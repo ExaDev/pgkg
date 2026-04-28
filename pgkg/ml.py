@@ -246,7 +246,9 @@ def extract_propositions(
         "  freeform strings, measurements, quotes.\n"
         "- Keep subject and object as concise noun phrases.\n"
         f"- Extract at most {max_propositions} propositions.\n"
-        "Return a JSON object with a 'propositions' array."
+        "Return ONLY a raw JSON object of the form "
+        '{"propositions": [{"text":"...","subject":"...","predicate":"...","object":"...","object_is_literal":false}, ...]}. '
+        "No markdown fences, no commentary, no preamble."
     )
 
     prop_schema = {
@@ -287,9 +289,32 @@ def extract_propositions(
 
 
 def _parse_propositions_json(text: str) -> "list[Proposition]":
-    """Parse a JSON string containing a 'propositions' array into Proposition objects."""
+    """Parse a JSON string containing a 'propositions' array into Proposition objects.
+
+    Tolerates markdown code fences (```json ... ```) and prose surrounding the
+    JSON object — common when the LLM is not in strict JSON-output mode (e.g.
+    the claude_code provider, which routes through the chat-style CLI).
+    """
     import json  # noqa: PLC0415
-    data = json.loads(text)
+    import re  # noqa: PLC0415
+
+    s = text.strip()
+    # Strip markdown fences if present.
+    fence = re.search(r"```(?:json)?\s*(.*?)```", s, re.DOTALL)
+    if fence:
+        s = fence.group(1).strip()
+    # If still surrounded by prose, slice from first '{' to last '}'.
+    if not s.startswith("{"):
+        first = s.find("{")
+        last = s.rfind("}")
+        if first != -1 and last != -1 and last > first:
+            s = s[first : last + 1]
+    if not s:
+        return []
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        return []
     return [Proposition(**p) for p in data.get("propositions", [])]
 
 
@@ -544,7 +569,9 @@ def _do_extract(
         "  freeform strings, measurements, quotes.\n"
         "- Keep subject and object as concise noun phrases.\n"
         f"- Extract at most {max_propositions} propositions.\n"
-        "Return a JSON object with a 'propositions' array."
+        "Return ONLY a raw JSON object of the form "
+        '{"propositions": [{"text":"...","subject":"...","predicate":"...","object":"...","object_is_literal":false}, ...]}. '
+        "No markdown fences, no commentary, no preamble."
     )
     prop_schema = {
         "type": "object",
