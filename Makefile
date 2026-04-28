@@ -1,4 +1,4 @@
-.PHONY: up down logs psql migrate test smoke line-count clean bench-locomo bench-longmemeval bench-smoke bench-mem0-stack bench-zep-stack bench-openrouter-free
+.PHONY: up down logs psql migrate test smoke line-count clean bench-locomo bench-longmemeval bench-smoke bench-mem0-stack bench-zep-stack bench-openrouter-free local
 
 # Bring the stack up (build first), detached
 up:
@@ -141,3 +141,11 @@ bench-openrouter-free:
 	set -a; source .env.bench-openrouter-free; set +a; \
 		uv run python -m bench.locomo --limit 5 && \
 		uv run python -m bench.longmemeval --variant longmemeval_s --limit 5
+
+# Embedded Postgres via pgserver — no Docker, no env file, no external process.
+# Just works: omit PGKG_DATABASE_URL and pgserver auto-starts.
+# Requires: uv sync --extra embedded
+local: ## Run pgkg with auto-managed embedded Postgres (chunks-only, zero LLM)
+	@echo "Embedded Postgres mode — no Docker, no config needed."
+	@echo "Data persists in ~/.local/share/pgkg/pgdata."
+	uv run pgkg migrate && uv run pgkg serve

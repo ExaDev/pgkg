@@ -15,6 +15,9 @@ def cmd_migrate(args: argparse.Namespace) -> None:
 
     async def _run() -> None:
         dsn = get_settings().database_url
+        if dsn is None:
+            from pgkg.embedded import get_dsn
+            dsn = get_dsn()
         migrations_dir = pathlib.Path(__file__).resolve().parent.parent / "migrations"
         conn = await asyncpg.connect(dsn)
         try:

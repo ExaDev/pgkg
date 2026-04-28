@@ -13,7 +13,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    database_url: str = "postgresql://postgres:postgres@localhost:5432/pgkg"
+    # When None, pgkg auto-starts an embedded Postgres via pgserver (no Docker).
+    # Set explicitly to connect to an external Postgres instance.
+    database_url: str | None = None
     embed_model: str = "BAAI/bge-m3"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     embed_dim: int = 1024

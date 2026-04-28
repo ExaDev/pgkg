@@ -13,7 +13,10 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     await register_vector(conn)
 
 
-async def make_pool(dsn: str) -> asyncpg.Pool:
+async def make_pool(dsn: str | None = None) -> asyncpg.Pool:
+    if dsn is None:
+        from pgkg.embedded import get_dsn
+        dsn = get_dsn()
     pool = await asyncpg.create_pool(dsn, min_size=1, max_size=10, init=_init_connection)
     return pool  # type: ignore[return-value]
 
