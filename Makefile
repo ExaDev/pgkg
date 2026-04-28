@@ -16,6 +16,17 @@ logs:
 psql:
 	docker compose exec db psql -U pgkg -d pgkg
 
+# Wipe all ingested data but keep schema and migration tracking.
+# Use this between experiments (e.g. switching from chunks-only to propositions mode).
+wipe:
+	@if [ "$$CI" != "1" ]; then \
+		printf "This will TRUNCATE documents, propositions, entities, edges, proposition_cache. Continue? [y/N] "; \
+		read ans; case "$$ans" in y|Y|yes) ;; *) echo "Aborted."; exit 1 ;; esac; \
+	fi
+	docker compose exec -T db psql -U pgkg -d pgkg -c \
+		"TRUNCATE documents, propositions, entities, edges, proposition_cache RESTART IDENTITY CASCADE;"
+	@echo "Wiped. Schema and migration tracking preserved."
+
 # Run database migrations inside the running app container
 migrate:
 	docker compose exec app pgkg migrate
