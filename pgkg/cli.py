@@ -1,0 +1,93 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import sys
+
+
+def cmd_migrate(args: argparse.Namespace) -> None:
+    from scripts.run_migrations import run_migrations  # type: ignore[import]
+    asyncio.run(run_migrations())
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    import uvicorn
+    uvicorn.run("pgkg.api:app", host=args.host, port=args.port, reload=False)
+
+
+def cmd_ingest(args: argparse.Namespace) -> None:
+    from pgkg.db import pool_from_settings
+    from pgkg.memory import Memory
+    from pgkg.config import get_settings
+
+    if args.path == "-":
+        text = sys.stdin.read()
+        source = "stdin"
+    else:
+        import pathlib
+        p = pathlib.Path(args.path)
+        text = p.read_text()
+        source = str(p)
+
+    async def _run() -> None:
+        settings = get_settings()
+        async with pool_from_settings() as pool:
+            mem = Memory(pool, namespace=settings.default_namespace)
+            result = await mem.ingest(text, source=source)
+            print(json.dumps({
+                "documents": result.documents,
+                "chunks": result.chunks,
+                "propositions": result.propositions,
+                "entities": result.entities,
+            }))
+
+    asyncio.run(_run())
+
+
+def cmd_recall(args: argparse.Namespace) -> None:
+    from pgkg.db import pool_from_settings
+    from pgkg.memory import Memory
+    from pgkg.config import get_settings
+
+    async def _run() -> None:
+        settings = get_settings()
+        async with pool_from_settings() as pool:
+            mem = Memory(pool, namespace=settings.default_namespace)
+            results = await mem.recall(args.query, k=args.k)
+            print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
+
+    asyncio.run(_run())
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="pgkg", description="pgkg knowledge graph CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("migrate", help="Apply database migrations")
+
+    serve_parser = subparsers.add_parser("serve", help="Start the API server")
+    serve_parser.add_argument("--host", default="0.0.0.0")
+    serve_parser.add_argument("--port", type=int, default=8000)
+
+    ingest_parser = subparsers.add_parser("ingest", help="Ingest a file or stdin")
+    ingest_parser.add_argument("path", help="Path to file or '-' for stdin")
+
+    recall_parser = subparsers.add_parser("recall", help="Recall memories matching a query")
+    recall_parser.add_argument("query", help="Search query")
+    recall_parser.add_argument("--k", type=int, default=10, help="Number of results")
+
+    args = parser.parse_args()
+
+    if args.command == "migrate":
+        cmd_migrate(args)
+    elif args.command == "serve":
+        cmd_serve(args)
+    elif args.command == "ingest":
+        cmd_ingest(args)
+    elif args.command == "recall":
+        cmd_recall(args)
+
+
+if __name__ == "__main__":
+    main()

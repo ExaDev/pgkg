@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and coverage artifacts
+tests/
+bench/
+.pytest_cache/
+htmlcov/
+.coverage
+*.cover
+coverage.xml
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Model / data caches (large, fetched at runtime)
+models/
+data/
+
+# Docker-specific files (not needed in image context)
+docker-compose*.yml
+Makefile
+.dockerignore
+
+# Documentation
+*.md
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment files (secrets should never be baked in)
+.env
+.env.*

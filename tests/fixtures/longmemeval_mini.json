@@ -1,0 +1,17 @@
+[
+  {
+    "question_id": "lme-test-001",
+    "question": "What did the user say about their weekend plans?",
+    "answer": "hiking trip",
+    "question_type": "single-session-user",
+    "haystack_sessions": [
+      [
+        {"role": "user", "content": "I'm planning a hiking trip this weekend."},
+        {"role": "assistant", "content": "That sounds fun! Where are you going?"},
+        {"role": "user", "content": "The Blue Ridge Mountains."}
+      ]
+    ],
+    "haystack_session_ids": ["session-001"],
+    "answer_session_ids": ["session-001"]
+  }
+]

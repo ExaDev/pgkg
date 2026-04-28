@@ -1,0 +1,39 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: pgkg
+      POSTGRES_PASSWORD: pgkg
+      POSTGRES_DB: pgkg
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${PGKG_DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgkg -d pgkg"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGKG_DATABASE_URL: postgresql://pgkg:pgkg@db:5432/pgkg
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      PGKG_LLM_PROVIDER: ${PGKG_LLM_PROVIDER:-}
+      PGKG_OFFLINE_EXTRACT: ${PGKG_OFFLINE_EXTRACT:-}
+    volumes:
+      - hfcache:/data/hf-cache
+    ports:
+      - "${PGKG_APP_PORT:-8000}:8000"
+    command: >
+      sh -c "pgkg migrate && pgkg serve"
+
+volumes:
+  pgdata:
+  hfcache:

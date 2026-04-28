@@ -1,0 +1,26 @@
+[
+  {
+    "sessions": [
+      [
+        {"speaker": "Alice", "text": "I love hiking in the mountains."},
+        {"speaker": "Bob", "text": "That sounds amazing! Which mountains?"}
+      ],
+      [
+        {"speaker": "Alice", "text": "I went to the Rockies last summer."},
+        {"speaker": "Bob", "text": "Did you see any wildlife there?"}
+      ]
+    ],
+    "qa": [
+      {
+        "question": "Where did Alice go hiking?",
+        "answer": "The Rockies",
+        "category": "single-session"
+      },
+      {
+        "question": "What hobby does Alice enjoy?",
+        "answer": "hiking",
+        "category": "multi-session"
+      }
+    ]
+  }
+]

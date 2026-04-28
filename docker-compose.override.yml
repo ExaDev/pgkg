@@ -1,0 +1,15 @@
+# docker-compose.override.yml — DEV ONLY
+#
+# This file is automatically loaded by `docker compose` alongside
+# docker-compose.yml. It mounts the local source tree for hot-reload
+# so you don't need to rebuild the image on every Python change.
+#
+# To use production settings only, run:
+#   docker compose -f docker-compose.yml up
+
+services:
+  app:
+    volumes:
+      - ./pgkg:/app/pgkg:cached
+    command: >
+      sh -c "pgkg migrate && uvicorn pgkg.api:app --host 0.0.0.0 --port 8000 --reload"
