@@ -18,7 +18,7 @@ from pgkg.ml import (
     compute_cache_key,
     extract_propositions_async,
 )
-from pgkg.memory import PostgresExtractCache
+from pgkg.memory import BackendExtractCache
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +69,7 @@ async def _get_hit_count(pool: asyncpg.Pool, cache_key: str) -> int:
 # ---------------------------------------------------------------------------
 
 async def test_cache_hit_returns_stored_props_without_llm(
-    pool: asyncpg.Pool, monkeypatch
+    pool: asyncpg.Pool, backend, monkeypatch
 ):
     """Pre-populate cache; LLM provider should never be called on cache hit."""
     chunk = "Alice is a brilliant scientist who works at CERN."
@@ -102,7 +102,7 @@ async def test_cache_hit_returns_stored_props_without_llm(
         lambda *a, **kw: (_ for _ in ()).throw(AssertionError("LLM was called — should have been a cache hit")),
     )
 
-    cache = PostgresExtractCache(pool, "test-ns")
+    cache = BackendExtractCache(backend)
     result = await extract_propositions_async(chunk, cache=cache)
 
     assert len(result) == 1
@@ -114,7 +114,7 @@ async def test_cache_hit_returns_stored_props_without_llm(
 # test_cache_miss_then_hit
 # ---------------------------------------------------------------------------
 
-async def test_cache_miss_then_hit(pool: asyncpg.Pool, monkeypatch):
+async def test_cache_miss_then_hit(pool: asyncpg.Pool, backend, monkeypatch):
     """First call invokes LLM stub (count=1); second call hits cache (count still 1)."""
     chunk = "Bob loves hiking in the mountains near his home."
     model = "stub-model-v1"
@@ -141,7 +141,7 @@ async def test_cache_miss_then_hit(pool: asyncpg.Pool, monkeypatch):
 
     monkeypatch.setattr(ml_module, "_do_extract", _fake_do_extract)
 
-    cache = PostgresExtractCache(pool, "test-ns-miss-hit")
+    cache = BackendExtractCache(backend)
 
     # First call — cache miss, LLM called
     result1 = await extract_propositions_async(chunk, cache=cache)
@@ -235,7 +235,7 @@ def test_cache_key_changes_with_prompt_version(monkeypatch):
 # test_postgres_cache_hit_count_increments
 # ---------------------------------------------------------------------------
 
-async def test_postgres_cache_hit_count_increments(pool: asyncpg.Pool):
+async def test_postgres_cache_hit_count_increments(pool: asyncpg.Pool, backend):
     """Two get() calls on a populated key → hit_count = 2."""
     chunk = "Eve is a cryptographer."
     model = "hit-count-model"
@@ -244,7 +244,7 @@ async def test_postgres_cache_hit_count_increments(pool: asyncpg.Pool):
     stored = [_make_prop(text="Eve is a cryptographer.", subject="Eve", predicate="is", object="cryptographer")]
     await _seed_cache(pool, cache_key, stored)
 
-    cache = PostgresExtractCache(pool, "test-ns-hits")
+    cache = BackendExtractCache(backend)
     await cache.get(cache_key)
     await cache.get(cache_key)
 

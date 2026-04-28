@@ -37,8 +37,15 @@ class PostgresBackend:
         self._dsn = dsn
 
     @classmethod
-    async def create(cls, dsn: str) -> PostgresBackend:
-        """Create a backend with a fresh connection pool."""
+    async def create(cls, dsn: str | None = None) -> PostgresBackend:
+        """Create a backend with a fresh connection pool.
+
+        When *dsn* is ``None``, an embedded Postgres is started
+        automatically via pgserver (requires ``uv sync --extra embedded``).
+        """
+        if dsn is None:
+            from pgkg.embedded import get_dsn
+            dsn = get_dsn()
         pool = await asyncpg.create_pool(
             dsn, min_size=1, max_size=10, init=_init_connection,
         )

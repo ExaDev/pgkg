@@ -38,7 +38,7 @@ def _fake_embed(texts: list[str]) -> list[list[float]]:
 # test_ingest_creates_rows
 # ---------------------------------------------------------------------------
 
-async def test_ingest_creates_rows(pool: asyncpg.Pool, monkeypatch):
+async def test_ingest_creates_rows(pool: asyncpg.Pool, backend, monkeypatch):
     """PGKG_OFFLINE_EXTRACT=1: ingest populates documents, chunks, propositions tables."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -46,7 +46,7 @@ async def test_ingest_creates_rows(pool: asyncpg.Pool, monkeypatch):
     monkeypatch.setattr(ml_module, "embed", _fake_embed)
 
     ns = f"ingest_test_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns)
+    mem = Memory(backend, namespace=ns)
     result = await mem.ingest("Hello world. This is a test document.")
 
     assert result.documents == 1
@@ -74,7 +74,7 @@ async def test_ingest_creates_rows(pool: asyncpg.Pool, monkeypatch):
 # test_recall_returns_ingested
 # ---------------------------------------------------------------------------
 
-async def test_recall_returns_ingested(pool: asyncpg.Pool, monkeypatch):
+async def test_recall_returns_ingested(pool: asyncpg.Pool, backend, monkeypatch):
     """After ingesting a doc, recalling a matching query returns the proposition."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -103,7 +103,7 @@ async def test_recall_returns_ingested(pool: asyncpg.Pool, monkeypatch):
     monkeypatch.setattr(ml_module, "_rerank_model", FakeCE())
 
     ns = f"recall_test_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns)
+    mem = Memory(backend, namespace=ns)
     await mem.ingest(ocean_text)
 
     results = await mem.recall(
@@ -123,7 +123,7 @@ async def test_recall_returns_ingested(pool: asyncpg.Pool, monkeypatch):
 # test_recall_session_scope
 # ---------------------------------------------------------------------------
 
-async def test_recall_session_scope(pool: asyncpg.Pool, monkeypatch):
+async def test_recall_session_scope(pool: asyncpg.Pool, backend, monkeypatch):
     """Propositions ingested with session_id='A' don't appear in session_id='B' recall."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -131,7 +131,7 @@ async def test_recall_session_scope(pool: asyncpg.Pool, monkeypatch):
     monkeypatch.setattr(ml_module, "embed", _fake_embed)
 
     ns = f"session_test_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns)
+    mem = Memory(backend, namespace=ns)
 
     # Ingest unique text with session A
     unique_text = f"Unique session A content xyzzy_{uuid.uuid4().hex}"
@@ -164,7 +164,7 @@ async def test_recall_session_scope(pool: asyncpg.Pool, monkeypatch):
 # test_forget_supersedes
 # ---------------------------------------------------------------------------
 
-async def test_forget_supersedes(pool: asyncpg.Pool, monkeypatch):
+async def test_forget_supersedes(pool: asyncpg.Pool, backend, monkeypatch):
     """After forget(), the proposition no longer appears in recall results."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -185,7 +185,7 @@ async def test_forget_supersedes(pool: asyncpg.Pool, monkeypatch):
     monkeypatch.setattr(ml_module, "embed", _targeted_embed)
 
     ns = f"forget_test_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns)
+    mem = Memory(backend, namespace=ns)
     result = await mem.ingest(target_text)
 
     # Get the proposition id
@@ -220,7 +220,7 @@ async def test_forget_supersedes(pool: asyncpg.Pool, monkeypatch):
 # recall test bypassed rerank/MMR, so the truthiness check on the
 # embedding column was never exercised against a real DB row.
 
-async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, monkeypatch):
+async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, backend, monkeypatch):
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
     import pgkg.ml as ml_module
@@ -229,7 +229,7 @@ async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, 
     monkeypatch.setattr(ml_module, "rerank", lambda q, docs: [1.0 / (i + 1) for i in range(len(docs))])
 
     ns = f"recall_default_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(backend, namespace=ns, extract_propositions=False)
     await mem.ingest("The chunks-only ingest mode skips LLM extraction entirely.")
     await mem.ingest("Hybrid retrieval fuses BM25 and vector similarity via RRF.")
 

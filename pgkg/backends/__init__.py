@@ -15,12 +15,14 @@ async def make_backend(backend_type: str = "postgres", **kwargs) -> "StorageBack
     backend_type:
         One of ``"postgres"`` (default).  Future values: ``"sqlite"``.
     **kwargs:
-        Backend-specific arguments.  For ``"postgres"``: ``dsn`` (str).
+        Backend-specific arguments.  For ``"postgres"``: ``dsn`` (str | None).
+        When *dsn* is omitted or ``None``, pgserver auto-starts an embedded
+        Postgres instance.
     """
     if backend_type == "postgres":
         from pgkg.backends.postgres import PostgresBackend
 
-        dsn: str = kwargs.pop("dsn")
+        dsn: str | None = kwargs.pop("dsn", None)
         return await PostgresBackend.create(dsn)
 
     raise ValueError(f"Unknown backend type: {backend_type!r}")

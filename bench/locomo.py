@@ -190,16 +190,21 @@ async def main() -> None:
 
     print(f"Loaded {len(items)} LoCoMo conversations")
 
-    from pgkg.db import pool_from_settings
+    from pgkg.backends.postgres import PostgresBackend
+    from pgkg.config import get_settings
     from bench.common import run_bench
 
-    async with pool_from_settings() as pool:
+    settings = get_settings()
+    backend = await PostgresBackend.create(settings.database_url)
+    try:
         report = await run_bench(
             name="locomo",
             items=items,
             config=config,
-            pool=pool,
+            backend=backend,
         )
+    finally:
+        await backend.close()
 
     print(f"\nFinal: {report.accuracy:.1%} accuracy over {report.total} questions")
 

@@ -13,6 +13,8 @@ import asyncpg
 import pytest
 from pgvector.asyncpg import register_vector
 
+from pgkg.backends.postgres import PostgresBackend
+
 MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
 
 
@@ -64,3 +66,11 @@ async def pool(pg_dsn) -> AsyncGenerator[asyncpg.Pool, None]:
 
     yield conn_pool
     await conn_pool.close()
+
+
+@pytest.fixture(scope="session")
+async def backend(pool) -> AsyncGenerator[PostgresBackend, None]:
+    """PostgresBackend wrapping the test pool."""
+    b = PostgresBackend(pool)
+    yield b
+    # Pool cleanup handled by the pool fixture; do not close here.

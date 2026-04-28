@@ -9,27 +9,27 @@ from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
 from pgkg import ml
+from pgkg.backends.postgres import PostgresBackend
 from pgkg.config import get_settings
-from pgkg.db import make_pool, close_pool
 from pgkg.memory import Memory, IngestResult, Result
 
-_pool = None
+_backend: PostgresBackend | None = None
 _memory: Memory | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _memory
+    global _backend, _memory
     settings = get_settings()
-    _pool = await make_pool(settings.database_url)
+    _backend = await PostgresBackend.create(settings.database_url)
     _memory = Memory(
-        _pool,
+        _backend,
         namespace=settings.default_namespace,
         extract_propositions=settings.extract_propositions,
     )
     yield
-    if _pool:
-        await close_pool(_pool)
+    if _backend:
+        await _backend.close()
 
 
 app = FastAPI(title="pgkg", lifespan=lifespan)
@@ -90,15 +90,7 @@ async def forget(req: ForgetRequest) -> Response:
 
 @app.get("/health")
 async def health() -> dict:
-    db_ok = False
-    if _pool:
-        try:
-            async with _pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
-            db_ok = True
-        except Exception:
-            pass
-
+    db_ok = await _backend.health_check() if _backend else False
     return {
         "status": "ok",
         "db": db_ok,
