@@ -344,7 +344,7 @@ class Memory:
             sorted_indices = sorted(range(len(blended)), key=lambda i: blended[i], reverse=True)
             rows = [candidate_rows[i] for i in sorted_indices]
             scores = [blended[i] for i in sorted_indices]
-            embs = [list(candidate_rows[i]["embedding"]) if candidate_rows[i]["embedding"] else q_emb
+            embs = [list(candidate_rows[i]["embedding"]) if candidate_rows[i]["embedding"] is not None else q_emb
                     for i in sorted_indices]
 
         if with_mmr and len(rows) > k:
