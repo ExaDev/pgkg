@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol, runtime_checkable
 from uuid import UUID
 
@@ -25,6 +26,7 @@ class Candidate:
     subject_id: UUID | None
     predicate: str | None
     object_id: UUID | None
+    asserted_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,7 @@ class StoredProposition:
     session_id: str | None
     confidence: float = 1.0
     metadata: dict | None = None
+    asserted_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +78,7 @@ class StoredChunk:
     id: UUID | None = None
     span_start: int | None = None
     span_end: int | None = None
+    asserted_at: datetime | None = None
 
 
 @runtime_checkable

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -27,6 +28,7 @@ class Result(BaseModel):
     subject: str | None
     predicate: str | None
     object: str | None
+    asserted_at: datetime | None = None
 
 
 @dataclass
@@ -115,6 +117,7 @@ class Memory:
         *,
         source: str | None = None,
         session_id: str | None = None,
+        asserted_at: datetime | None = None,
         chunk_size: int = 1200,
         chunk_overlap: int = 100,
     ) -> IngestResult:
@@ -134,6 +137,7 @@ class Memory:
                     text=chunk_text,
                     span_start=i * chunk_size,
                     span_end=(i + 1) * chunk_size,
+                    asserted_at=asserted_at,
                 )
             )
             chunk_ids.append(chunk_id)
@@ -193,6 +197,7 @@ class Memory:
                             chunk_id=chunk_id,
                             namespace=self._namespace,
                             session_id=session_id,
+                            asserted_at=asserted_at,
                         )
                     )
                     total_propositions += 1
@@ -219,6 +224,7 @@ class Memory:
                         namespace=self._namespace,
                         session_id=session_id,
                         metadata={"mode": "chunk"},
+                        asserted_at=asserted_at,
                     )
                 )
                 total_propositions += 1
@@ -323,6 +329,7 @@ class Memory:
                     subject=None,
                     predicate=cand.predicate,
                     object=None,
+                    asserted_at=cand.asserted_at,
                 )
             )
 

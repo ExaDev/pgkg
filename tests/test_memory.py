@@ -245,7 +245,7 @@ async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, 
 # test_ingest_propagates_asserted_at
 # ---------------------------------------------------------------------------
 
-async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
+async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, backend, monkeypatch):
     """Ingest with asserted_at stores it in both chunk and proposition rows."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -254,7 +254,7 @@ async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
 
     expected_ts = datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
     ns = f"assertedat_ingest_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(backend, namespace=ns, extract_propositions=False)
 
     await mem.ingest(
         "The sky is blue and the grass is green.",
@@ -292,7 +292,7 @@ async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
 # test_recall_returns_asserted_at_in_result
 # ---------------------------------------------------------------------------
 
-async def test_recall_returns_asserted_at_in_result(pool: asyncpg.Pool, monkeypatch):
+async def test_recall_returns_asserted_at_in_result(pool: asyncpg.Pool, backend, monkeypatch):
     """Result.asserted_at is populated when ingested with an asserted_at timestamp."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -312,7 +312,7 @@ async def test_recall_returns_asserted_at_in_result(pool: asyncpg.Pool, monkeypa
     monkeypatch.setattr(ml_module, "embed", _controlled_embed)
 
     ns = f"assertedat_recall_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(backend, namespace=ns, extract_propositions=False)
 
     await mem.ingest(target_text, asserted_at=expected_ts)
 

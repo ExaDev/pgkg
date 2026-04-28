@@ -175,7 +175,7 @@ class PostgresBackend:
             rows = await conn.fetch(
                 f"""
                 SELECT proposition_id, text, embedding, rrf_score, adjusted_score,
-                       source_kind, chunk_id, subject_id, predicate, object_id
+                       source_kind, chunk_id, subject_id, predicate, object_id, asserted_at
                 FROM pgkg_search($1, '{vec_lit}'::vector,
                                  $2, $3, $4, $5, $6, $7, $8)
                 """,
@@ -199,6 +199,7 @@ class PostgresBackend:
                 subject_id=r["subject_id"],
                 predicate=r["predicate"],
                 object_id=r["object_id"],
+                asserted_at=r["asserted_at"],
             )
             for r in rows
         ]
@@ -280,13 +281,14 @@ class PostgresBackend:
         async with self._pool.acquire() as conn:
             chunk_id: UUID = await conn.fetchval(
                 """
-                INSERT INTO chunks (document_id, text, span_start, span_end)
-                VALUES ($1, $2, $3, $4) RETURNING id
+                INSERT INTO chunks (document_id, text, span_start, span_end, asserted_at)
+                VALUES ($1, $2, $3, $4, $5) RETURNING id
                 """,
                 chunk.document_id,
                 chunk.text,
                 chunk.span_start,
                 chunk.span_end,
+                chunk.asserted_at,
             )
         return chunk_id
 
@@ -299,10 +301,10 @@ class PostgresBackend:
                 INSERT INTO propositions
                     (text, embedding, subject_id, predicate, object_id,
                      object_literal, chunk_id, namespace, session_id,
-                     confidence, metadata)
+                     confidence, metadata, asserted_at)
                 VALUES ($1, '{vec_lit}'::vector,
                         $2, $3, $4, $5, $6, $7, $8, $9,
-                        $10::jsonb)
+                        $10::jsonb, $11)
                 RETURNING id
                 """,
                 prop.text,
@@ -315,6 +317,7 @@ class PostgresBackend:
                 prop.session_id,
                 prop.confidence,
                 metadata_json,
+                prop.asserted_at,
             )
         return prop_id
 
