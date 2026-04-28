@@ -89,6 +89,10 @@ cp .env.local-claude .env  # or .env.local-chunks
 │ FastAPI app (pgkg/api.py)                           │
 ├─────────────────────────────────────────────────────┤
 │ POST /memorize  → embed + extract propositions      │
+│   body: {text, session_id?, source?, asserted_at?}  │
+│   asserted_at (ISO 8601): when the fact was         │
+│   originally asserted; drives recency decay when    │
+│   set, otherwise falls back to ingest time.         │
 │ POST /recall    → embed + search + rerank           │
 │ GET  /health    → liveness                          │
 │                                                     │

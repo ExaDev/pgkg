@@ -64,34 +64,45 @@ async def insert_proposition(
     last_accessed_at: datetime | None = None,
     access_count: int = 0,
     confidence: float = 1.0,
+    asserted_at: datetime | None = None,
 ) -> uuid.UUID:
     emb_expr = f"'{_list_to_pg(embedding)}'" if embedding is not None else "NULL"
-    # Pass last_accessed_at as a parameter to avoid SQL injection / quoting issues
+    # Build dynamic placeholders for optional timestamp params
+    params: list = [
+        text,       # $1
+        namespace,  # $2
+        session_id, # $3
+        subject_id, # $4
+        object_id,  # $5
+        predicate,  # $6
+        superseded_by, # $7
+        access_count,  # $8
+        confidence,    # $9
+    ]
+
     if last_accessed_at is not None:
-        laa_placeholder = "$10"
-        extra_param: list = [last_accessed_at]
+        laa_placeholder = f"${len(params) + 1}"
+        params.append(last_accessed_at)
     else:
         laa_placeholder = "now()"
-        extra_param = []
+
+    if asserted_at is not None:
+        aat_placeholder = f"${len(params) + 1}"
+        params.append(asserted_at)
+    else:
+        aat_placeholder = "NULL"
 
     row = await conn.fetchrow(
         f"""
         INSERT INTO propositions
             (text, namespace, session_id, embedding, subject_id, object_id,
-             predicate, superseded_by, last_accessed_at, access_count, confidence)
-        VALUES ($1, $2, $3, {emb_expr}, $4, $5, $6, $7, {laa_placeholder}, $8, $9)
+             predicate, superseded_by, last_accessed_at, access_count, confidence,
+             asserted_at)
+        VALUES ($1, $2, $3, {emb_expr}, $4, $5, $6, $7, {laa_placeholder}, $8, $9,
+                {aat_placeholder})
         RETURNING id
         """,
-        text,
-        namespace,
-        session_id,
-        subject_id,
-        object_id,
-        predicate,
-        superseded_by,
-        access_count,
-        confidence,
-        *extra_param,
+        *params,
     )
     return row["id"]
 
@@ -494,4 +505,93 @@ async def test_pgkg_recompute_pagerank_runs(pool: asyncpg.Pool) -> None:
     # C receives links from both A and B → higher PageRank than A (receives none)
     assert scores[id_c] > scores[id_a], (
         f"C (receives 2 links) should outrank A (receives 0). Got C={scores[id_c]}, A={scores[id_a]}"
+    )
+
+
+async def test_pgkg_search_asserted_at_overrides_recency(pool: asyncpg.Pool) -> None:
+    """asserted_at drives decay when set; NULL falls back to last_accessed_at.
+
+    With a short half-life, a proposition whose asserted_at is 60 days ago should
+    score lower than one whose asserted_at is NULL (falls back to last_accessed_at=now).
+    Both have last_accessed_at=now so only asserted_at distinguishes them.
+    """
+    from datetime import timedelta
+    async with pool.acquire() as conn:
+        ns = f"assertedat_decay_{uuid.uuid4().hex[:8]}"
+        emb = vec(hot_index=60, value=1.0)
+
+        sixty_days_ago = datetime.now(timezone.utc) - timedelta(days=60)
+
+        # Proposition with old asserted_at — should decay heavily
+        old_asserted_id = await insert_proposition(
+            conn,
+            text="fact about rivers and streams",
+            namespace=ns,
+            embedding=emb,
+            last_accessed_at=datetime.now(timezone.utc),
+            asserted_at=sixty_days_ago,
+        )
+        # Proposition with NULL asserted_at — decay falls back to last_accessed_at=now
+        null_asserted_id = await insert_proposition(
+            conn,
+            text="fact about rivers and streams",
+            namespace=ns,
+            embedding=emb,
+            last_accessed_at=datetime.now(timezone.utc),
+            asserted_at=None,
+        )
+
+        # half_life = 7 days makes 60-day-old assertion score much lower than fresh
+        rows = await conn.fetch(
+            f"""
+            SELECT proposition_id, adjusted_score
+            FROM pgkg_search('rivers', '{_list_to_pg(emb)}', 20, 50, $1,
+                             NULL, 7.0)
+            ORDER BY adjusted_score DESC
+            """,
+            ns,
+        )
+
+    result_map = {r["proposition_id"]: float(r["adjusted_score"]) for r in rows}
+    assert old_asserted_id in result_map, "Old-asserted proposition should appear in results"
+    assert null_asserted_id in result_map, "Null-asserted proposition should appear in results"
+    assert result_map[null_asserted_id] > result_map[old_asserted_id], (
+        "Null asserted_at (decays from now) should rank above old asserted_at with short half-life"
+    )
+
+
+async def test_pgkg_search_returns_asserted_at_column(pool: asyncpg.Pool) -> None:
+    """pgkg_search result rows include the asserted_at column with the correct value."""
+    from datetime import timedelta
+    async with pool.acquire() as conn:
+        ns = f"assertedat_col_{uuid.uuid4().hex[:8]}"
+        emb = vec(hot_index=61, value=1.0)
+
+        expected_ts = datetime(2025, 3, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+        prop_id = await insert_proposition(
+            conn,
+            text="proposition with known assertion timestamp",
+            namespace=ns,
+            embedding=emb,
+            asserted_at=expected_ts,
+        )
+
+        rows = await conn.fetch(
+            f"""
+            SELECT proposition_id, asserted_at
+            FROM pgkg_search('assertion timestamp', '{_list_to_pg(emb)}', 10, 20, $1)
+            """,
+            ns,
+        )
+
+    result_map = {r["proposition_id"]: r["asserted_at"] for r in rows}
+    assert prop_id in result_map, "Proposition should appear in search results"
+    returned_ts = result_map[prop_id]
+    assert returned_ts is not None, "asserted_at should not be NULL in results"
+    # Compare timestamps (asyncpg may return timezone-aware datetime)
+    if returned_ts.tzinfo is None:
+        returned_ts = returned_ts.replace(tzinfo=timezone.utc)
+    assert returned_ts == expected_ts, (
+        f"Returned asserted_at {returned_ts!r} should equal inserted {expected_ts!r}"
     )

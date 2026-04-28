@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -38,6 +39,7 @@ class MemorizeRequest(BaseModel):
     text: str
     session_id: str | None = None
     source: str | None = None
+    asserted_at: datetime | None = None
 
 
 class RecallRequest(BaseModel):
@@ -57,7 +59,7 @@ class ForgetRequest(BaseModel):
 @app.post("/memorize", response_model=dict)
 async def memorize(req: MemorizeRequest) -> dict:
     assert _memory is not None
-    result = await _memory.ingest(req.text, source=req.source, session_id=req.session_id)
+    result = await _memory.ingest(req.text, source=req.source, session_id=req.session_id, asserted_at=req.asserted_at)
     return {
         "documents": result.documents,
         "chunks": result.chunks,

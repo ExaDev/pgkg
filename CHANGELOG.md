@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0
+
+- **Assertion timestamps (`asserted_at`)**: New nullable `asserted_at TIMESTAMPTZ` column on `propositions` and `chunks` (migration 006). When set, recency decay in `pgkg_search()` keys on when the fact was originally asserted rather than when it was indexed (`COALESCE(asserted_at, last_accessed_at)`). No change for rows where `asserted_at` is NULL.
+- **API**: `POST /memorize` accepts optional `asserted_at` (ISO 8601) in the request body.
+- **`Memory.ingest()`**: New `asserted_at: datetime | None = None` parameter; propagated to both chunk and proposition rows.
+- **`Memory.recall()` / `Result`**: `Result` model gains `asserted_at: datetime | None`; populated from `pgkg_search()` output.
+- **Bench harnesses**: `ingest_conversation()` in `bench/common.py` now parses and forwards `timestamp` fields from turn dicts as `asserted_at`. `bench/locomo.py` wires per-turn timestamps; `bench/longmemeval.py` populates `timestamp` from session-level metadata for temporal-reasoning category support.
+
 ## 0.4.1
 
 - Promote zero-LLM chunks-only path as the lead local-experimentation flow. New `.env.local-chunks` preset and `make local-chunks` target — no API key, no `claude` CLI required.

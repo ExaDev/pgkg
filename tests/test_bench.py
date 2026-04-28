@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import asyncpg
 import pytest
@@ -177,3 +179,48 @@ def test_exact_match_grade():
     assert exact_match_grade(gold_answer="The Rockies", predicted="She went to the Rockies last summer")
     assert exact_match_grade(gold_answer="blue", predicted="The sky is blue.")
     assert not exact_match_grade(gold_answer="Paris", predicted="London is the capital")
+
+
+# ---------------------------------------------------------------------------
+# test_ingest_conversation_passes_timestamp_through
+# ---------------------------------------------------------------------------
+
+async def test_ingest_conversation_passes_timestamp_through():
+    """ingest_conversation parses turn timestamp and calls memory.ingest with asserted_at."""
+    from bench.common import ingest_conversation
+
+    iso_ts = "2025-01-15T10:00:00Z"
+    expected_dt = datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+
+    mock_memory = MagicMock()
+    # ingest is async; return a coroutine-compatible mock
+    ingest_result = MagicMock()
+    mock_memory.ingest = AsyncMock(return_value=ingest_result)
+
+    turns = [
+        {"speaker": "Alice", "text": "Hello there", "timestamp": iso_ts},
+        {"speaker": "Bob", "text": "How are you"},  # no timestamp
+    ]
+
+    count = await ingest_conversation(
+        mock_memory,
+        namespace="test-ns",
+        session_id="sess-1",
+        turns=turns,
+    )
+
+    assert count == 2
+    assert mock_memory.ingest.call_count == 2
+
+    first_call_kwargs = mock_memory.ingest.call_args_list[0]
+    # call_args is (args, kwargs)
+    _, kwargs = first_call_kwargs
+    assert "asserted_at" in kwargs
+    ts = kwargs["asserted_at"]
+    if ts is not None and ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    assert ts == expected_dt, f"Expected {expected_dt!r}, got {ts!r}"
+
+    # Second turn has no timestamp — asserted_at should be None
+    _, kwargs2 = mock_memory.ingest.call_args_list[1]
+    assert kwargs2.get("asserted_at") is None

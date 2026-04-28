@@ -50,7 +50,12 @@ def _parse_turns(session: list | dict) -> list[dict]:
             speaker = turn.get("speaker") or turn.get("role") or "speaker"
             text = turn.get("text") or turn.get("content") or ""
             if text:
-                turns.append({"speaker": str(speaker), "text": str(text)})
+                t: dict = {"speaker": str(speaker), "text": str(text)}
+                # LoCoMo has per-turn timestamps on some utterances
+                timestamp = turn.get("timestamp") or turn.get("date") or turn.get("time")
+                if timestamp is not None:
+                    t["timestamp"] = timestamp
+                turns.append(t)
     return turns
 
 

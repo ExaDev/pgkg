@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import asyncpg
@@ -238,3 +239,95 @@ async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, 
 
     assert len(results) > 0
     assert all(r.text for r in results)
+
+
+# ---------------------------------------------------------------------------
+# test_ingest_propagates_asserted_at
+# ---------------------------------------------------------------------------
+
+async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
+    """Ingest with asserted_at stores it in both chunk and proposition rows."""
+    monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
+
+    import pgkg.ml as ml_module
+    monkeypatch.setattr(ml_module, "embed", _fake_embed)
+
+    expected_ts = datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
+    ns = f"assertedat_ingest_{uuid.uuid4().hex[:8]}"
+    mem = Memory(pool, namespace=ns, extract_propositions=False)
+
+    await mem.ingest(
+        "The sky is blue and the grass is green.",
+        asserted_at=expected_ts,
+    )
+
+    async with pool.acquire() as conn:
+        prop_row = await conn.fetchrow(
+            "SELECT asserted_at FROM propositions WHERE namespace = $1 LIMIT 1", ns
+        )
+        chunk_row = await conn.fetchrow(
+            """
+            SELECT c.asserted_at FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.namespace = $1
+            LIMIT 1
+            """,
+            ns,
+        )
+
+    assert prop_row is not None
+    prop_ts = prop_row["asserted_at"]
+    if prop_ts is not None and prop_ts.tzinfo is None:
+        prop_ts = prop_ts.replace(tzinfo=timezone.utc)
+    assert prop_ts == expected_ts, f"Proposition asserted_at {prop_ts!r} should equal {expected_ts!r}"
+
+    assert chunk_row is not None
+    chunk_ts = chunk_row["asserted_at"]
+    if chunk_ts is not None and chunk_ts.tzinfo is None:
+        chunk_ts = chunk_ts.replace(tzinfo=timezone.utc)
+    assert chunk_ts == expected_ts, f"Chunk asserted_at {chunk_ts!r} should equal {expected_ts!r}"
+
+
+# ---------------------------------------------------------------------------
+# test_recall_returns_asserted_at_in_result
+# ---------------------------------------------------------------------------
+
+async def test_recall_returns_asserted_at_in_result(pool: asyncpg.Pool, monkeypatch):
+    """Result.asserted_at is populated when ingested with an asserted_at timestamp."""
+    monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
+
+    import pgkg.ml as ml_module
+
+    expected_ts = datetime(2025, 6, 20, 8, 30, 0, tzinfo=timezone.utc)
+    target_text = f"Fact about temporal reasoning asserted {uuid.uuid4().hex}"
+
+    def _controlled_embed(texts: list[str]) -> list[list[float]]:
+        result = []
+        for t in texts:
+            v = [0.0] * 1024
+            v[hash(t) % 1024] = 1.0
+            result.append(v)
+        return result
+
+    monkeypatch.setattr(ml_module, "embed", _controlled_embed)
+
+    ns = f"assertedat_recall_{uuid.uuid4().hex[:8]}"
+    mem = Memory(pool, namespace=ns, extract_propositions=False)
+
+    await mem.ingest(target_text, asserted_at=expected_ts)
+
+    results = await mem.recall(
+        target_text[:30],
+        k=10,
+        with_rerank=False,
+        with_mmr=False,
+        expand_graph=False,
+    )
+
+    assert len(results) > 0, "Recall should return results"
+    # All ingested props were stamped with expected_ts; every returned result should carry it
+    for r in results:
+        ts = r.asserted_at
+        if ts is not None and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        assert ts == expected_ts, f"Result.asserted_at {ts!r} should equal {expected_ts!r}"

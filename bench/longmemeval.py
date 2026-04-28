@@ -79,14 +79,30 @@ def _download_longmemeval(variant: str, dataset_path: Path | None) -> Path:
 
 
 def _parse_haystack_sessions(record: dict) -> list[dict]:
-    """Parse haystack_sessions into normalized turn dicts with session_id tags."""
+    """Parse haystack_sessions into normalized turn dicts with session_id tags.
+
+    LongMemEval's small variant uses one timestamp per session (``session_timestamp``
+    field on the record or per-session metadata); all turns within a session share
+    that timestamp, which is forwarded as ``timestamp`` on each turn dict so that
+    ``ingest_conversation`` can pass it to ``memory.ingest`` as ``asserted_at``.
+    Per-turn vs per-session granularity differs by dataset; we plumb through
+    whatever the source provides without over-engineering.
+    """
     turns: list[dict] = []
     sessions = record.get("haystack_sessions") or []
     session_ids = record.get("haystack_session_ids") or []
+    # Some LongMemEval variants supply per-session timestamps as a parallel list
+    session_timestamps = record.get("session_timestamps") or record.get("haystack_session_timestamps") or []
 
     for sess_idx, session in enumerate(sessions):
         sid = session_ids[sess_idx] if sess_idx < len(session_ids) else f"sess-{sess_idx}"
         sid = str(sid)
+        # Prefer per-session timestamp from parallel list; fallback to record-level field
+        session_ts = (
+            session_timestamps[sess_idx]
+            if sess_idx < len(session_timestamps)
+            else record.get("session_timestamp")
+        )
 
         if isinstance(session, list):
             for turn in session:
@@ -94,21 +110,30 @@ def _parse_haystack_sessions(record: dict) -> list[dict]:
                     speaker = turn.get("role") or turn.get("speaker") or "user"
                     text = turn.get("content") or turn.get("text") or ""
                     if text:
-                        turns.append({
+                        t: dict = {
                             "speaker": str(speaker),
                             "text": str(text),
                             "session_id": sid,
-                        })
+                        }
+                        # Per-turn timestamp wins; fall back to session-level timestamp
+                        ts = turn.get("timestamp") or turn.get("date") or session_ts
+                        if ts is not None:
+                            t["timestamp"] = ts
+                        turns.append(t)
         elif isinstance(session, dict):
             for turn in session.get("messages") or session.get("turns") or []:
                 speaker = turn.get("role") or turn.get("speaker") or "user"
                 text = turn.get("content") or turn.get("text") or ""
                 if text:
-                    turns.append({
+                    t = {
                         "speaker": str(speaker),
                         "text": str(text),
                         "session_id": sid,
-                    })
+                    }
+                    ts = turn.get("timestamp") or turn.get("date") or session_ts
+                    if ts is not None:
+                        t["timestamp"] = ts
+                    turns.append(t)
 
     return turns
 

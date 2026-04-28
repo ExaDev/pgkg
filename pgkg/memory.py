@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 from uuid import UUID
 
@@ -25,6 +26,7 @@ class Result(BaseModel):
     subject: str | None
     predicate: str | None
     object: str | None
+    asserted_at: datetime | None = None
 
 
 @dataclass
@@ -140,6 +142,7 @@ class Memory:
         *,
         source: str | None = None,
         session_id: str | None = None,
+        asserted_at: datetime | None = None,
         chunk_size: int = 1200,
         chunk_overlap: int = 100,
     ) -> IngestResult:
@@ -159,13 +162,14 @@ class Memory:
             for i, chunk_text in enumerate(chunks):
                 chunk_id: UUID = await conn.fetchval(
                     """
-                    INSERT INTO chunks (document_id, text, span_start, span_end)
-                    VALUES ($1, $2, $3, $4) RETURNING id
+                    INSERT INTO chunks (document_id, text, span_start, span_end, asserted_at)
+                    VALUES ($1, $2, $3, $4, $5) RETURNING id
                     """,
                     doc_id,
                     chunk_text,
                     i * chunk_size,
                     (i + 1) * chunk_size,
+                    asserted_at,
                 )
                 chunk_ids.append(chunk_id)
 
@@ -226,9 +230,9 @@ class Memory:
                             f"""
                             INSERT INTO propositions
                                 (text, embedding, subject_id, predicate, object_id,
-                                 object_literal, chunk_id, namespace, session_id)
+                                 object_literal, chunk_id, namespace, session_id, asserted_at)
                             VALUES ($1, '{_vec_literal(prop_emb)}'::vector,
-                                    $2, $3, $4, $5, $6, $7, $8)
+                                    $2, $3, $4, $5, $6, $7, $8, $9)
                             RETURNING id
                             """,
                             prop.text,
@@ -239,6 +243,7 @@ class Memory:
                             chunk_id,
                             self._namespace,
                             session_id,
+                            asserted_at,
                         )
                         total_propositions += 1
 
@@ -265,9 +270,9 @@ class Memory:
                         f"""
                         INSERT INTO propositions
                             (text, embedding, subject_id, predicate, object_id,
-                             object_literal, chunk_id, namespace, session_id, metadata)
+                             object_literal, chunk_id, namespace, session_id, metadata, asserted_at)
                         VALUES ($1, '{_vec_literal(chunk_emb)}'::vector,
-                                NULL, NULL, NULL, NULL, $2, $3, $4, $5::jsonb)
+                                NULL, NULL, NULL, NULL, $2, $3, $4, $5::jsonb, $6)
                         RETURNING id
                         """,
                         chunk_text,
@@ -275,6 +280,7 @@ class Memory:
                         self._namespace,
                         session_id,
                         metadata,
+                        asserted_at,
                     )
                     total_propositions += 1
 
@@ -303,7 +309,7 @@ class Memory:
             rows = await conn.fetch(
                 f"""
                 SELECT proposition_id, text, embedding, rrf_score, adjusted_score,
-                       source_kind, chunk_id, subject_id, predicate, object_id
+                       source_kind, chunk_id, subject_id, predicate, object_id, asserted_at
                 FROM pgkg_search($1, '{_vec_literal(q_emb)}'::vector,
                                  $2, $3, $4, $5, 30.0, $6)
                 """,
@@ -375,6 +381,7 @@ class Memory:
                     subject=subject_name,
                     predicate=row["predicate"],
                     object=object_name,
+                    asserted_at=row["asserted_at"],
                 )
             )
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import subprocess
 import time
@@ -155,6 +156,31 @@ class BenchReport(BaseModel):
 # Ingestion helpers
 # ---------------------------------------------------------------------------
 
+_timestamp_warn_logged = False
+
+
+def _parse_turn_timestamp(raw: object) -> datetime | None:
+    """Parse a turn timestamp (ISO string or datetime) into a timezone-aware datetime.
+
+    Returns None if raw is None or unparseable. Logs a one-time warning on parse failure.
+    """
+    global _timestamp_warn_logged
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw if raw.tzinfo is not None else raw.replace(tzinfo=timezone.utc)
+    try:
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        if not _timestamp_warn_logged:
+            logging.warning(
+                "bench: could not parse turn timestamp %r — ingesting without asserted_at", raw
+            )
+            _timestamp_warn_logged = True
+        return None
+
+
 async def ingest_conversation(
     memory: Memory,
     *,
@@ -162,7 +188,14 @@ async def ingest_conversation(
     session_id: str,
     turns: list[dict],
 ) -> int:
-    """Ingest a list of turns into memory. Returns number of turns ingested."""
+    """Ingest a list of turns into memory. Returns number of turns ingested.
+
+    When a turn dict includes a ``timestamp`` field (ISO string or datetime),
+    it is parsed and forwarded to ``memory.ingest()`` as ``asserted_at`` so that
+    recency decay is keyed on when the fact was actually asserted rather than
+    when it was indexed.  Granularity varies by dataset: LoCoMo has per-turn
+    timestamps; LongMemEval (small variant) has one timestamp per session.
+    """
     count = 0
     for turn in turns:
         speaker = turn.get("speaker", "unknown")
@@ -170,7 +203,8 @@ async def ingest_conversation(
         if not text:
             continue
         formatted = f"{speaker}: {text}"
-        await memory.ingest(formatted, session_id=session_id)
+        asserted_at = _parse_turn_timestamp(turn.get("timestamp"))
+        await memory.ingest(formatted, session_id=session_id, asserted_at=asserted_at)
         count += 1
     return count
 
