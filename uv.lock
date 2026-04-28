@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.12"
 
 [options]
-exclude-newer = "2026-04-21T14:41:23.266995Z"
+exclude-newer = "2026-04-21T15:15:18.022369Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -1102,7 +1102,7 @@ wheels = [
 
 [[package]]
 name = "pgkg"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },

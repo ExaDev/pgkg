@@ -7,8 +7,25 @@ import sys
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
-    from scripts.run_migrations import run_migrations  # type: ignore[import]
-    asyncio.run(run_migrations())
+    import pathlib
+
+    import asyncpg
+
+    from pgkg.config import get_settings
+
+    async def _run() -> None:
+        dsn = get_settings().database_url
+        migrations_dir = pathlib.Path(__file__).resolve().parent.parent / "migrations"
+        conn = await asyncpg.connect(dsn)
+        try:
+            for migration in sorted(migrations_dir.glob("*.sql")):
+                print(f"Applying {migration.name}...")
+                await conn.execute(migration.read_text())
+            print("All migrations applied.")
+        finally:
+            await conn.close()
+
+    asyncio.run(_run())
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
