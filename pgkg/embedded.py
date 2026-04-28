@@ -56,6 +56,17 @@ def get_server(
     return server
 
 
+def _ensure_database(server: "_pgserver.PostgresServer", database: str) -> None:
+    """Create the target database if it does not already exist."""
+    result = server.psql(
+        f"SELECT 1 FROM pg_database WHERE datname = '{database}'",
+    )
+    # psql returns a row containing "1" when the database exists,
+    # or just the header + "(0 rows)" when it does not.
+    if "(0 rows)" in result:
+        server.psql(f'CREATE DATABASE "{database}"')
+
+
 def get_dsn(
     *,
     pgdata: str | pathlib.Path | None = None,
@@ -67,27 +78,5 @@ def get_dsn(
     Creates the target database if it does not exist.
     """
     server = get_server(pgdata=pgdata, cleanup_mode=cleanup_mode)
-
-    # pgserver's get_uri returns a libpq-style URI.
-    # Ensure the target database exists (pgserver only creates "postgres").
-    try:
-        server.psql(f"SELECT 1 FROM pg_database WHERE datname = '{database}'")
-        result = server.psql(
-            f"SELECT count(*) FROM pg_database WHERE datname = '{database}'"
-        )
-        # psql output includes header + row; parse the count
-        count = int(result.strip().splitlines()[-1].strip())
-        if count == 0:
-            server.psql(f'CREATE DATABASE "{database}"')
-    except Exception:
-        # Best effort — if the DB already exists, CREATE will fail harmlessly
-        try:
-            server.psql(f'CREATE DATABASE "{database}"')
-        except Exception:
-            pass
-
-    uri = server.get_uri(database=database)
-
-    # pgserver may return a URI with unix socket path in the host param.
-    # asyncpg accepts this format directly.
-    return uri
+    _ensure_database(server, database)
+    return server.get_uri(database=database)
