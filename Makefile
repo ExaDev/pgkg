@@ -87,6 +87,42 @@ bench-zep-stack:
 		uv run python -m bench.locomo && \
 		uv run python -m bench.longmemeval --variant longmemeval_s
 
+# NOTE: local-claude runs the app on the HOST (not inside Docker) because the
+# claude-agent-sdk shells out to the local 'claude' binary on your PATH.
+# The db container runs as normal; only the app must stay on the host.
+local-claude: ## Run pgkg locally with Claude Code subscription bridge (Pro/Max users)
+	@echo "Local experimentation mode — uses your claude CLI subscription."
+	@echo "Requires: claude CLI installed and logged in. Run 'claude' once first."
+	@command -v claude >/dev/null 2>&1 || { echo "claude CLI not found. Install from https://claude.com/claude-code"; exit 1; }
+	set -a; source .env.local-claude; set +a; \
+	  ./scripts/dev_db.sh && \
+	  uv run pgkg migrate && \
+	  uv run pgkg serve
+
+# Ablation baseline: pure chunk RAG (no LLM extraction). Same stack as bench-mem0-stack
+# but with --chunks-only on both bench commands. Quantifies the value of proposition extraction.
+bench-mem0-stack-chunks:
+	@if [ "$$CI" != "1" ]; then \
+		echo "WARNING: This benchmark will call OpenAI APIs and spend real money."; \
+		echo "Make sure OPENAI_API_KEY is set and you accept the cost."; \
+		read -p "Continue? [y/N] " ans; \
+		[ "$$ans" = "y" ] || [ "$$ans" = "Y" ] || (echo "Aborted." && exit 1); \
+	fi
+	set -a; source .env.bench-mem0-stack; set +a; \
+		uv run python -m bench.locomo --chunks-only && \
+		uv run python -m bench.longmemeval --variant longmemeval_s --chunks-only
+
+# Local experimentation with zero LLM at ingest. Same as local-claude but skips extraction
+# entirely — useful when you want zero LLM at ingest, even with claude_code provider configured.
+local-claude-chunks: ## Run pgkg locally with claude_code provider but skip extraction (PGKG_EXTRACT_PROPOSITIONS=0)
+	@echo "Local chunks-only mode — no LLM at ingest. Uses your claude CLI subscription for recall answering only."
+	@command -v claude >/dev/null 2>&1 || { echo "claude CLI not found. Install from https://claude.com/claude-code"; exit 1; }
+	set -a; source .env.local-claude; set +a; \
+	  export PGKG_EXTRACT_PROPOSITIONS=0; \
+	  ./scripts/dev_db.sh && \
+	  uv run pgkg migrate && \
+	  uv run pgkg serve
+
 bench-openrouter-free:
 	@if [ "$$CI" != "1" ]; then \
 		echo "WARNING: Free-tier OpenRouter is rate-limited. Use --limit 5 or expect throttling."; \

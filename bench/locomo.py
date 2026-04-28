@@ -159,6 +159,11 @@ async def main() -> None:
     parser.add_argument("--no-graph-expansion", action="store_true")
     parser.add_argument("--dataset-path", type=Path, default=None)
     parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument(
+        "--chunks-only",
+        action="store_true",
+        help="Skip LLM extraction; store chunks directly as propositions (ablation baseline).",
+    )
     args = parser.parse_args()
 
     config = BenchConfig(
@@ -171,6 +176,7 @@ async def main() -> None:
         expand_graph=not args.no_graph_expansion,
         dataset_path=args.dataset_path,
         concurrency=args.concurrency,
+        extract_propositions=not args.chunks_only,
     )
 
     items = load_locomo(dataset_path=args.dataset_path)

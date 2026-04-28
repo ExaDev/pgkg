@@ -266,6 +266,16 @@ def extract_propositions(
         props = _extract_openai(chunk_text, system_prompt, prop_schema, max_propositions, settings, extractor_model)
     elif settings.llm_provider == "anthropic":
         props = _extract_anthropic(chunk_text, system_prompt, prop_schema, max_propositions, settings, extractor_model)
+    elif settings.llm_provider == "claude_code":
+        import asyncio as _asyncio  # noqa: PLC0415
+        props = _asyncio.run(
+            _extract_claude_code(
+                chunk_text,
+                extractor_model=extractor_model,
+                max_propositions=max_propositions,
+                system_prompt=system_prompt,
+            )
+        )
     else:
         props = _extract_ollama(chunk_text, system_prompt, max_propositions, settings, extractor_model)
 
@@ -274,6 +284,60 @@ def extract_propositions(
         asyncio.run(_run_cache_put(cache, cache_key, chunk_hash, extractor_model, PROMPT_VERSION, props))
 
     return props
+
+
+def _parse_propositions_json(text: str) -> "list[Proposition]":
+    """Parse a JSON string containing a 'propositions' array into Proposition objects."""
+    import json  # noqa: PLC0415
+    data = json.loads(text)
+    return [Proposition(**p) for p in data.get("propositions", [])]
+
+
+async def _extract_claude_code(
+    chunk_text: str,
+    *,
+    extractor_model: str = "claude-haiku-4-5-20251001",
+    max_propositions: int = 20,
+    system_prompt: str,
+) -> "list[Proposition]":
+    """Extract propositions via the local claude CLI using claude-agent-sdk.
+
+    This is for local experimentation only. It requires the 'claude' CLI to be
+    installed and logged in. NOT suitable for benchmark runs (rate limits + ToS).
+    """
+    try:
+        import claude_agent_sdk  # noqa: PLC0415
+        from claude_agent_sdk import ClaudeAgentOptions  # noqa: PLC0415
+    except ImportError as exc:
+        raise RuntimeError(
+            "claude_code provider requires 'claude-agent-sdk' to be installed. "
+            "Run: uv sync --extra claude_agent"
+        ) from exc
+
+    user_prompt = (
+        f"{chunk_text}\n\n"
+        f"Return a JSON object with a 'propositions' array. "
+        f"Extract at most {max_propositions} propositions."
+    )
+
+    accumulated_text = ""
+    try:
+        async for message in claude_agent_sdk.query(
+            prompt=user_prompt,
+            options=ClaudeAgentOptions(model=extractor_model, system_prompt=system_prompt),
+        ):
+            # Collect text from AssistantMessage content blocks
+            if hasattr(message, "content") and isinstance(message.content, list):
+                for block in message.content:
+                    if hasattr(block, "text"):
+                        accumulated_text += block.text
+    except Exception as exc:
+        raise RuntimeError(
+            "claude_code provider requires the 'claude' CLI installed and logged in. "
+            "Run `claude` once to authenticate, or set PGKG_LLM_PROVIDER=openai instead."
+        ) from exc
+
+    return _parse_propositions_json(accumulated_text)
 
 
 def _extract_openai(
@@ -426,12 +490,35 @@ async def extract_propositions_async(
         if cached is not None:
             return cached
 
-    # Run sync LLM extraction in a thread pool to avoid blocking the event loop
-    loop = asyncio.get_event_loop()
-    props = await loop.run_in_executor(
-        None,
-        lambda: _do_extract(chunk_text, max_propositions, settings, extractor_model),
-    )
+    if settings.llm_provider == "claude_code":
+        # _extract_claude_code is natively async; call it directly rather than
+        # bridging through run_in_executor (which would need asyncio.run inside a
+        # running loop and would fail).
+        system_prompt = (
+            "You are a knowledge extraction assistant. Extract distinct atomic facts "
+            "from the provided text as subject-predicate-object propositions. "
+            "Rules:\n"
+            "- Each proposition must be self-contained and atomic (one fact per proposition).\n"
+            "- Resolve pronouns when context allows (use the actual entity name).\n"
+            "- Set object_is_literal=true for non-entity objects: numbers, dates, "
+            "  freeform strings, measurements, quotes.\n"
+            "- Keep subject and object as concise noun phrases.\n"
+            f"- Extract at most {max_propositions} propositions.\n"
+            "Return a JSON object with a 'propositions' array."
+        )
+        props = await _extract_claude_code(
+            chunk_text,
+            extractor_model=extractor_model,
+            max_propositions=max_propositions,
+            system_prompt=system_prompt,
+        )
+    else:
+        # Run sync LLM extraction in a thread pool to avoid blocking the event loop
+        loop = asyncio.get_event_loop()
+        props = await loop.run_in_executor(
+            None,
+            lambda: _do_extract(chunk_text, max_propositions, settings, extractor_model),
+        )
 
     if cache is not None:
         chunk_hash = hashlib.sha256(chunk_text.encode()).hexdigest()
@@ -475,5 +562,15 @@ def _do_extract(
         return _extract_openai(chunk_text, system_prompt, prop_schema, max_propositions, settings, extractor_model)
     elif settings.llm_provider == "anthropic":
         return _extract_anthropic(chunk_text, system_prompt, prop_schema, max_propositions, settings, extractor_model)
+    elif settings.llm_provider == "claude_code":
+        import asyncio as _asyncio  # noqa: PLC0415
+        return _asyncio.run(
+            _extract_claude_code(
+                chunk_text,
+                extractor_model=extractor_model,
+                max_propositions=max_propositions,
+                system_prompt=system_prompt,
+            )
+        )
     else:
         return _extract_ollama(chunk_text, system_prompt, max_propositions, settings, extractor_model)

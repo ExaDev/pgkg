@@ -125,11 +125,13 @@ class Memory:
         *,
         namespace: str = "default",
         use_extract_cache: bool = True,
+        extract_propositions: bool = True,
     ) -> None:
         self._pool = pool
         self._namespace = namespace
+        self._extract_propositions = extract_propositions
         self._extract_cache: ExtractCache | None = (
-            PostgresExtractCache(pool, namespace) if use_extract_cache else None
+            PostgresExtractCache(pool, namespace) if use_extract_cache and extract_propositions else None
         )
 
     async def ingest(
@@ -167,90 +169,114 @@ class Memory:
                 )
                 chunk_ids.append(chunk_id)
 
-            # Extract and embed per chunk
-            for chunk_id, chunk_text in zip(chunk_ids, chunks):
-                propositions = await ml.extract_propositions_async(
-                    chunk_text, cache=self._extract_cache
-                )
-                if not propositions:
-                    continue
-
-                # Collect all texts for batch embedding
-                entity_names: list[str] = []
-                for prop in propositions:
-                    entity_names.append(prop.subject)
-                    if not prop.object_is_literal:
-                        entity_names.append(prop.object)
-
-                prop_texts = [p.text for p in propositions]
-                all_texts = entity_names + prop_texts
-                all_embs = ml.embed(all_texts)
-
-                entity_embs = all_embs[: len(entity_names)]
-                prop_embs = all_embs[len(entity_names):]
-
-                # Link entities and insert propositions
-                entity_idx = 0
-                for prop, prop_emb in zip(propositions, prop_embs):
-                    subj_emb = entity_embs[entity_idx]
-                    entity_idx += 1
-
-                    subject_id: UUID = await conn.fetchval(
-                        _link_entity_sql(subj_emb),
-                        self._namespace,
-                        prop.subject,
-                        "concept",
+            if self._extract_propositions:
+                # Extract and embed per chunk
+                for chunk_id, chunk_text in zip(chunk_ids, chunks):
+                    propositions = await ml.extract_propositions_async(
+                        chunk_text, cache=self._extract_cache
                     )
-                    entities_created.add(subject_id)
+                    if not propositions:
+                        continue
 
-                    object_id: UUID | None = None
-                    object_literal: str | None = None
+                    # Collect all texts for batch embedding
+                    entity_names: list[str] = []
+                    for prop in propositions:
+                        entity_names.append(prop.subject)
+                        if not prop.object_is_literal:
+                            entity_names.append(prop.object)
 
-                    if prop.object_is_literal:
-                        object_literal = prop.object
-                    else:
-                        obj_emb = entity_embs[entity_idx]
+                    prop_texts = [p.text for p in propositions]
+                    all_texts = entity_names + prop_texts
+                    all_embs = ml.embed(all_texts)
+
+                    entity_embs = all_embs[: len(entity_names)]
+                    prop_embs = all_embs[len(entity_names):]
+
+                    # Link entities and insert propositions
+                    entity_idx = 0
+                    for prop, prop_emb in zip(propositions, prop_embs):
+                        subj_emb = entity_embs[entity_idx]
                         entity_idx += 1
-                        object_id = await conn.fetchval(
-                            _link_entity_sql(obj_emb),
+
+                        subject_id: UUID = await conn.fetchval(
+                            _link_entity_sql(subj_emb),
                             self._namespace,
-                            prop.object,
+                            prop.subject,
                             "concept",
                         )
-                        entities_created.add(object_id)
+                        entities_created.add(subject_id)
 
-                    prop_id: UUID = await conn.fetchval(
+                        object_id: UUID | None = None
+                        object_literal: str | None = None
+
+                        if prop.object_is_literal:
+                            object_literal = prop.object
+                        else:
+                            obj_emb = entity_embs[entity_idx]
+                            entity_idx += 1
+                            object_id = await conn.fetchval(
+                                _link_entity_sql(obj_emb),
+                                self._namespace,
+                                prop.object,
+                                "concept",
+                            )
+                            entities_created.add(object_id)
+
+                        prop_id: UUID = await conn.fetchval(
+                            f"""
+                            INSERT INTO propositions
+                                (text, embedding, subject_id, predicate, object_id,
+                                 object_literal, chunk_id, namespace, session_id)
+                            VALUES ($1, '{_vec_literal(prop_emb)}'::vector,
+                                    $2, $3, $4, $5, $6, $7, $8)
+                            RETURNING id
+                            """,
+                            prop.text,
+                            subject_id,
+                            prop.predicate,
+                            object_id,
+                            object_literal,
+                            chunk_id,
+                            self._namespace,
+                            session_id,
+                        )
+                        total_propositions += 1
+
+                        if object_id is not None:
+                            await conn.execute(
+                                """
+                                INSERT INTO edges (src_entity, dst_entity, relation, proposition_id)
+                                VALUES ($1, $2, $3, $4)
+                                ON CONFLICT DO NOTHING
+                                """,
+                                subject_id,
+                                object_id,
+                                prop.predicate,
+                                prop_id,
+                            )
+            else:
+                # Chunks-only mode: embed each chunk directly, no LLM extraction,
+                # no entity linking, no edge creation.
+                chunk_texts_list = list(chunks)
+                chunk_embs = ml.embed(chunk_texts_list)
+                for chunk_id, chunk_text, chunk_emb in zip(chunk_ids, chunk_texts_list, chunk_embs):
+                    metadata = '{"mode": "chunk"}'
+                    await conn.fetchval(
                         f"""
                         INSERT INTO propositions
                             (text, embedding, subject_id, predicate, object_id,
-                             object_literal, chunk_id, namespace, session_id)
-                        VALUES ($1, '{_vec_literal(prop_emb)}'::vector,
-                                $2, $3, $4, $5, $6, $7, $8)
+                             object_literal, chunk_id, namespace, session_id, metadata)
+                        VALUES ($1, '{_vec_literal(chunk_emb)}'::vector,
+                                NULL, NULL, NULL, NULL, $2, $3, $4, $5::jsonb)
                         RETURNING id
                         """,
-                        prop.text,
-                        subject_id,
-                        prop.predicate,
-                        object_id,
-                        object_literal,
+                        chunk_text,
                         chunk_id,
                         self._namespace,
                         session_id,
+                        metadata,
                     )
                     total_propositions += 1
-
-                    if object_id is not None:
-                        await conn.execute(
-                            """
-                            INSERT INTO edges (src_entity, dst_entity, relation, proposition_id)
-                            VALUES ($1, $2, $3, $4)
-                            ON CONFLICT DO NOTHING
-                            """,
-                            subject_id,
-                            object_id,
-                            prop.predicate,
-                            prop_id,
-                        )
 
         return IngestResult(
             documents=1,

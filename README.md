@@ -199,6 +199,34 @@ Returns:
 ]
 ```
 
+## Local experimentation (Claude Pro/Max users)
+
+If you have a Claude Pro or Max subscription, you can drive proposition extraction through the `claude` CLI — no OpenAI/Anthropic API key needed. **This is for development and exploration only**: rate limits and ToS make it unsuitable for benchmark runs.
+
+Prereqs: `claude` CLI installed and logged in (run `claude` once and log in via the browser flow).
+
+```bash
+uv sync --extra claude_agent
+cp .env.local-claude .env
+make local-claude    # spins up db, migrates, serves on host
+```
+
+The app must run on the host (not in the Docker `app` container) because the SDK shells out to your local `claude` binary. The `db` container is fine to use as normal.
+
+For a real benchmark, switch to `.env.bench-mem0-stack` and budget ~$50-100.
+
+## Two modes: chunks vs propositions
+
+pgkg supports two ingest modes:
+
+**Propositions mode (default)** — chunks are split into atomic facts via an LLM extractor; entities are linked across documents; edges enable graph expansion. Best retrieval quality, especially on multi-hop QA. Costs ~$X per 1M tokens of input.
+
+**Chunks mode** (`--chunks-only` / `PGKG_EXTRACT_PROPOSITIONS=0`) — chunks are embedded and stored directly as propositions with no entity structure. Zero LLM cost at ingest. Equivalent to vanilla hybrid RAG (BM25 + vector + rerank + MMR + recency). Graph expansion is a no-op (no edges).
+
+Both modes use the same retrieval pipeline (`pgkg_search()`), the same rerank+MMR, and the same `Result` shape. You can mix them per-namespace by configuring different `Memory` instances.
+
+The point: chunk RAG is a perfectly fine starting point for a lot of agent-memory use cases (especially in pgkg, since you still get hybrid retrieval and rerank). Add proposition extraction when you need entity-level recall or multi-hop reasoning. The headline benchmark numbers below quantify the gap.
+
 ## Configuration
 
 All settings are environment variables. See `.env.example` and `pgkg/config.py` for defaults.
@@ -210,11 +238,12 @@ All settings are environment variables. See `.env.example` and `pgkg/config.py` 
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace cross-encoder for reranking |
 | `EMBED_DIM` | `1024` | Embedding dimension (must match the chosen model) |
 | `LLM_MODEL` | `gpt-4o-mini` | LLM for proposition extraction |
-| `LLM_PROVIDER` | `openai` | One of: `openai`, `anthropic`, `ollama` |
+| `LLM_PROVIDER` | `openai` | One of: `openai`, `anthropic`, `ollama`, `claude_code` (local dev only — requires `claude` CLI) |
 | `OPENAI_API_KEY` | (unset) | OpenAI API key (required if `LLM_PROVIDER=openai`) |
 | `ANTHROPIC_API_KEY` | (unset) | Anthropic API key (required if `LLM_PROVIDER=anthropic`) |
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint (used if `LLM_PROVIDER=ollama`) |
 | `OFFLINE_EXTRACT` | `0` | Set to `1` to skip LLM calls (test mode); uses dummy extraction |
+| `EXTRACT_PROPOSITIONS` | `true` | Set to `0` or `false` to skip LLM extraction entirely; store chunks directly as propositions (NULL subject/predicate/object). Zero LLM cost at ingest. See [Two modes](#two-modes-chunks-vs-propositions). |
 | `DEFAULT_NAMESPACE` | `default` | Default namespace for memories |
 
 ### Development mode
@@ -260,12 +289,12 @@ Proposition extraction is deterministic w.r.t. model + `prompt_version`, cached 
 
 ### Results
 
-_TBD_ — run `make bench-mem0-stack` when you have an OpenAI key.
+_TBD_ — run `make bench-mem0-stack` (propositions) or `make bench-mem0-stack-chunks` (chunks ablation) when you have an OpenAI key.
 
-| Benchmark | pgkg | Mem0 | Zep | MemGPT | Stack used |
-|---|---|---|---|---|---|
-| LoCoMo (overall) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | mem0-stack |
-| LongMemEval-S (overall) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | mem0-stack |
+| Benchmark | pgkg (propositions) | pgkg (chunks) | Mem0 | Zep | MemGPT | Stack used |
+|---|---|---|---|---|---|---|
+| LoCoMo (overall) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | mem0-stack |
+| LongMemEval-S (overall) | _TBD_ | _TBD_ | _TBD_ | _TBD_ | _TBD_ | mem0-stack |
 
 **References:**
 - Mem0 published numbers: https://docs.mem0.ai/research

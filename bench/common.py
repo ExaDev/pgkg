@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 from pgkg.config import get_settings
@@ -31,6 +33,7 @@ class StackInfo(BaseModel):
     pgkg_git_sha: str
     recency_half_life_days: float = 30.0
     rrf_k: int = 60
+    mode: Literal["propositions", "chunks"] = "propositions"
 
 
 class BenchConfig(BaseModel):
@@ -50,6 +53,7 @@ class BenchConfig(BaseModel):
     concurrency: int = 4
     dry_run: bool = False
     exact_match: bool = False
+    extract_propositions: bool = True
     dataset_path: Path | None = None
     output_path: Path = Path("bench/results")
     namespace_prefix: str = "bench"
@@ -96,6 +100,7 @@ class BenchConfig(BaseModel):
             pgkg_git_sha=sha,
             recency_half_life_days=self.recency_half_life_days,
             rrf_k=self.rrf_k,
+            mode="chunks" if not self.extract_propositions else "propositions",
         )
 
 
@@ -250,6 +255,38 @@ def _call_llm(prompt: str, *, model: str, provider: str) -> str:
             messages=[{"role": "user", "content": prompt}],
         )
         return response.content[0].text if response.content else ""
+    elif provider == "claude_code":
+        # Local experimentation only — uses the local 'claude' CLI via claude-agent-sdk.
+        # NOT suitable for benchmark runs (rate limits + ToS).
+        import asyncio  # noqa: PLC0415
+        try:
+            import claude_agent_sdk  # noqa: PLC0415
+            from claude_agent_sdk import ClaudeAgentOptions  # noqa: PLC0415
+        except ImportError as exc:
+            raise RuntimeError(
+                "claude_code provider requires 'claude-agent-sdk' to be installed. "
+                "Run: uv sync --extra claude_agent"
+            ) from exc
+
+        async def _run_claude_code() -> str:
+            accumulated = ""
+            try:
+                async for message in claude_agent_sdk.query(
+                    prompt=prompt,
+                    options=ClaudeAgentOptions(model=model),
+                ):
+                    if hasattr(message, "content") and isinstance(message.content, list):
+                        for block in message.content:
+                            if hasattr(block, "text"):
+                                accumulated += block.text
+            except Exception as exc:
+                raise RuntimeError(
+                    "claude_code provider requires the 'claude' CLI installed and logged in. "
+                    "Run `claude` once to authenticate, or set PGKG_LLM_PROVIDER=openai instead."
+                ) from exc
+            return accumulated
+
+        return asyncio.run(_run_claude_code())
     else:
         import httpx
         payload = {
@@ -337,6 +374,7 @@ async def run_bench(
     print(
         f"Stack: extract={stack.extractor_model} answer={stack.answerer_model} "
         f"judge={stack.judge_model} embed={stack.embed_model} rerank={stack.rerank_model} "
+        f"mode={stack.mode} "
         f"retrieval={{k={config.k}, rrf_k={stack.rrf_k}, "
         f"recency_half_life={stack.recency_half_life_days}d, "
         f"graph={config.expand_graph}, rerank={config.with_rerank}, mmr={config.with_mmr}}}"
@@ -362,7 +400,7 @@ async def run_bench(
 
         async with semaphore:
             ns = item.namespace
-            memory = Memory(pool, namespace=ns)
+            memory = Memory(pool, namespace=ns, extract_propositions=config.extract_propositions)
 
             # Ingest all conversation turns grouped by session_id
             sessions: dict[str, list[dict]] = {}

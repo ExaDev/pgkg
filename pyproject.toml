@@ -1,6 +1,6 @@
 [project]
 name = "pgkg"
-version = "0.2.0"
+version = "0.4.0"
 description = "Postgres-native knowledge graph engine for agentic memory"
 license = { text = "MIT" }
 authors = [{ name = "ExaDev Ltd" }]
@@ -27,6 +27,13 @@ dev = [
     "pytest-asyncio>=0.23",
     "testcontainers[postgres]>=4.0",
     "pytest-mock>=3.14",
+]
+# Local experimentation via the Claude Pro/Max subscription (claude CLI bridge).
+# Install with: uv sync --extra claude_agent
+# NOT a hard dependency — only needed when PGKG_LLM_PROVIDER=claude_code.
+claude_agent = [
+    # Package name: claude-agent-sdk (verify current version on PyPI)
+    "claude-agent-sdk>=0.1.0",
 ]
 
 [project.scripts]

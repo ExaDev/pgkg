@@ -32,8 +32,9 @@ def cmd_ingest(args: argparse.Namespace) -> None:
 
     async def _run() -> None:
         settings = get_settings()
+        extract = not args.chunks_only
         async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace)
+            mem = Memory(pool, namespace=settings.default_namespace, extract_propositions=extract)
             result = await mem.ingest(text, source=source)
             print(json.dumps({
                 "documents": result.documents,
@@ -72,6 +73,16 @@ def main() -> None:
 
     ingest_parser = subparsers.add_parser("ingest", help="Ingest a file or stdin")
     ingest_parser.add_argument("path", help="Path to file or '-' for stdin")
+    ingest_parser.add_argument(
+        "--chunks-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip LLM proposition extraction; store chunks directly as propositions "
+            "(NULL subject/predicate/object). Zero LLM cost at ingest. "
+            "Equivalent to PGKG_EXTRACT_PROPOSITIONS=0."
+        ),
+    )
 
     recall_parser = subparsers.add_parser("recall", help="Recall memories matching a query")
     recall_parser.add_argument("query", help="Search query")

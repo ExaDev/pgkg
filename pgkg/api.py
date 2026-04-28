@@ -21,7 +21,11 @@ async def lifespan(app: FastAPI):
     global _pool, _memory
     settings = get_settings()
     _pool = await make_pool(settings.database_url)
-    _memory = Memory(_pool, namespace=settings.default_namespace)
+    _memory = Memory(
+        _pool,
+        namespace=settings.default_namespace,
+        extract_propositions=settings.extract_propositions,
+    )
     yield
     if _pool:
         await close_pool(_pool)

@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     embed_dim: int = 1024
     # Pinned model IDs — dated suffixes ensure reproducible benchmark comparisons.
     llm_model: str = "gpt-4o-mini-2024-07-18"
-    llm_provider: Literal["openai", "anthropic", "ollama"] = "openai"
+    llm_provider: Literal["openai", "anthropic", "ollama", "claude_code"] = "openai"
     # When set, overrides llm_model for extraction only.
     # Useful for "extract with one model, answer with another" Mem0-style setups.
     extractor_model: str | None = None
@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     openai_base_url: str | None = None
     default_namespace: str = "default"
     offline_extract: str = "0"
+    # When False, skip LLM proposition extraction entirely; store chunks directly
+    # as propositions (NULL subject/predicate/object). Zero LLM cost at ingest.
+    extract_propositions: bool = True
     # Informational: the prompt version used for extraction (source of truth is
     # the PROMPT_VERSION constant in ml.py; this field is logged into BenchReport).
     prompt_version: str = "v1"
