@@ -208,3 +208,33 @@ async def test_forget_supersedes(pool: asyncpg.Pool, monkeypatch):
     )
     result_ids = {r.proposition_id for r in results}
     assert prop_id not in result_ids, "Forgotten proposition should not appear in recall"
+
+
+# ---------------------------------------------------------------------------
+# test_recall_default_flags_with_pgvector_embedding (regression)
+# ---------------------------------------------------------------------------
+#
+# Regression for: bool(numpy.ndarray) ambiguity in memory.recall when the
+# rerank+MMR path inspects pgvector's returned embeddings. Every other
+# recall test bypassed rerank/MMR, so the truthiness check on the
+# embedding column was never exercised against a real DB row.
+
+async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, monkeypatch):
+    monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
+
+    import pgkg.ml as ml_module
+
+    monkeypatch.setattr(ml_module, "embed", _fake_embed)
+    monkeypatch.setattr(ml_module, "rerank", lambda q, docs: [1.0 / (i + 1) for i in range(len(docs))])
+
+    ns = f"recall_default_{uuid.uuid4().hex[:8]}"
+    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    await mem.ingest("The chunks-only ingest mode skips LLM extraction entirely.")
+    await mem.ingest("Hybrid retrieval fuses BM25 and vector similarity via RRF.")
+
+    # Default flags: rerank=True, mmr=True. This is the path the API uses
+    # and the path that previously crashed on numpy embedding truthiness.
+    results = await mem.recall("chunks-only mode", k=2)
+
+    assert len(results) > 0
+    assert all(r.text for r in results)
