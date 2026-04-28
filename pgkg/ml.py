@@ -164,11 +164,17 @@ def mmr(
 # ---------------------------------------------------------------------------
 
 class Proposition(BaseModel):
-    text: str
+    text: str = ""
     subject: str
     predicate: str
     object: str
     object_is_literal: bool = False
+
+    def model_post_init(self, __context) -> None:  # type: ignore[override]
+        # If the LLM omitted the surface form, synthesize it from S-P-O so the
+        # proposition still has a searchable text representation.
+        if not self.text:
+            self.text = f"{self.subject} {self.predicate} {self.object}".strip()
 
 
 async def _run_cache_get(cache: ExtractCache, cache_key: str) -> "list[Proposition] | None":
@@ -315,7 +321,14 @@ def _parse_propositions_json(text: str) -> "list[Proposition]":
         data = json.loads(s)
     except json.JSONDecodeError:
         return []
-    return [Proposition(**p) for p in data.get("propositions", [])]
+    out: list[Proposition] = []
+    for p in data.get("propositions", []):
+        try:
+            out.append(Proposition(**p))
+        except Exception:
+            # Drop malformed entries rather than failing the whole ingest.
+            continue
+    return out
 
 
 async def _extract_claude_code(
