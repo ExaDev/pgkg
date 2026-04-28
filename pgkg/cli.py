@@ -18,9 +18,27 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         migrations_dir = pathlib.Path(__file__).resolve().parent.parent / "migrations"
         conn = await asyncpg.connect(dsn)
         try:
+            await conn.execute(
+                "CREATE TABLE IF NOT EXISTS pgkg_schema_migrations ("
+                "  filename TEXT PRIMARY KEY,"
+                "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+                ")"
+            )
+            applied = {
+                r["filename"]
+                for r in await conn.fetch("SELECT filename FROM pgkg_schema_migrations")
+            }
             for migration in sorted(migrations_dir.glob("*.sql")):
+                if migration.name in applied:
+                    print(f"Skipping {migration.name} (already applied).")
+                    continue
                 print(f"Applying {migration.name}...")
-                await conn.execute(migration.read_text())
+                async with conn.transaction():
+                    await conn.execute(migration.read_text())
+                    await conn.execute(
+                        "INSERT INTO pgkg_schema_migrations (filename) VALUES ($1)",
+                        migration.name,
+                    )
             print("All migrations applied.")
         finally:
             await conn.close()

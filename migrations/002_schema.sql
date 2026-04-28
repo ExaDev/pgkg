@@ -1,4 +1,4 @@
-CREATE TABLE documents (
+CREATE TABLE IF NOT EXISTS documents (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     source      TEXT,
     namespace   TEXT NOT NULL DEFAULT 'default',
@@ -6,7 +6,7 @@ CREATE TABLE documents (
     created_at  TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE chunks (
+CREATE TABLE IF NOT EXISTS chunks (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     document_id UUID REFERENCES documents(id) ON DELETE CASCADE,
     text        TEXT NOT NULL,
@@ -16,7 +16,7 @@ CREATE TABLE chunks (
     created_at  TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE entities (
+CREATE TABLE IF NOT EXISTS entities (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name        TEXT NOT NULL,
     type        TEXT,
@@ -28,16 +28,16 @@ CREATE TABLE entities (
     UNIQUE(namespace, name, type)
 );
 
-CREATE INDEX entities_embedding_idx ON entities
+CREATE INDEX IF NOT EXISTS entities_embedding_idx ON entities
     USING hnsw (embedding vector_cosine_ops);
 
-CREATE INDEX entities_name_trgm_idx ON entities
+CREATE INDEX IF NOT EXISTS entities_name_trgm_idx ON entities
     USING gin (name gin_trgm_ops);
 
-CREATE INDEX entities_aliases_idx ON entities
+CREATE INDEX IF NOT EXISTS entities_aliases_idx ON entities
     USING gin (aliases);
 
-CREATE TABLE propositions (
+CREATE TABLE IF NOT EXISTS propositions (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     text             TEXT NOT NULL,
     tsv              tsvector GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
@@ -57,15 +57,15 @@ CREATE TABLE propositions (
     metadata         JSONB DEFAULT '{}'
 );
 
-CREATE INDEX prop_tsv_idx ON propositions USING gin (tsv);
-CREATE INDEX prop_emb_idx ON propositions USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX prop_ns_session_idx ON propositions (namespace, session_id);
-CREATE INDEX prop_subject_idx ON propositions (subject_id);
-CREATE INDEX prop_object_idx ON propositions (object_id);
-CREATE INDEX prop_active_idx ON propositions (namespace)
+CREATE INDEX IF NOT EXISTS prop_tsv_idx ON propositions USING gin (tsv);
+CREATE INDEX IF NOT EXISTS prop_emb_idx ON propositions USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS prop_ns_session_idx ON propositions (namespace, session_id);
+CREATE INDEX IF NOT EXISTS prop_subject_idx ON propositions (subject_id);
+CREATE INDEX IF NOT EXISTS prop_object_idx ON propositions (object_id);
+CREATE INDEX IF NOT EXISTS prop_active_idx ON propositions (namespace)
     WHERE superseded_by IS NULL;
 
-CREATE TABLE edges (
+CREATE TABLE IF NOT EXISTS edges (
     src_entity     UUID NOT NULL REFERENCES entities(id),
     dst_entity     UUID NOT NULL REFERENCES entities(id),
     relation       TEXT NOT NULL,
@@ -74,10 +74,10 @@ CREATE TABLE edges (
     PRIMARY KEY (src_entity, dst_entity, relation, proposition_id)
 );
 
-CREATE INDEX edges_src_idx ON edges (src_entity);
-CREATE INDEX edges_dst_idx ON edges (dst_entity);
+CREATE INDEX IF NOT EXISTS edges_src_idx ON edges (src_entity);
+CREATE INDEX IF NOT EXISTS edges_dst_idx ON edges (dst_entity);
 
-CREATE TABLE entity_pagerank (
+CREATE TABLE IF NOT EXISTS entity_pagerank (
     entity_id   UUID PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
     score       REAL NOT NULL,
     computed_at TIMESTAMPTZ DEFAULT now()
