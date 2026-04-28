@@ -112,13 +112,10 @@ bench-mem0-stack-chunks:
 		uv run python -m bench.locomo --chunks-only && \
 		uv run python -m bench.longmemeval --variant longmemeval_s --chunks-only
 
-# Local experimentation with zero LLM at ingest. Same as local-claude but skips extraction
-# entirely — useful when you want zero LLM at ingest, even with claude_code provider configured.
-local-claude-chunks: ## Run pgkg locally with claude_code provider but skip extraction (PGKG_EXTRACT_PROPOSITIONS=0)
-	@echo "Local chunks-only mode — no LLM at ingest. Uses your claude CLI subscription for recall answering only."
-	@command -v claude >/dev/null 2>&1 || { echo "claude CLI not found. Install from https://claude.com/claude-code"; exit 1; }
-	set -a; source .env.local-claude; set +a; \
-	  export PGKG_EXTRACT_PROPOSITIONS=0; \
+# Zero-LLM local mode: chunks-only ingest with hybrid retrieval. No API key, no claude CLI.
+local-chunks: ## Run pgkg locally in chunks-only mode (zero LLM at ingest)
+	@echo "Local chunks-only mode — pure hybrid RAG. No LLM, no API key, no claude CLI required."
+	set -a; source .env.local-chunks; set +a; \
 	  ./scripts/dev_db.sh && \
 	  uv run pgkg migrate && \
 	  uv run pgkg serve

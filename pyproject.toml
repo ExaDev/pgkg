@@ -1,6 +1,6 @@
 [project]
 name = "pgkg"
-version = "0.4.0"
+version = "0.4.1"
 description = "Postgres-native knowledge graph engine for agentic memory"
 license = { text = "MIT" }
 authors = [{ name = "ExaDev Ltd" }]

@@ -199,21 +199,46 @@ Returns:
 ]
 ```
 
-## Local experimentation (Claude Pro/Max users)
+## Local experimentation
 
-If you have a Claude Pro or Max subscription, you can drive proposition extraction through the `claude` CLI — no OpenAI/Anthropic API key needed. **This is for development and exploration only**: rate limits and ToS make it unsuitable for benchmark runs.
+Two paths depending on whether you want LLM-extracted facts or just chunk-level RAG.
 
-Prereqs: `claude` CLI installed and logged in (run `claude` once and log in via the browser flow).
+### Zero-LLM: chunks-only mode (fastest path)
+
+No API key, no `claude` CLI, no provider config. Chunks are embedded and stored directly; you still get hybrid retrieval (BM25 + vector + RRF), reranking, MMR, recency decay, and session scoping. You lose entity-level recall and graph-based multi-hop expansion (those need extracted facts), but for a lot of "drop in some files and search" use cases this is plenty.
+
+```bash
+cp .env.local-chunks .env
+make local-chunks         # spins up db, migrates, serves on host
+```
+
+Then ingest something:
+```bash
+curl -X POST http://localhost:8000/memorize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"pgkg is a Postgres-native knowledge graph engine. It supports a chunks-only mode that needs no LLM."}'
+curl -X POST http://localhost:8000/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"can pgkg run without an LLM?","k":5}'
+```
+
+### With proposition extraction: Claude Pro/Max subscription
+
+If you have a Claude Pro or Max subscription, you can drive extraction through the `claude` CLI — no OpenAI/Anthropic API key needed. **Local development only**: rate limits and ToS make it unsuitable for benchmark runs.
+
+Prereqs: `claude` CLI installed and logged in (run `claude` once and complete the browser flow).
 
 ```bash
 uv sync --extra claude_agent
 cp .env.local-claude .env
-make local-claude    # spins up db, migrates, serves on host
+make local-claude         # spins up db, migrates, serves on host
 ```
 
 The app must run on the host (not in the Docker `app` container) because the SDK shells out to your local `claude` binary. The `db` container is fine to use as normal.
 
-For a real benchmark, switch to `.env.bench-mem0-stack` and budget ~$50-100.
+### With proposition extraction: paid API
+
+For benchmark runs or if you don't have a Claude subscription, use OpenAI / Anthropic / Ollama / OpenRouter. See [Configuration](#configuration) and the `.env.bench-*` presets. Budget ~$50-100 for a full LongMemEval-S + LoCoMo bench pass on the Mem0 stack.
 
 ## Two modes: chunks vs propositions
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+
+- Promote zero-LLM chunks-only path as the lead local-experimentation flow. New `.env.local-chunks` preset and `make local-chunks` target — no API key, no `claude` CLI required.
+- Replace ill-defined `local-claude-chunks` target (which still required `claude` CLI for no functional reason) with the cleaner `local-chunks`.
+- Restructure README "Local experimentation" section into three explicit paths: zero-LLM, Claude subscription, paid API.
+
 ## 0.4.0
 
 - Add chunks-only ingest mode (`--chunks-only`, `PGKG_EXTRACT_PROPOSITIONS=0`). Skip LLM extraction; store chunks directly as propositions. Equivalent to vanilla hybrid RAG. Enables `pgkg-chunks` vs `pgkg-propositions` ablation.
