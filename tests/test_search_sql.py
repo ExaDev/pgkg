@@ -560,6 +560,51 @@ async def test_pgkg_search_asserted_at_overrides_recency(pool: asyncpg.Pool) -> 
     )
 
 
+async def test_pgkg_search_bm25_idf_ranking(pool: asyncpg.Pool) -> None:
+    """BM25 ranks a proposition matching a rare term above one matching a common term.
+
+    ts_rank_cd ignores term rarity (no IDF).  BM25 should rank the
+    proposition containing the rare term "zymurgy" higher than ones
+    containing the common term "animal" when the query is "zymurgy animal".
+    """
+    async with pool.acquire() as conn:
+        ns = f"bm25_idf_{uuid.uuid4().hex[:8]}"
+
+        # Insert many propositions containing "animal" (common term)
+        for i in range(20):
+            await insert_proposition(
+                conn, text=f"the animal kingdom contains species number {i}", namespace=ns,
+            )
+
+        # Insert one proposition containing both "animal" AND the rare term "zymurgy"
+        rare_id = await insert_proposition(
+            conn, text="zymurgy is the study of fermentation in animal biology", namespace=ns,
+        )
+
+        # Insert one proposition containing only "animal" (no rare term)
+        common_id = await insert_proposition(
+            conn, text="the animal is a common creature found everywhere", namespace=ns,
+        )
+
+        # Query for both terms — BM25 should boost "zymurgy" (rare, high IDF)
+        rows = await conn.fetch(
+            """
+            SELECT proposition_id, rrf_score
+            FROM pgkg_search('zymurgy animal', NULL, 30, 50, $1)
+            ORDER BY rrf_score DESC
+            """,
+            ns,
+        )
+
+    ids_ordered = [r["proposition_id"] for r in rows]
+    assert rare_id in ids_ordered, "Rare-term proposition should appear in results"
+    assert common_id in ids_ordered, "Common-term proposition should appear in results"
+    assert ids_ordered.index(rare_id) < ids_ordered.index(common_id), (
+        "Proposition with rare term 'zymurgy' should rank above common-only proposition "
+        "due to BM25 IDF weighting"
+    )
+
+
 async def test_pgkg_search_returns_asserted_at_column(pool: asyncpg.Pool) -> None:
     """pgkg_search result rows include the asserted_at column with the correct value."""
     from datetime import timedelta
