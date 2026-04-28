@@ -20,6 +20,63 @@ SQL:             393 lines (schema, search CTEs, PageRank)
 - **Fact supersession:** Mark propositions as superseded when new facts replace old ones.
 - **Optional PageRank:** Offline (precomputed) link-based importance weighting on the entity graph.
 
+## Quickstart
+
+End-to-end in two HTTP calls. Pick a path.
+
+### Path A — Vanilla RAG (zero LLM, no API key, no claude CLI)
+
+Pure chunks-only mode: chunks → embedder → Postgres. Hybrid retrieval + rerank + MMR + recency, no proposition extraction.
+
+```bash
+cp .env.local-chunks .env
+make local-chunks
+```
+
+```bash
+curl -X POST http://localhost:8000/memorize \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"pgkg is a Postgres-native knowledge graph engine for agentic memory. It was built by ExaDev. Chunks-only mode skips LLM extraction entirely."}'
+
+curl -X POST http://localhost:8000/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"who built pgkg?","k":3}' | python3 -m json.tool
+```
+
+You'll get the chunk back with a high score — vector + tsvector hybrid retrieval working. The `subject`, `predicate`, and `object` fields will be `null` because nothing extracted facts.
+
+### Path B — Propositions mode via Claude subscription (no API key)
+
+LLM extracts atomic facts at ingest. You'll see `subject`/`predicate`/`object` populated and the `text` field will be a short atomic statement, not the source paragraph.
+
+Prereqs: Claude Pro/Max subscription, `claude` CLI installed and logged in (run `claude` once to authenticate).
+
+```bash
+uv sync --extra claude_agent
+cp .env.local-claude .env
+make local-claude
+```
+
+Same curl as Path A. Compare the result shape:
+
+```jsonc
+// Path A (chunks): one big chunk back
+{ "text": "pgkg is a Postgres-native knowledge graph engine...", "subject": null, "predicate": null }
+
+// Path B (propositions): atomic fact, predicate populated
+{ "text": "pgkg built by ExaDev", "predicate": "built by", "source_kind": "both" }
+```
+
+`source_kind: "both"` only fires for atomic propositions because keyword search has a chance against short focused text. That's the win.
+
+### Switching between paths
+
+```bash
+make wipe                  # truncate ingested data, keep schema
+cp .env.local-claude .env  # or .env.local-chunks
+# Ctrl-C the running server, then re-run make local-* in the same terminal
+```
+
 ## Architecture
 
 ```
