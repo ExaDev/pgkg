@@ -27,6 +27,7 @@ dev = [
     "pytest-asyncio>=0.23",
     "testcontainers[postgres]>=4.0",
     "pytest-mock>=3.14",
+    "pgserver>=0.1.4",
 ]
 # Local experimentation via the Claude Pro/Max subscription (claude CLI bridge).
 # Install with: uv sync --extra claude_agent
@@ -34,6 +35,12 @@ dev = [
 claude_agent = [
     # Package name: claude-agent-sdk (verify current version on PyPI)
     "claude-agent-sdk>=0.1.0",
+]
+# Embedded Postgres via pgserver — no Docker required for local dev/testing.
+# Install with: uv sync --extra embedded
+# Bundles PostgreSQL 16.2 + pgvector in a pip wheel.
+embedded = [
+    "pgserver>=0.1.4",
 ]
 
 [project.scripts]
