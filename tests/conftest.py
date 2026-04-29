@@ -47,15 +47,20 @@ def pg_dsn():
 @pytest.fixture(scope="session")
 async def pool(pg_dsn) -> AsyncGenerator[asyncpg.Pool, None]:
     """Asyncpg pool pointing at the test database with all migrations applied."""
+    # Apply migrations first — the vector extension must exist before
+    # register_vector can be called in the pool's init callback.
+    migrate_conn = await asyncpg.connect(pg_dsn)
+    try:
+        for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            await migrate_conn.execute(migration.read_text())
+    finally:
+        await migrate_conn.close()
+
+    # Now create the pool with pgvector codec registration.
     conn_pool = await asyncpg.create_pool(
         pg_dsn, min_size=1, max_size=5,
         init=lambda conn: register_vector(conn),
     )
-
-    migration_files = sorted(MIGRATIONS_DIR.glob("*.sql"))
-    async with conn_pool.acquire() as conn:
-        for migration in migration_files:
-            await conn.execute(migration.read_text())
 
     yield conn_pool
     await conn_pool.close()
