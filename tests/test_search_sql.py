@@ -854,3 +854,120 @@ async def test_pgkg_search_returns_asserted_at_column(pool: asyncpg.Pool) -> Non
     assert returned_ts == expected_ts, (
         f"Returned asserted_at {returned_ts!r} should equal inserted {expected_ts!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Query decomposition tests
+#
+# These tests verify that pgkg_search() uses OR semantics for keyword
+# matching — a multi-term query returns propositions matching ANY subset
+# of terms, not just ALL of them.  BM25 scoring ranks propositions
+# matching more terms higher.
+# ---------------------------------------------------------------------------
+
+
+async def test_pgkg_search_or_semantics(pool: asyncpg.Pool) -> None:
+    """A multi-term query returns propositions matching only one of the terms.
+
+    With AND semantics (plainto_tsquery), "zymurgy fermentation" would only
+    match propositions containing BOTH terms.  With OR semantics, a
+    proposition containing just "fermentation" also appears.
+    """
+    async with pool.acquire() as conn:
+        ns = f"or_test_{uuid.uuid4().hex[:8]}"
+
+        # Proposition matching both terms
+        both_id = await insert_proposition(
+            conn, text="zymurgy is the science of fermentation", namespace=ns,
+        )
+
+        # Proposition matching only "fermentation"
+        one_id = await insert_proposition(
+            conn, text="fermentation produces alcohol from sugars", namespace=ns,
+        )
+
+        # Proposition matching neither
+        await insert_proposition(
+            conn, text="geology studies rocks and minerals", namespace=ns,
+        )
+
+        rows = await conn.fetch(
+            """
+            SELECT proposition_id
+            FROM pgkg_search('zymurgy fermentation', NULL, 10, 50, $1)
+            """,
+            ns,
+        )
+        result_ids = {r["proposition_id"] for r in rows}
+
+    assert both_id in result_ids, "Proposition matching both terms should appear"
+    assert one_id in result_ids, (
+        "Proposition matching only 'fermentation' should appear — OR semantics"
+    )
+
+
+async def test_pgkg_search_multi_term_ranking(pool: asyncpg.Pool) -> None:
+    """A proposition matching more query terms ranks higher than one matching fewer.
+
+    BM25 sums per-term contributions, so matching 2 of 2 query terms
+    scores higher than matching 1 of 2 (given similar document lengths).
+    """
+    async with pool.acquire() as conn:
+        ns = f"multi_rank_{uuid.uuid4().hex[:8]}"
+
+        # Proposition matching both "mitochondria" and "respiration"
+        both_id = await insert_proposition(
+            conn, text="mitochondria drive cellular respiration", namespace=ns,
+        )
+
+        # Proposition matching only "respiration"
+        one_id = await insert_proposition(
+            conn, text="respiration converts glucose to energy", namespace=ns,
+        )
+
+        # Background to give IDF meaningful values
+        for i in range(5):
+            await insert_proposition(
+                conn, text=f"background fact about chemistry number {i}", namespace=ns,
+            )
+
+        rows = await conn.fetch(
+            """
+            SELECT proposition_id
+            FROM pgkg_search('mitochondria respiration', NULL, 10, 50, $1)
+            """,
+            ns,
+        )
+        result_ids = [r["proposition_id"] for r in rows]
+
+    assert both_id in result_ids, "Both-term proposition should appear"
+    assert one_id in result_ids, "Single-term proposition should appear"
+    assert result_ids.index(both_id) < result_ids.index(one_id), (
+        "Proposition matching both terms should rank above single-term match"
+    )
+
+
+async def test_pgkg_search_no_terms_excluded(pool: asyncpg.Pool) -> None:
+    """All existing keyword tests still pass — OR semantics is a superset of AND.
+
+    When all query terms appear in a proposition, it still matches (and
+    ranks highest).  This is a sanity check that OR doesn't break the
+    common case.
+    """
+    async with pool.acquire() as conn:
+        ns = f"no_exclude_{uuid.uuid4().hex[:8]}"
+
+        target_id = await insert_proposition(
+            conn, text="cats are fluffy animals", namespace=ns,
+        )
+
+        rows = await conn.fetch(
+            """
+            SELECT proposition_id
+            FROM pgkg_search('fluffy cats', NULL, 10, 50, $1)
+            """,
+            ns,
+        )
+        result_ids = {r["proposition_id"] for r in rows}
+
+    assert target_id in result_ids, "Proposition matching all terms should still appear"
