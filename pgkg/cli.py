@@ -7,44 +7,17 @@ import sys
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
-    import pathlib
-
-    import asyncpg
-
+    from pgkg.backends.postgres import PostgresBackend
     from pgkg.config import get_settings
 
     async def _run() -> None:
-        dsn = get_settings().database_url
-        if dsn is None:
-            from pgkg.embedded import get_dsn
-            dsn = get_dsn()
-        migrations_dir = pathlib.Path(__file__).resolve().parent.parent / "migrations"
-        conn = await asyncpg.connect(dsn)
+        settings = get_settings()
+        backend = await PostgresBackend.create(settings.database_url)
         try:
-            await conn.execute(
-                "CREATE TABLE IF NOT EXISTS pgkg_schema_migrations ("
-                "  filename TEXT PRIMARY KEY,"
-                "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-                ")"
-            )
-            applied = {
-                r["filename"]
-                for r in await conn.fetch("SELECT filename FROM pgkg_schema_migrations")
-            }
-            for migration in sorted(migrations_dir.glob("*.sql")):
-                if migration.name in applied:
-                    print(f"Skipping {migration.name} (already applied).")
-                    continue
-                print(f"Applying {migration.name}...")
-                async with conn.transaction():
-                    await conn.execute(migration.read_text())
-                    await conn.execute(
-                        "INSERT INTO pgkg_schema_migrations (filename) VALUES ($1)",
-                        migration.name,
-                    )
+            await backend.apply_migrations()
             print("All migrations applied.")
         finally:
-            await conn.close()
+            await backend.close()
 
     asyncio.run(_run())
 
@@ -55,7 +28,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
-    from pgkg.db import pool_from_settings
+    from pgkg.backends.postgres import PostgresBackend
     from pgkg.memory import Memory
     from pgkg.config import get_settings
 
@@ -71,8 +44,9 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     async def _run() -> None:
         settings = get_settings()
         extract = not args.chunks_only
-        async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace, extract_propositions=extract)
+        backend = await PostgresBackend.create(settings.database_url)
+        try:
+            mem = Memory(backend, namespace=settings.default_namespace, extract_propositions=extract)
             result = await mem.ingest(text, source=source)
             print(json.dumps({
                 "documents": result.documents,
@@ -80,21 +54,26 @@ def cmd_ingest(args: argparse.Namespace) -> None:
                 "propositions": result.propositions,
                 "entities": result.entities,
             }))
+        finally:
+            await backend.close()
 
     asyncio.run(_run())
 
 
 def cmd_recall(args: argparse.Namespace) -> None:
-    from pgkg.db import pool_from_settings
+    from pgkg.backends.postgres import PostgresBackend
     from pgkg.memory import Memory
     from pgkg.config import get_settings
 
     async def _run() -> None:
         settings = get_settings()
-        async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace)
+        backend = await PostgresBackend.create(settings.database_url)
+        try:
+            mem = Memory(backend, namespace=settings.default_namespace)
             results = await mem.recall(args.query, k=args.k)
             print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
+        finally:
+            await backend.close()
 
     asyncio.run(_run())
 

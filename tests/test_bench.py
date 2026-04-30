@@ -41,7 +41,7 @@ def test_bench_item_validates():
 # test_run_bench_dry_run_exact_match
 # ---------------------------------------------------------------------------
 
-async def test_run_bench_dry_run_exact_match(pool: asyncpg.Pool, monkeypatch):
+async def test_run_bench_dry_run_exact_match(pool: asyncpg.Pool, backend, monkeypatch):
     """run_bench with dry_run=True, exact_match=True completes without LLM calls."""
     monkeypatch.setenv("PGKG_OFFLINE_EXTRACT", "1")
 
@@ -99,7 +99,7 @@ async def test_run_bench_dry_run_exact_match(pool: asyncpg.Pool, monkeypatch):
             name="test-dryrun",
             items=items,
             config=config,
-            pool=pool,
+            backend=backend,
         )
 
     assert report.total == 2

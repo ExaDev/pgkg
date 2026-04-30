@@ -31,7 +31,7 @@ def _fake_embed(texts: list[str]) -> list[list[float]]:
 # test_ingest_chunks_only_skips_extraction
 # ---------------------------------------------------------------------------
 
-async def test_ingest_chunks_only_skips_extraction(pool: asyncpg.Pool, monkeypatch):
+async def test_ingest_chunks_only_skips_extraction(pool: asyncpg.Pool, backend, monkeypatch):
     """extract_propositions_async must not be called; propositions have NULL subject_id
     and metadata->>'mode' = 'chunk'; entities table is untouched."""
     import pgkg.ml as ml_module
@@ -44,7 +44,7 @@ async def test_ingest_chunks_only_skips_extraction(pool: asyncpg.Pool, monkeypat
     monkeypatch.setattr(ml_module, "extract_propositions_async", _should_not_be_called)
 
     ns = f"chunks_only_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(backend, namespace=ns, extract_propositions=False)
     result = await mem.ingest("Hello world. This is a test document.")
 
     assert result.documents == 1
@@ -83,7 +83,7 @@ async def test_ingest_chunks_only_skips_extraction(pool: asyncpg.Pool, monkeypat
 # test_recall_works_in_chunks_mode
 # ---------------------------------------------------------------------------
 
-async def test_recall_works_in_chunks_mode(pool: asyncpg.Pool, monkeypatch):
+async def test_recall_works_in_chunks_mode(pool: asyncpg.Pool, backend, monkeypatch):
     """After chunks-only ingest, recall returns results with NULL predicate."""
     import pgkg.ml as ml_module
 
@@ -114,7 +114,7 @@ async def test_recall_works_in_chunks_mode(pool: asyncpg.Pool, monkeypatch):
     monkeypatch.setattr(ml_module, "extract_propositions_async", _noop_extract)
 
     ns = f"chunks_recall_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(backend, namespace=ns, extract_propositions=False)
     await mem.ingest(ocean_text)
 
     results = await mem.recall(
@@ -135,7 +135,7 @@ async def test_recall_works_in_chunks_mode(pool: asyncpg.Pool, monkeypatch):
 # test_chunks_mode_graph_expansion_is_noop
 # ---------------------------------------------------------------------------
 
-async def test_chunks_mode_graph_expansion_is_noop(pool: asyncpg.Pool, monkeypatch):
+async def test_chunks_mode_graph_expansion_is_noop(pool: asyncpg.Pool, backend, monkeypatch):
     """Graph expansion with chunks-only ingest produces no graph-sourced rows."""
     import pgkg.ml as ml_module
     monkeypatch.setattr(ml_module, "embed", _fake_embed)
@@ -152,7 +152,7 @@ async def test_chunks_mode_graph_expansion_is_noop(pool: asyncpg.Pool, monkeypat
     monkeypatch.setattr(ml_module, "extract_propositions_async", _noop_extract)
 
     ns = f"chunks_graph_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(backend, namespace=ns, extract_propositions=False)
     await mem.ingest("Alice visited Bob last Tuesday. Bob works at Acme Corp.")
 
     results = await mem.recall(

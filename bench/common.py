@@ -395,7 +395,7 @@ async def run_bench(
     name: str,
     items: Iterable[BenchItem],
     config: BenchConfig,
-    pool,
+    backend,
 ) -> BenchReport:
     """Orchestrate the full benchmark run."""
     from pgkg.memory import Memory
@@ -434,7 +434,7 @@ async def run_bench(
 
         async with semaphore:
             ns = item.namespace
-            memory = Memory(pool, namespace=ns, extract_propositions=config.extract_propositions)
+            memory = Memory(backend, namespace=ns, extract_propositions=config.extract_propositions)
 
             # Ingest all conversation turns grouped by session_id
             sessions: dict[str, list[dict]] = {}
