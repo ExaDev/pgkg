@@ -18,7 +18,10 @@ class Settings(BaseSettings):
     database_url: str | None = None
     embed_model: str = "BAAI/bge-m3"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
-    embed_dim: int = 1024
+    # The embedding width is a property of the schema, not of configuration:
+    # read it with pgkg_embedding_dim('propositions', 'embedding').  A settings
+    # field here would only be able to disagree with the column.
+    #
     # Pinned model IDs — dated suffixes ensure reproducible benchmark comparisons.
     llm_model: str = "gpt-4o-mini-2024-07-18"
     llm_provider: Literal["openai", "anthropic", "ollama", "claude_code"] = "openai"

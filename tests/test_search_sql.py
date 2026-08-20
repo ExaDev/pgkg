@@ -573,28 +573,6 @@ async def test_pgkg_search_asserted_at_overrides_recency(pool: asyncpg.Pool) -> 
 # prove the old ranking would have been wrong (or at least indifferent).
 # ---------------------------------------------------------------------------
 
-async def _tsrankcd_order(
-    conn: asyncpg.Connection,
-    query: str,
-    namespace: str,
-    limit: int = 50,
-) -> list[UUID]:
-    """Return proposition IDs ranked by ts_rank_cd (the old scoring method)."""
-    rows = await conn.fetch(
-        """
-        SELECT p.id
-        FROM propositions p
-        WHERE p.tsv @@ plainto_tsquery('english', $1)
-          AND p.namespace = $2
-          AND p.superseded_by IS NULL
-        ORDER BY ts_rank_cd(p.tsv, plainto_tsquery('english', $1)) DESC
-        LIMIT $3
-        """,
-        query, namespace, limit,
-    )
-    return [r["id"] for r in rows]
-
-
 async def test_pgkg_search_bm25_idf_ranking(pool: asyncpg.Pool) -> None:
     """BM25's IDF gives a higher score for a rare query term than a common one.
 

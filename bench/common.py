@@ -435,104 +435,109 @@ async def run_bench(
         async with semaphore:
             ns = item.namespace
             memory = Memory(pool, namespace=ns, extract_propositions=config.extract_propositions)
+            try:
+                # Ingest all conversation turns grouped by session_id
+                sessions: dict[str, list[dict]] = {}
+                for turn in item.conversation:
+                    sid = turn.get("session_id") or item.session_id or "default"
+                    sessions.setdefault(sid, []).append(turn)
 
-            # Ingest all conversation turns grouped by session_id
-            sessions: dict[str, list[dict]] = {}
-            for turn in item.conversation:
-                sid = turn.get("session_id") or item.session_id or "default"
-                sessions.setdefault(sid, []).append(turn)
-
-            prop_count = 0
-            for sid, turns in sessions.items():
-                prop_count += await ingest_conversation(
-                    memory,
-                    namespace=ns,
-                    session_id=sid,
-                    turns=turns,
-                )
-            n_propositions += prop_count
-
-            # Answer each question
-            for qa in item.questions:
-                t0 = time.monotonic()
-                results = await memory.recall(
-                    qa.question,
-                    k=config.k,
-                    k_retrieve=config.k_retrieve,
-                    session_id=item.session_id,
-                    with_rerank=config.with_rerank,
-                    with_mmr=config.with_mmr,
-                    expand_graph=config.expand_graph,
-                )
-                recall_ms = (time.monotonic() - t0) * 1000
-                recall_latencies.append(recall_ms)
-
-                t1 = time.monotonic()
-                if config.dry_run:
-                    predicted = results[0].text if results else "I don't know"
-                    grade = {"correct": False, "reasoning": "dry_run"}
-                else:
-                    context = "\n".join(f"- {r.text}" for r in results)
-                    prompt = (
-                        f"Facts:\n{context}\n\n"
-                        f"Question: {qa.question}\n\n"
-                        "Answer the question using only the facts above. "
-                        "If the answer is not in the facts, say 'I don't know'."
+                prop_count = 0
+                for sid, turns in sessions.items():
+                    prop_count += await ingest_conversation(
+                        memory,
+                        namespace=ns,
+                        session_id=sid,
+                        turns=turns,
                     )
-                    predicted = _call_llm(
-                        prompt,
-                        model=config.judge_model,
-                        provider=config.judge_provider,
+                n_propositions += prop_count
+
+                # Answer each question
+                for qa in item.questions:
+                    t0 = time.monotonic()
+                    results = await memory.recall(
+                        qa.question,
+                        k=config.k,
+                        k_retrieve=config.k_retrieve,
+                        session_id=item.session_id,
+                        with_rerank=config.with_rerank,
+                        with_mmr=config.with_mmr,
+                        expand_graph=config.expand_graph,
                     )
-                    grade = llm_judge_grade(
-                        question=qa.question,
-                        gold_answer=qa.answer,
-                        predicted=predicted,
-                        judge_model=config.judge_model,
-                        judge_provider=config.judge_provider,
+                    recall_ms = (time.monotonic() - t0) * 1000
+                    recall_latencies.append(recall_ms)
+
+                    t1 = time.monotonic()
+                    if config.dry_run:
+                        predicted = results[0].text if results else "I don't know"
+                        grade = {"correct": False, "reasoning": "dry_run"}
+                    else:
+                        context = "\n".join(f"- {r.text}" for r in results)
+                        prompt = (
+                            f"Facts:\n{context}\n\n"
+                            f"Question: {qa.question}\n\n"
+                            "Answer the question using only the facts above. "
+                            "If the answer is not in the facts, say 'I don't know'."
+                        )
+                        predicted = _call_llm(
+                            prompt,
+                            model=config.judge_model,
+                            provider=config.judge_provider,
+                        )
+                        grade = llm_judge_grade(
+                            question=qa.question,
+                            gold_answer=qa.answer,
+                            predicted=predicted,
+                            judge_model=config.judge_model,
+                            judge_provider=config.judge_provider,
+                        )
+                    answer_ms = (time.monotonic() - t1) * 1000
+                    answer_latencies.append(answer_ms)
+
+                    is_correct = bool(grade.get("correct", False))
+                    is_em = exact_match_grade(gold_answer=qa.answer, predicted=predicted)
+
+                    cat = qa.category
+                    if cat not in per_category:
+                        per_category[cat] = CategoryStats()
+                    per_category[cat].total += 1
+                    if is_correct:
+                        per_category[cat].correct += 1
+
+                    total += 1
+                    if is_correct:
+                        correct += 1
+                    if is_em:
+                        em_correct += 1
+
+                    record = {
+                        "item_id": item.id,
+                        "qa_id": qa.id,
+                        "question": qa.question,
+                        "gold": qa.answer,
+                        "predicted": predicted,
+                        "correct": is_correct,
+                        "exact_match": is_em,
+                        "category": cat,
+                        "recall_ms": recall_ms,
+                        "answer_ms": answer_ms,
+                        "n_retrieved": len(results),
+                    }
+
+                    with open(results_path, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+
+                    status = "CORRECT" if is_correct else "wrong"
+                    em_status = "EM" if is_em else ""
+                    print(
+                        f"[{total:4d}] {status:7s} {em_status:2s} | "
+                        f"{qa.question[:60]!r} → {predicted[:40]!r}"
                     )
-                answer_ms = (time.monotonic() - t1) * 1000
-                answer_latencies.append(answer_ms)
-
-                is_correct = bool(grade.get("correct", False))
-                is_em = exact_match_grade(gold_answer=qa.answer, predicted=predicted)
-
-                cat = qa.category
-                if cat not in per_category:
-                    per_category[cat] = CategoryStats()
-                per_category[cat].total += 1
-                if is_correct:
-                    per_category[cat].correct += 1
-
-                total += 1
-                if is_correct:
-                    correct += 1
-                if is_em:
-                    em_correct += 1
-
-                record = {
-                    "item_id": item.id,
-                    "qa_id": qa.id,
-                    "question": qa.question,
-                    "gold": qa.answer,
-                    "predicted": predicted,
-                    "correct": is_correct,
-                    "exact_match": is_em,
-                    "category": cat,
-                    "recall_ms": recall_ms,
-                    "answer_ms": answer_ms,
-                    "n_retrieved": len(results),
-                }
-
-                with open(results_path, "a") as f:
-                    f.write(json.dumps(record) + "\n")
-
-                status = "CORRECT" if is_correct else "wrong"
-                em_status = "EM" if is_em else ""
-                print(
-                    f"[{total:4d}] {status:7s} {em_status:2s} | "
-                    f"{qa.question[:60]!r} → {predicted[:40]!r}"
-                )
+            finally:
+                # recall() accumulates access counts in process, so a
+                # per-item Memory that is never closed discards the
+                # frequency signal the benchmark exists to measure.
+                await memory.aclose()
 
     await asyncio.gather(*[process_item(item) for item in items_list])
 

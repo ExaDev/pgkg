@@ -28,6 +28,10 @@ async def lifespan(app: FastAPI):
         extract_propositions=settings.extract_propositions,
     )
     yield
+    # The Memory carries access counts that recall() deliberately did not write;
+    # closing it is what turns them into rows, so it happens before the pool goes.
+    if _memory:
+        await _memory.aclose()
     if _pool:
         await close_pool(_pool)
 

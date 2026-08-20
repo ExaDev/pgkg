@@ -54,10 +54,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run("pgkg.api:app", host=args.host, port=args.port, reload=False)
 
 
-def cmd_ingest(args: argparse.Namespace) -> None:
+async def run_ingest(args: argparse.Namespace) -> None:
+    from pgkg.config import get_settings
     from pgkg.db import pool_from_settings
     from pgkg.memory import Memory
-    from pgkg.config import get_settings
 
     if args.path == "-":
         text = sys.stdin.read()
@@ -68,35 +68,48 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         text = p.read_text()
         source = str(p)
 
-    async def _run() -> None:
-        settings = get_settings()
-        extract = not args.chunks_only
-        async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace, extract_propositions=extract)
+    settings = get_settings()
+    async with pool_from_settings() as pool:
+        mem = Memory(
+            pool,
+            namespace=settings.default_namespace,
+            extract_propositions=not args.chunks_only,
+        )
+        try:
             result = await mem.ingest(text, source=source)
-            print(json.dumps({
-                "documents": result.documents,
-                "chunks": result.chunks,
-                "propositions": result.propositions,
-                "entities": result.entities,
-            }))
+        finally:
+            await mem.aclose()
+        print(json.dumps({
+            "documents": result.documents,
+            "chunks": result.chunks,
+            "propositions": result.propositions,
+            "entities": result.entities,
+        }))
 
-    asyncio.run(_run())
+
+def cmd_ingest(args: argparse.Namespace) -> None:
+    asyncio.run(run_ingest(args))
+
+
+async def run_recall(args: argparse.Namespace) -> None:
+    from pgkg.config import get_settings
+    from pgkg.db import pool_from_settings
+    from pgkg.memory import Memory
+
+    settings = get_settings()
+    async with pool_from_settings() as pool:
+        mem = Memory(pool, namespace=settings.default_namespace)
+        # A CLI invocation is a whole process lifetime: without the close, the
+        # access counts recall() accumulated in memory never reach the database.
+        try:
+            results = await mem.recall(args.query, k=args.k)
+        finally:
+            await mem.aclose()
+        print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
 
 
 def cmd_recall(args: argparse.Namespace) -> None:
-    from pgkg.db import pool_from_settings
-    from pgkg.memory import Memory
-    from pgkg.config import get_settings
-
-    async def _run() -> None:
-        settings = get_settings()
-        async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace)
-            results = await mem.recall(args.query, k=args.k)
-            print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
-
-    asyncio.run(_run())
+    asyncio.run(run_recall(args))
 
 
 def main() -> None:

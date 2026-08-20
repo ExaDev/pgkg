@@ -109,18 +109,23 @@ cp .env.local-claude .env  # or .env.local-chunks
 │ Tables:                                             │
 │   documents       chunks     propositions           │
 │   entities        edges      entity_pagerank        │
+│   corpus_stats    lexeme_df  proposition_cache      │
 │                                                     │
 │ Key functions (everything below the line is SQL):   │
-│   pgkg_search()         → 250+ lines RRF + graph   │
-│   pgkg_link_entity()    → entity dedup + linking    │
-│   pgkg_bump_access()    → update recency counters   │
+│   pgkg_search()             → composes the stages   │
+│   pgkg_bm25_candidates()    → keyword arm           │
+│   pgkg_vector_candidates()  → vector arm            │
+│   pgkg_graph_candidates()   → one-hop expansion     │
+│   pgkg_fuse()               → weighted RRF          │
+│   pgkg_apply_profile()      → recency + frequency   │
+│   pgkg_link_entity()        → entity dedup          │
 │   pgkg_recompute_pagerank() → offline scoring       │
 └─────────────────────────────────────────────────────┘
 ```
 
 ## The hero query: RRF + graph expansion
 
-The core of pgkg is a single SQL function that orchestrates keyword retrieval, vector retrieval, RRF fusion, and graph expansion. Here's the RRF and fusion logic (full function in `migrations/003_search.sql`):
+`pgkg_search()` orchestrates keyword retrieval, vector retrieval, RRF fusion and graph expansion. Each stage is its own set-returning function over a `pgkg_candidate` row type, so an arm can be tested, replaced or weighted on its own; `pgkg_search()` is the composition (see `migrations/010_search_decompose.sql`). Here's the RRF and fusion logic:
 
 ```sql
 -- 1. Keyword retrieval (tsvector + ts_rank_cd)
@@ -322,7 +327,6 @@ All settings are environment variables. See `.env.example` and `pgkg/config.py` 
 | `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/pgkg` | Postgres connection string |
 | `EMBED_MODEL` | `BAAI/bge-m3` | HuggingFace sentence-transformer model for embeddings |
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace cross-encoder for reranking |
-| `EMBED_DIM` | `1024` | Embedding dimension (must match the chosen model) |
 | `LLM_MODEL` | `gpt-4o-mini` | LLM for proposition extraction |
 | `LLM_PROVIDER` | `openai` | One of: `openai`, `anthropic`, `ollama`, `claude_code` (local dev only — requires `claude` CLI) |
 | `OPENAI_API_KEY` | (unset) | OpenAI API key (required if `LLM_PROVIDER=openai`) |
@@ -430,12 +434,19 @@ pgkg/
 ├── migrations/                # SQL schema and functions
 │   ├── 001_extensions.sql     # Enable pgvector, pg_trgm
 │   ├── 002_schema.sql         # Tables: documents, chunks, propositions, entities, edges
-│   ├── 003_search.sql         # pgkg_search(), pgkg_link_entity(), pgkg_bump_access()
-│   └── 004_pagerank.sql       # pgkg_recompute_pagerank()
+│   ├── 003_search.sql         # pgkg_link_entity(), pgkg_bump_access()
+│   ├── 004_pagerank.sql       # pgkg_recompute_pagerank()
+│   ├── 005–009                # Extract cache, asserted_at, BM25, OR semantics
+│   ├── 010_search_decompose.sql  # pgkg_search() as composable candidate SRFs
+│   ├── 011_bm25_stats.sql     # Materialised corpus_stats + lexeme_df
+│   ├── 012_halfvec_dims.sql   # halfvec storage, no hardcoded dimension
+│   └── 013_link_entity_idempotent.sql  # Concurrent entity resolution
 │
 ├── pgkg/                       # Python package (~350 lines)
 │   ├── config.py              # Settings (pydantic)
 │   ├── db.py                  # asyncpg pool + pgvector init
+│   ├── chunking.py            # Content-defined chunk boundaries
+│   ├── memory.py              # Ingest and recall
 │   ├── ml.py                  # Embeddings, reranking, MMR, proposition extraction
 │   └── api.py                 # FastAPI endpoints (created by Phase 2b)
 │
