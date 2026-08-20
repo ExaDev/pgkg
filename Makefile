@@ -43,13 +43,13 @@ smoke:
 	@echo "--- memorize ---"
 	@MEMO_ID=$$(curl -sf -X POST http://localhost:${PGKG_APP_PORT:-8000}/memorize \
 		-H 'Content-Type: application/json' \
-		-d '{"content": "pgkg smoke test memory", "tags": ["smoke"]}' | python3 -m json.tool); \
+		-d '{"text": "pgkg smoke test memory", "source": "smoke"}' | python3 -m json.tool) || (echo "FAIL: memorize rejected" && exit 1); \
 	echo "$$MEMO_ID"; \
 	echo ""; \
 	echo "--- recall ---"; \
 	curl -sf -X POST http://localhost:${PGKG_APP_PORT:-8000}/recall \
 		-H 'Content-Type: application/json' \
-		-d '{"query": "smoke test memory", "top_k": 3}' | python3 -m json.tool || (echo "FAIL: recall failed" && exit 1)
+		-d '{"query": "smoke test memory", "k": 3}' | python3 -m json.tool || (echo "FAIL: recall failed" && exit 1)
 	@echo ""
 	@echo "Smoke test passed."
 

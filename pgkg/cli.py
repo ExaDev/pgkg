@@ -54,6 +54,35 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run("pgkg.api:app", host=args.host, port=args.port, reload=False)
 
 
+def _scope(args: argparse.Namespace):
+    """The tenant this invocation runs as.
+
+    Absent flags resolve to the reserved default org and collection, which is
+    the partition every pre-tenancy row was backfilled into — so an existing
+    script keeps reading and writing exactly what it did.
+    """
+    import uuid
+
+    from pgkg.config import DEFAULT_COLLECTION_ID, DEFAULT_ORG_ID
+    from pgkg.memory import Scope
+
+    return Scope(
+        org_id=uuid.UUID(args.org) if getattr(args, "org", None) else DEFAULT_ORG_ID,
+        collection_id=(
+            uuid.UUID(args.collection)
+            if getattr(args, "collection", None)
+            else DEFAULT_COLLECTION_ID
+        ),
+        user_id=uuid.UUID(args.user) if getattr(args, "user", None) else None,
+    )
+
+
+def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--org", default=None, help="Org UUID to act as")
+    parser.add_argument("--user", default=None, help="User UUID to act as")
+    parser.add_argument("--collection", default=None, help="Collection UUID")
+
+
 async def run_ingest(args: argparse.Namespace) -> None:
     from pgkg.config import get_settings
     from pgkg.db import pool_from_settings
@@ -73,6 +102,7 @@ async def run_ingest(args: argparse.Namespace) -> None:
         mem = Memory(
             pool,
             namespace=settings.default_namespace,
+            scope=_scope(args),
             extract_propositions=not args.chunks_only,
         )
         try:
@@ -98,7 +128,7 @@ async def run_recall(args: argparse.Namespace) -> None:
 
     settings = get_settings()
     async with pool_from_settings() as pool:
-        mem = Memory(pool, namespace=settings.default_namespace)
+        mem = Memory(pool, namespace=settings.default_namespace, scope=_scope(args))
         # A CLI invocation is a whole process lifetime: without the close, the
         # access counts recall() accumulated in memory never reach the database.
         try:
@@ -134,10 +164,12 @@ def main() -> None:
             "Equivalent to PGKG_EXTRACT_PROPOSITIONS=0."
         ),
     )
+    _add_scope_flags(ingest_parser)
 
     recall_parser = subparsers.add_parser("recall", help="Recall memories matching a query")
     recall_parser.add_argument("query", help="Search query")
     recall_parser.add_argument("--k", type=int, default=10, help="Number of results")
+    _add_scope_flags(recall_parser)
 
     args = parser.parse_args()
 
