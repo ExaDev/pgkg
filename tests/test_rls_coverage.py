@@ -112,18 +112,98 @@ async def _seed_org_embedders(conn: asyncpg.Connection, org: uuid.UUID) -> None:
     assert bound > 0, "026's binding trigger did not fire, so nothing to hide"
 
 
+async def _seed_document_versions(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    document = await conn.fetchval(
+        "INSERT INTO documents (source, org_id) VALUES ('rls versioned', $1)"
+        " RETURNING id",
+        org,
+    )
+    await conn.execute(
+        "INSERT INTO document_versions (document_id, org_id, version_no,"
+        " content_hash) VALUES ($1, $2, 1, digest('rls body', 'sha256'))",
+        document,
+        org,
+    )
+
+
+async def _seed_document_version_chunks(
+    conn: asyncpg.Connection, org: uuid.UUID
+) -> uuid.UUID:
+    document = await conn.fetchval(
+        "INSERT INTO documents (source, org_id) VALUES ('rls linked', $1)"
+        " RETURNING id",
+        org,
+    )
+    version = await conn.fetchval(
+        "INSERT INTO document_versions (document_id, org_id, version_no,"
+        " content_hash) VALUES ($1, $2, 1, digest($3, 'sha256')) RETURNING id",
+        document,
+        org,
+        f"rls linked {org}",
+    )
+    chunk = await conn.fetchval(
+        "INSERT INTO chunks (text, org_id) VALUES ($1, $2) RETURNING id",
+        f"rls linked passage {uuid.uuid4().hex[:8]}",
+        org,
+    )
+    await conn.execute(
+        "INSERT INTO document_version_chunks (document_version_id, chunk_id, ord)"
+        " VALUES ($1, $2, 0)",
+        version,
+        chunk,
+    )
+    # The version, not the org: counting these rows through document_versions
+    # would be laundering the answer through that table's policy, and the count
+    # would come back zero for a stranger even with this table wide open.
+    return version
+
+
+async def _seed_ingest_jobs(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    collection = await conn.fetchval(
+        "INSERT INTO collections (org_id, owner_org_id, name, kind)"
+        " VALUES ($1, $1, $2, 'corpus') RETURNING id",
+        org,
+        f"jobs_{uuid.uuid4().hex[:8]}",
+    )
+    await conn.execute(
+        "SELECT pgkg_enqueue_ingest_job($1, $2, $3, digest($4, 'sha256'), $4)",
+        org,
+        collection,
+        f"external_{uuid.uuid4().hex[:8]}",
+        "a queued document body",
+    )
+
+
 SEEDS = {
     "chunks": _seed_chunks,
     "collection_subscriptions": _seed_collection_subscriptions,
     "collections": _seed_collections,
+    "document_version_chunks": _seed_document_version_chunks,
+    "document_versions": _seed_document_versions,
     "documents": _seed_documents,
     "entities": _seed_entities,
+    "ingest_jobs": _seed_ingest_jobs,
     "org_embedders": _seed_org_embedders,
     "propositions": _seed_propositions,
     "provenance": _seed_provenance,
     "tenant_shards": _seed_tenant_shards,
     "users": _seed_users,
 }
+
+# How the seeded row is found again, and what $1 is when it is.  Every table but
+# one carries the org directly and is counted by it.  document_version_chunks is
+# a link table and gains no org column of its own — the version already states
+# it, and a second copy could only disagree with the first — so its seed returns
+# the version id and the count names that version.  Counting it through
+# document_versions instead would launder the answer through that table's
+# policy: a stranger would read zero however wide open this table was left.
+FOUND_BY = {
+    "document_version_chunks": "document_version_id = $1",
+}
+
+
+def _row_predicate(table: str) -> str:
+    return FOUND_BY.get(table, "org_id = $1")
 
 
 async def test_every_rls_enabled_table_is_covered_here(pool: asyncpg.Pool) -> None:
@@ -149,13 +229,14 @@ async def test_every_rls_enabled_table_is_covered_here(pool: asyncpg.Pool) -> No
 
 
 async def _count_as_app(
-    conn: asyncpg.Connection, *, table: str, org: uuid.UUID, guc: uuid.UUID
+    conn: asyncpg.Connection, *, table: str, handle: uuid.UUID, guc: uuid.UUID
 ) -> int:
     async with conn.transaction():
         await conn.execute("SET LOCAL ROLE pgkg_app")
         await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(guc))
         return await conn.fetchval(
-            f"SELECT count(*) FROM {table} WHERE org_id = $1", org
+            f"SELECT count(*) FROM {table} WHERE {_row_predicate(table)}",
+            handle,
         )
 
 
@@ -166,10 +247,11 @@ async def test_the_application_role_reads_only_its_own_orgs_rows(
     async with pool.acquire() as conn:
         mine = await new_org(conn)
         stranger = await new_org(conn)
-        await SEEDS[table](conn, mine)
+        # The org, unless the seed named something more specific to count.
+        handle = await SEEDS[table](conn, mine) or mine
 
-        own = await _count_as_app(conn, table=table, org=mine, guc=mine)
-        foreign = await _count_as_app(conn, table=table, org=mine, guc=stranger)
+        own = await _count_as_app(conn, table=table, handle=handle, guc=mine)
+        foreign = await _count_as_app(conn, table=table, handle=handle, guc=stranger)
 
     assert own > 0, (
         f"{table}: the row is invisible to its own org, so the negative "

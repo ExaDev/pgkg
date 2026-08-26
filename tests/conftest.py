@@ -110,10 +110,24 @@ async def pool(pg_dsn) -> AsyncGenerator[asyncpg.Pool, None]:
     finally:
         await migrate_conn.close()
 
-    # Now create the pool with pgvector codec registration.
+    # Now create the pool the way production means to create it.  The codec
+    # registration is only half of it: a scoped vector search over an HNSW
+    # index under-returns rather than erroring unless the scan is iterative
+    # (ADR 0001, D3), so a suite whose pool leaves that off is not exercising
+    # the search the product performs.
+    #
+    # Set at connection startup, not from the pool's init callback: asyncpg
+    # runs RESET ALL when a connection goes back to the pool, so a plain SET
+    # survives exactly one acquire.  A startup option becomes the session
+    # default and RESET ALL restores it.
+    from pgkg.db import _ITERATIVE_SCAN
+
     conn_pool = await asyncpg.create_pool(
-        pg_dsn, min_size=1, max_size=5,
+        pg_dsn,
+        min_size=1,
+        max_size=5,
         init=lambda conn: register_vector(conn),
+        server_settings={"hnsw.iterative_scan": _ITERATIVE_SCAN},
     )
 
     yield conn_pool

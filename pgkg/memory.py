@@ -38,6 +38,19 @@ ACCESS_FLUSH_MAX_PENDING = 512
 CLAIM_SCOPES = frozenset({"world", "org", "user"})
 VISIBILITIES = frozenset({"private", "shared"})
 
+# The two retrievable classes: remembered facts and retrieved passages.  Adding
+# a third — summaries, entity cards, tool output — is a candidate function in
+# SQL and one more name here (ADR 0001, D1).
+SOURCES = ("propositions", "chunks")
+
+# The quota that stops the corpus drowning the memory, as D1 sizes it: the
+# corpus takes at most 60% of the reranker's input and never the last eight
+# slots of personal material.  Arguments rather than constants in SQL, because
+# tuning them must not need a migration.
+DEFAULT_K_RERANK = 64
+DEFAULT_CORPUS_FRACTION = 0.6
+DEFAULT_MEMORY_FLOOR = 8
+
 # The reasons belief can end, as migration 021's CHECK constraint enumerates
 # them.  Rejecting an unknown reason here rather than letting the constraint do
 # it keeps the failure at the call site, where the caller knows what it meant.
@@ -171,11 +184,30 @@ class BeliefRecord(BaseModel):
 
 
 class Result(BaseModel):
-    proposition_id: UUID
+    """One retrieved item, and which store it came out of.
+
+    An agent has to be able to tell a remembered fact from a retrieved passage
+    — they answer differently, they are trusted differently, and only one of
+    them can be forgotten — so `source` and `collection_id` travel with every
+    row rather than being inferred from which fields happen to be NULL.
+
+    `proposition_id` is the fact's id and is NULL for a passage; `item_id` is
+    the row's own id whichever store it came from.  The pair is deliberate: a
+    caller holding a Result and wanting to forget it needs the first, and a
+    caller deduplicating or citing needs the second.
+    """
+
+    item_id: UUID
+    source: str
+    proposition_id: UUID | None
     text: str
+    context_text: str | None = None
     score: float
     rrf_score: float
     source_kind: str
+    bucket: str | None = None
+    claim_scope: str | None = None
+    collection_id: UUID | None = None
     chunk_id: UUID | None
     subject: str | None
     predicate: str | None
@@ -309,30 +341,59 @@ FROM unnest($1::uuid[], $2::uuid[], $3::text[], $4::uuid[])
 ON CONFLICT DO NOTHING
 """
 
-# The embedding leaves as `vector` even though the column is halfvec: widening
-# is exact and the client codec for it is the one _parse_emb understands.
+# The two-store surface, not pgkg_search(): a passage and a fact are both
+# answers to "what did we agree about the refund policy", and deciding between
+# them is the caller's job, not the retriever's.  pgkg_search() keeps its
+# proposition-shaped contract for the callers that want exactly that.
 #
-# The scope arrays are passed positionally, so rrf_k has to be named too.  The
-# generation queries are aggregated into pgkg_gen_query[] server-side: a
-# composite carrying a halfvec has no client codec, and two plain arrays do.
+# The embedding leaves as `vector` even though both columns are halfvec:
+# widening is exact and the client codec for it is the one _parse_emb
+# understands.  It comes from whichever store the row is in, and only when that
+# row was embedded by the org's PRIMARY generation: a vector from another model
+# space is still a vector, so a cosine against it returns a number rather than
+# an error, and MMR would rank on it (ADR 0001, D8).  A row from a transitional
+# generation therefore reaches the caller with no embedding, and MMR leaves it
+# in the order the scorer gave it.
+#
+# The scope arrays are passed positionally, so every scoring knob between them
+# has to be spelled out too.  The generation queries are aggregated into
+# pgkg_gen_query[] server-side: a composite carrying a halfvec has no client
+# codec, and two plain arrays do.
 _RECALL_SQL = """
-SELECT s.proposition_id, s.text, s.embedding, s.rrf_score, s.adjusted_score,
-       s.source_kind, s.chunk_id, s.predicate, s.asserted_at,
+SELECT r.item_id, r.source, r.text, r.context_text, r.rrf_score,
+       r.adjusted_score, r.source_kind, r.bucket, r.claim_scope,
+       r.collection_id, r.asserted_at,
+       CASE
+           WHEN COALESCE(p.embedder_generation_id, c.embedder_generation_id)
+                = primary_generation.generation_id
+           THEN COALESCE(p.embedding, c.embedding)::vector
+       END AS embedding,
+       p.id AS proposition_id,
+       COALESCE(p.chunk_id, c.id) AS chunk_id,
+       p.predicate,
        subj.name AS subject_name,
        COALESCE(obj.name, p.object_literal) AS object_name
-FROM pgkg_search(
+FROM pgkg_retrieve(
         $1, $2::halfvec, $3, $4, $5, $6, 30.0, $7, 60,
         $8::uuid[], $9::uuid[], $10::uuid, $11::uuid[], $12::timestamptz,
+        $13, $14, $15, 1.0, 1.0, 1.0, 730.0, 1, 1, $16::text[],
         (SELECT ARRAY(
             SELECT ROW(g.generation_id, g.q_embedding)::pgkg_gen_query
-            FROM unnest($13::uuid[], $14::halfvec[])
+            FROM unnest($17::uuid[], $18::halfvec[])
                  AS g(generation_id, q_embedding)
         ))
-     ) s
-LEFT JOIN propositions p ON p.id = s.proposition_id
-LEFT JOIN entities subj ON subj.id = s.subject_id
-LEFT JOIN entities obj ON obj.id = s.object_id
-ORDER BY s.adjusted_score DESC
+     ) r
+LEFT JOIN propositions p
+       ON r.source = 'propositions' AND p.id = r.item_id
+LEFT JOIN chunks c ON r.source = 'chunks' AND c.id = r.item_id
+LEFT JOIN entities subj ON subj.id = p.subject_id
+LEFT JOIN entities obj ON obj.id = p.object_id
+LEFT JOIN LATERAL (
+    SELECT oe.generation_id
+    FROM org_embedders oe
+    WHERE oe.org_id = $19::uuid AND oe.role = 'primary'
+) primary_generation ON TRUE
+ORDER BY r.adjusted_score DESC
 """
 
 _BELIEVED_AT_SQL = """
@@ -901,7 +962,20 @@ class Memory:
         mmr_lambda: float = 0.5,
         expand_graph: bool = True,
         valid_at: datetime | None = None,
+        sources: Iterable[str] | None = None,
+        k_rerank: int = DEFAULT_K_RERANK,
+        corpus_fraction: float = DEFAULT_CORPUS_FRACTION,
+        memory_floor: int = DEFAULT_MEMORY_FLOOR,
     ) -> list[Result]:
+        """One ranked list over both stores, or over one of them.
+
+        `sources` is the per-class option D1 keeps alongside the fused default:
+        an agent that already knows it wants the handbook and not the
+        conversation says so, and the whole candidate budget is spent there
+        rather than on the share the quota split left it.  Left unset, both
+        classes compete and the quota decides.
+        """
+        wanted = _resolve_sources(sources)
         q_emb, gen_ids, gen_embs = await self._query_vectors(query)
         async with self._connection() as conn:
             rows = await conn.fetch(
@@ -918,8 +992,13 @@ class Memory:
                 self._scope.user_id,
                 self._scope.read_acl_groups,
                 valid_at,
+                k_rerank,
+                corpus_fraction,
+                memory_floor,
+                wanted,
                 gen_ids,
                 gen_embs,
+                self._scope.org_id,
             )
 
         if not rows:
@@ -929,7 +1008,10 @@ class Memory:
         embs = [_parse_emb(r["embedding"], q_emb) for r in rows]
 
         if with_rerank:
-            cutoff = min(k_retrieve, 64)
+            # The same budget the quota divided: k_rerank is defined as the
+            # reranker's input, and two different numbers for it would mean the
+            # split guarded slots the reranker never sees.
+            cutoff = min(k_retrieve, k_rerank)
             candidate_rows = rows[:cutoff]
             candidate_embs = embs[:cutoff]
             rerank_scores = ml.rerank(query, [r["text"] for r in candidate_rows])
@@ -973,16 +1055,27 @@ class Memory:
             rows = rows[:k]
             scores = scores[:k]
 
-        self._record_access(row["proposition_id"] for row in rows)
+        # Only propositions carry an access count.  A passage has no belief
+        # clock and no frequency term in its decay profile — reading the
+        # handbook is not evidence the handbook is true (ADR 0001, D6).
+        self._record_access(
+            row["proposition_id"] for row in rows if row["proposition_id"] is not None
+        )
         await self._maybe_flush_access()
 
         return [
             Result(
+                item_id=row["item_id"],
+                source=row["source"],
                 proposition_id=row["proposition_id"],
                 text=row["text"],
+                context_text=row["context_text"],
                 score=score,
                 rrf_score=float(row["rrf_score"]),
                 source_kind=row["source_kind"],
+                bucket=row["bucket"],
+                claim_scope=row["claim_scope"],
+                collection_id=row["collection_id"],
                 chunk_id=row["chunk_id"],
                 subject=row["subject_name"],
                 predicate=row["predicate"],
@@ -1142,6 +1235,23 @@ class Memory:
             )
             for row in rows
         ]
+
+
+def _resolve_sources(sources: Iterable[str] | None) -> list[str] | None:
+    """NULL for the fused default, a validated list otherwise.
+
+    An unknown source retrieves nothing in SQL, which would reach the caller as
+    an empty result rather than as the typo it is.
+    """
+    if sources is None:
+        return None
+    wanted = list(dict.fromkeys(sources))
+    unknown = [source for source in wanted if source not in SOURCES]
+    if unknown or not wanted:
+        raise ValueError(
+            f"sources must be a non-empty subset of {list(SOURCES)}; got {list(sources)!r}"
+        )
+    return wanted
 
 
 def _entity_id(entity_ids: dict[str, UUID], name: str | None) -> UUID | None:

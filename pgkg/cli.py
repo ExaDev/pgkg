@@ -142,7 +142,38 @@ def cmd_recall(args: argparse.Namespace) -> None:
     asyncio.run(run_recall(args))
 
 
-def main() -> None:
+async def run_worker(args: argparse.Namespace) -> None:
+    """Drain the corpus ingest queue outside the request process.
+
+    Corpus ingest is batch (ADR 0001, D7): 600k chunks is a GPU-day, and it
+    must not compete with online recall for pool slots.  The two knobs are the
+    ones an operator actually reaches for — how many documents may be in
+    flight, and how long to wait between them.
+    """
+    from pgkg.corpus import CorpusIngest
+    from pgkg.db import pool_from_settings
+    from pgkg.ingest_jobs import IngestWorker
+
+    scope = _scope(args)
+    async with pool_from_settings() as pool:
+        worker = IngestWorker(
+            pool,
+            ingest=CorpusIngest(
+                pool, org_id=scope.org_id, collection_id=scope.collection_id
+            ),
+            org_id=scope.org_id if getattr(args, "org", None) else None,
+            throttle_seconds=args.throttle,
+            slots=args.slots,
+        )
+        drained = await worker.run(concurrency=args.slots, max_jobs=args.max_jobs)
+        print(json.dumps({"jobs": drained}))
+
+
+def cmd_worker(args: argparse.Namespace) -> None:
+    asyncio.run(run_worker(args))
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pgkg", description="pgkg knowledge graph CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -171,7 +202,34 @@ def main() -> None:
     recall_parser.add_argument("--k", type=int, default=10, help="Number of results")
     _add_scope_flags(recall_parser)
 
-    args = parser.parse_args()
+    worker_parser = subparsers.add_parser(
+        "worker", help="Drain the corpus ingest queue"
+    )
+    worker_parser.add_argument(
+        "--slots",
+        type=int,
+        default=1,
+        help="How many documents may be in flight at once",
+    )
+    worker_parser.add_argument(
+        "--throttle",
+        type=float,
+        default=0.0,
+        help="Seconds to wait between documents",
+    )
+    worker_parser.add_argument(
+        "--max-jobs",
+        type=int,
+        default=None,
+        help="Stop after this many documents (default: drain the queue)",
+    )
+    _add_scope_flags(worker_parser)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.command == "migrate":
         cmd_migrate(args)
@@ -181,6 +239,8 @@ def main() -> None:
         cmd_ingest(args)
     elif args.command == "recall":
         cmd_recall(args)
+    elif args.command == "worker":
+        cmd_worker(args)
 
 
 if __name__ == "__main__":

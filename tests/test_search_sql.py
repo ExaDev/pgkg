@@ -193,7 +193,6 @@ async def test_pgkg_search_rrf_combines(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         ns = f"rrf_test_{uuid.uuid4().hex[:8]}"
         both_emb = vec(hot_index=10, value=1.0)
-        other_emb = vec(hot_index=900, value=1.0)
 
         both_id = await insert_proposition(
             conn,
@@ -201,12 +200,17 @@ async def test_pgkg_search_rrf_combines(pool: asyncpg.Pool) -> None:
             namespace=ns,
             embedding=both_emb,
         )
-        # keyword-only (different embedding)
+        # Keyword-only, and keyword-only by construction: no embedding at all.
+        # A merely dissimilar vector does not stay out of the vector arm — it
+        # sits at cosine distance 1.0 like most of the table, so whether it
+        # survives the arm's k_initial depends on how many rows the rest of the
+        # suite has left in the shared index.  This row then scored in both
+        # arms, and which of the two ranked first came down to a sub-1% BM25
+        # margin that global row population could flip either way.
         await insert_proposition(
             conn,
             text="elephants are magnificent creatures",
             namespace=ns,
-            embedding=other_emb,
         )
         # vector-only (similar embedding, different text)
         await insert_proposition(
