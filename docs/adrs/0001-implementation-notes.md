@@ -244,7 +244,7 @@ own-org write policy as well, because the *write authorisation* question — may
 here — is a different question from the *integrity* question the trigger answers, and 043's read
 widening made the first one reachable. Both are in place; neither is redundant.
 
-### `ts_match_vq` is marked `LEAKPROOF`
+### The `@@` functions are marked `LEAKPROOF`, and the state is reported
 
 Not in the ADR, and it is a change to a built-in function's catalog entry, so it deserves stating.
 On a table with a policy Postgres may not use a qual of a higher security level as an index
@@ -254,6 +254,21 @@ every BM25 arm degraded to a sequential scan. 043 marks it leakproof in a `DO` b
 to a `NOTICE` without superuser. The claim is defensible: it raises no data-dependent error, emits
 no message carrying either argument, has no side effect, and the boolean it returns is not
 observable because the policy qual still filters the row before anything is returned.
+
+046 finishes it in two ways. `@@` is two functions: `tsquery @@ tsvector` is `ts_match_qv`, and the
+planner tests leakproofness on the clause as written, before it considers commuting the clause
+through the operator's commutator — so the reversed operand order still planned a Seq Scan under
+`pgkg_app`, and a future arm was one keystroke away from reinstating the defect. The alternative
+was a guard asserting that no retrieval function writes the reversed form; the operator is marked
+instead, because a text search for `@@` cannot see a query built in application Python, in a bench
+script, or in the next migration, and marking makes both forms correct by construction.
+
+And because the mark cannot be enforced — a managed Postgres will not grant ownership of a built-in
+— it is reported. `pgkg_keyword_match_leakproof()` returns the flag for both signatures and
+`GET /health` carries it as `keyword_index`, next to the embedder registry, so a deployment where
+the `DO` block fell through to its `NOTICE` is a monitorable fact rather than a line in a migration
+log. The suite can only ever observe the marked state, so the test that matters drives the
+endpoint through the unmarked state inside a transaction it rolls back.
 
 ### The extraction cache is keyed per org, not gated on `public_source`
 

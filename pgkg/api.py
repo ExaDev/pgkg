@@ -14,6 +14,7 @@ from pgkg.config import (
     ORG_GUC,
     embed_dim,
     get_settings,
+    keyword_match_leakproof,
     live_generations,
 )
 from pgkg.corpus import CorpusIngest, document_hash, dump_provenance
@@ -477,6 +478,13 @@ async def health() -> dict:
     # settings, because the registry is what the stored vectors were written
     # against: a configured width could only ever disagree with them.
     embedding: dict = {"dim": None, "generations": []}
+    # Whether the keyword arms can reach the GIN index under the application
+    # role.  Marking the `@@` functions leakproof needs ownership of a built-in,
+    # so 043 and 046 degrade to a NOTICE where a managed Postgres refuses it,
+    # and the cost is a sequential scan per arm that only shows at scale and
+    # only under a role with row security.  It cannot be enforced, so it is
+    # reported: a deployment that missed it is a fact something can watch.
+    keyword_index: dict = {"leakproof": None, "operators": {}}
     if _pool:
         try:
             async with _pool.acquire() as conn:
@@ -488,6 +496,11 @@ async def health() -> dict:
                         for generation in await live_generations(conn, DEFAULT_ORG_ID)
                     ],
                 }
+                operators = await keyword_match_leakproof(conn)
+                keyword_index = {
+                    "leakproof": bool(operators) and all(operators.values()),
+                    "operators": operators,
+                }
             db_ok = True
         except Exception:
             pass
@@ -496,6 +509,7 @@ async def health() -> dict:
         "status": "ok",
         "db": db_ok,
         "embedding": embedding,
+        "keyword_index": keyword_index,
         "models_loaded": {
             "embed": ml.is_embed_loaded(),
             "rerank": ml.is_rerank_loaded(),

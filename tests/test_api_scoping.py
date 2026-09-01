@@ -826,8 +826,34 @@ class _SharedPool:
         return self._pool.acquire()
 
 
+class _PinnedPool:
+    """Hands the app one connection the test is already holding.
+
+    A catalog change made inside an uncommitted transaction is visible on that
+    transaction's connection and on no other, so a test that wants the app to
+    read a state it never commits has to make the app read it from here.
+    """
+
+    def __init__(self, conn: asyncpg.Connection) -> None:
+        self._conn = conn
+
+    def acquire(self):
+        conn = self._conn
+
+        @asynccontextmanager
+        async def _pinned():
+            yield conn
+
+        return _pinned()
+
+
 @asynccontextmanager
-async def _api(pool: asyncpg.Pool, namespace: str, monkeypatch):
+async def _api(
+    pool: asyncpg.Pool,
+    namespace: str,
+    monkeypatch,
+    pinned: asyncpg.Connection | None = None,
+):
     """The real app, over real HTTP, on the test pool.
 
     ASGITransport does not send lifespan events, which is what makes it safe to
@@ -842,7 +868,7 @@ async def _api(pool: asyncpg.Pool, namespace: str, monkeypatch):
         extract_propositions = False
 
     async def _make_pool(dsn):
-        return _SharedPool(pool)
+        return _PinnedPool(pinned) if pinned is not None else _SharedPool(pool)
 
     async def _close_pool(_pool):
         return None
@@ -1327,3 +1353,60 @@ async def test_http_health_reports_the_registry_embedding_space(
 
     assert body["embedding"]["dim"] == dim
     assert "bge-m3" in body["embedding"]["generations"]
+
+
+_VQ = "ts_match_vq(tsvector,tsquery)"
+_QV = "ts_match_qv(tsquery,tsvector)"
+_PROLEAKPROOF = (
+    "SELECT p.proleakproof FROM pg_proc p WHERE p.oid = to_regprocedure($1)"
+)
+
+
+async def test_http_health_reports_the_keyword_operators_it_found_marked(
+    pool: asyncpg.Pool, monkeypatch
+) -> None:
+    """Both operand orders of `@@` are marked by the migrations, so a
+    deployment that owns the functions reports the state that makes the GIN
+    index reachable under row security."""
+    async with _api(pool, _ns("health_lp"), monkeypatch) as client:
+        body = (await client.get("/health")).json()
+
+    assert body["keyword_index"]["operators"] == {_VQ: True, _QV: True}
+    assert body["keyword_index"]["leakproof"] is True
+
+
+async def test_http_health_says_so_when_an_operator_was_never_marked(
+    pool: asyncpg.Pool, monkeypatch
+) -> None:
+    """The point of reporting it is the deployment that could not mark it.
+
+    The suite migrates as a superuser, so the flag is always set here and an
+    assertion that it is set proves nothing about the case worth monitoring.
+    `ALTER FUNCTION` is transactional, so the unmarked state is reachable for
+    the length of one transaction on one connection: the app is handed that
+    connection, reads the state the rollback then discards, and the session the
+    rest of the suite shares never sees it.
+    """
+    async with pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute(f"ALTER FUNCTION {_VQ} NOT LEAKPROOF")
+            async with _api(
+                pool, _ns("health_unmarked"), monkeypatch, pinned=conn
+            ) as client:
+                body = (await client.get("/health")).json()
+        finally:
+            await transaction.rollback()
+
+    assert body["keyword_index"]["operators"] == {_VQ: False, _QV: True}
+    assert body["keyword_index"]["leakproof"] is False, (
+        "an unmarked operator is reported as marked, so a deployment that "
+        "missed the fix looks identical to one that got it"
+    )
+
+    async with pool.acquire() as conn:
+        assert await conn.fetchval(_PROLEAKPROOF, _VQ) is True, (
+            "the test left the session unmarked and every later keyword plan "
+            "with it"
+        )

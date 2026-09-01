@@ -111,7 +111,10 @@ cp .env.local-claude .env  # or .env.local-chunks
 │   POST /documents/delete → soft delete              │
 │   GET  /jobs/{id}?org_id= → queue status            │
 │                                                     │
-│   GET  /health    → liveness                        │
+│   GET  /health    → liveness, the embedder          │
+│                     registry, and whether the       │
+│                     keyword index is reachable      │
+│                     under row security              │
 │                                                     │
 │ Every request carries a scope: org, collection,     │
 │ user, ACL groups, subscribed collections. Reads     │
