@@ -54,10 +54,39 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run("pgkg.api:app", host=args.host, port=args.port, reload=False)
 
 
-def cmd_ingest(args: argparse.Namespace) -> None:
+def _scope(args: argparse.Namespace):
+    """The tenant this invocation runs as.
+
+    Absent flags resolve to the reserved default org and collection, which is
+    the partition every pre-tenancy row was backfilled into — so an existing
+    script keeps reading and writing exactly what it did.
+    """
+    import uuid
+
+    from pgkg.config import DEFAULT_COLLECTION_ID, DEFAULT_ORG_ID
+    from pgkg.memory import Scope
+
+    return Scope(
+        org_id=uuid.UUID(args.org) if getattr(args, "org", None) else DEFAULT_ORG_ID,
+        collection_id=(
+            uuid.UUID(args.collection)
+            if getattr(args, "collection", None)
+            else DEFAULT_COLLECTION_ID
+        ),
+        user_id=uuid.UUID(args.user) if getattr(args, "user", None) else None,
+    )
+
+
+def _add_scope_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--org", default=None, help="Org UUID to act as")
+    parser.add_argument("--user", default=None, help="User UUID to act as")
+    parser.add_argument("--collection", default=None, help="Collection UUID")
+
+
+async def run_ingest(args: argparse.Namespace) -> None:
+    from pgkg.config import get_settings
     from pgkg.db import pool_from_settings
     from pgkg.memory import Memory
-    from pgkg.config import get_settings
 
     if args.path == "-":
         text = sys.stdin.read()
@@ -68,38 +97,83 @@ def cmd_ingest(args: argparse.Namespace) -> None:
         text = p.read_text()
         source = str(p)
 
-    async def _run() -> None:
-        settings = get_settings()
-        extract = not args.chunks_only
-        async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace, extract_propositions=extract)
+    settings = get_settings()
+    async with pool_from_settings() as pool:
+        mem = Memory(
+            pool,
+            namespace=settings.default_namespace,
+            scope=_scope(args),
+            extract_propositions=not args.chunks_only,
+        )
+        try:
             result = await mem.ingest(text, source=source)
-            print(json.dumps({
-                "documents": result.documents,
-                "chunks": result.chunks,
-                "propositions": result.propositions,
-                "entities": result.entities,
-            }))
+        finally:
+            await mem.aclose()
+        print(json.dumps({
+            "documents": result.documents,
+            "chunks": result.chunks,
+            "propositions": result.propositions,
+            "entities": result.entities,
+        }))
 
-    asyncio.run(_run())
+
+def cmd_ingest(args: argparse.Namespace) -> None:
+    asyncio.run(run_ingest(args))
+
+
+async def run_recall(args: argparse.Namespace) -> None:
+    from pgkg.config import get_settings
+    from pgkg.db import pool_from_settings
+    from pgkg.memory import Memory
+
+    settings = get_settings()
+    async with pool_from_settings() as pool:
+        mem = Memory(pool, namespace=settings.default_namespace, scope=_scope(args))
+        # A CLI invocation is a whole process lifetime: without the close, the
+        # access counts recall() accumulated in memory never reach the database.
+        try:
+            results = await mem.recall(args.query, k=args.k)
+        finally:
+            await mem.aclose()
+        print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
 
 
 def cmd_recall(args: argparse.Namespace) -> None:
+    asyncio.run(run_recall(args))
+
+
+async def run_worker(args: argparse.Namespace) -> None:
+    """Drain the corpus ingest queue outside the request process.
+
+    Corpus ingest is batch (ADR 0001, D7): 600k chunks is a GPU-day, and it
+    must not compete with online recall for pool slots.  The two knobs are the
+    ones an operator actually reaches for — how many documents may be in
+    flight, and how long to wait between them.
+    """
+    from pgkg.corpus import CorpusIngest
     from pgkg.db import pool_from_settings
-    from pgkg.memory import Memory
-    from pgkg.config import get_settings
+    from pgkg.ingest_jobs import IngestWorker
 
-    async def _run() -> None:
-        settings = get_settings()
-        async with pool_from_settings() as pool:
-            mem = Memory(pool, namespace=settings.default_namespace)
-            results = await mem.recall(args.query, k=args.k)
-            print(json.dumps([r.model_dump(mode="json") for r in results], indent=2))
+    scope = _scope(args)
+    async with pool_from_settings() as pool:
+        worker = IngestWorker(
+            pool,
+            ingest=CorpusIngest(
+                pool, org_id=scope.org_id, collection_id=scope.collection_id
+            ),
+            org_id=scope.org_id if getattr(args, "org", None) else None,
+            throttle_seconds=args.throttle,
+            slots=args.slots,
+        )
+        drained = await worker.run(concurrency=args.slots, max_jobs=args.max_jobs)
+        print(json.dumps({"jobs": drained}))
 
-    asyncio.run(_run())
+
+def cmd_worker(args: argparse.Namespace) -> None:
+    asyncio.run(run_worker(args))
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pgkg", description="pgkg knowledge graph CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -121,12 +195,41 @@ def main() -> None:
             "Equivalent to PGKG_EXTRACT_PROPOSITIONS=0."
         ),
     )
+    _add_scope_flags(ingest_parser)
 
     recall_parser = subparsers.add_parser("recall", help="Recall memories matching a query")
     recall_parser.add_argument("query", help="Search query")
     recall_parser.add_argument("--k", type=int, default=10, help="Number of results")
+    _add_scope_flags(recall_parser)
 
-    args = parser.parse_args()
+    worker_parser = subparsers.add_parser(
+        "worker", help="Drain the corpus ingest queue"
+    )
+    worker_parser.add_argument(
+        "--slots",
+        type=int,
+        default=1,
+        help="How many documents may be in flight at once",
+    )
+    worker_parser.add_argument(
+        "--throttle",
+        type=float,
+        default=0.0,
+        help="Seconds to wait between documents",
+    )
+    worker_parser.add_argument(
+        "--max-jobs",
+        type=int,
+        default=None,
+        help="Stop after this many documents (default: drain the queue)",
+    )
+    _add_scope_flags(worker_parser)
+
+    return parser
+
+
+def main() -> None:
+    args = build_parser().parse_args()
 
     if args.command == "migrate":
         cmd_migrate(args)
@@ -136,6 +239,8 @@ def main() -> None:
         cmd_ingest(args)
     elif args.command == "recall":
         cmd_recall(args)
+    elif args.command == "worker":
+        cmd_worker(args)
 
 
 if __name__ == "__main__":
