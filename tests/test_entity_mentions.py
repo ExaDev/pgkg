@@ -893,3 +893,174 @@ async def test_a_chat_fact_pulls_in_the_document_that_defines_what_it_names(
     assert [r["source"] for r in isolated] == ["propositions"], (
         "without the mention edge the passage shares no term with the query"
     )
+
+
+# ---------------------------------------------------------------------------
+# What the mention edge must not cost the two surfaces that walk it
+# ---------------------------------------------------------------------------
+
+async def test_graph_expansion_refilters_in_both_directions(
+    pool: asyncpg.Pool,
+) -> None:
+    """D3's hard requirement, checked on both stores at once.
+
+    One org, two users, one shared entity.  User B's seed is a shared fact
+    naming it; user A owns a private fact about it and a private passage
+    mentioning it, the latter reachable only through the edge this module
+    builds.  Neither may come back for B.  The non-vacuity check is the same
+    query as A, which returns both — so the walk does reach them and the
+    visibility predicate in each arm is what stops it.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        user_a = await conn.fetchval(
+            "INSERT INTO users (org_id, external_id) VALUES ($1, $2) RETURNING id",
+            org, unique("a"),
+        )
+        user_b = await conn.fetchval(
+            "INSERT INTO users (org_id, external_id) VALUES ($1, $2) RETURNING id",
+            org, unique("b"),
+        )
+        entity = await insert_entity(
+            conn, org_id=org, name="Zzqhelios Programme"
+        )
+
+        await insert_proposition(
+            conn, org_id=org, collection_id=collection, subject_id=entity,
+            text="Zzqhelios Programme kickoff meeting was minuted",
+        )
+        await insert_proposition(
+            conn, org_id=org, collection_id=collection, subject_id=entity,
+            text="PRIVATE_FACT Zzqhelios Programme budget overrun is nine million",
+            visibility="private", owner_user_id=user_a,
+        )
+
+        document = await conn.fetchval(
+            "INSERT INTO documents (source, org_id, collection_id, external_id)"
+            " VALUES ('probe', $1, $2, $3) RETURNING id",
+            org, collection, unique("ext"),
+        )
+        version = await conn.fetchval(
+            "SELECT version_id FROM pgkg_open_document_version($1, $2)",
+            document, uuid.uuid4().bytes,
+        )
+        chunk = await conn.fetchval(
+            "SELECT chunk_id FROM pgkg_add_version_chunk($1, 0, $2)",
+            version,
+            "PRIVATE_PASSAGE the Zzqhelios Programme steering notes, restricted",
+        )
+        await conn.execute("SELECT pgkg_promote_document_version($1)", version)
+        await conn.execute(
+            "UPDATE chunks SET visibility = 'private', owner_user_id = $1"
+            " WHERE id = $2",
+            user_a, chunk,
+        )
+        assert await match(conn, chunk) == 1, (
+            "the mention edge was not built, so the walk is vacuous"
+        )
+
+        async def texts_for(user: uuid.UUID) -> str:
+            rows = await conn.fetch(
+                """
+                SELECT text FROM pgkg_retrieve(
+                    q_text => 'Zzqhelios Programme kickoff minuted',
+                    k_retrieve => 50,
+                    expand_graph => TRUE,
+                    p_org_ids => $1::uuid[],
+                    p_collection_ids => $2::uuid[],
+                    p_user_id => $3::uuid
+                )
+                """,
+                [org], [collection], user,
+            )
+            return " | ".join(row["text"] for row in rows)
+
+        stranger = await texts_for(user_b)
+        owner = await texts_for(user_a)
+
+    assert "PRIVATE_FACT" not in stranger, stranger
+    assert "PRIVATE_PASSAGE" not in stranger, stranger
+    assert "PRIVATE_FACT" in owner and "PRIVATE_PASSAGE" in owner, (
+        f"the walk never reached the private rows at all: {owner}"
+    )
+
+
+async def test_mentions_do_not_displace_facts_in_pgkg_search(
+    pool: asyncpg.Pool,
+) -> None:
+    """pgkg_search() is proposition-shaped, and the graph arm now emits
+    passages as well as facts.
+
+    The chunk candidates were discarded only after they had taken places in the
+    arm's own budget, so a proposition-only search lost 42% of its facts the
+    moment gazetteer mentions existed and returned nothing in their place.  A
+    cap is a budget: the caller says which stores it can consume, and the arm
+    spends the budget on those.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        await conn.execute("SELECT set_config('pgkg.org_id', $1, false)", str(org))
+        collection = await new_collection(conn, org_id=org, kind="mixed")
+        namespace = unique("mention_ns")
+
+        edges: list[tuple[uuid.UUID, uuid.UUID]] = []
+        for i in range(20):
+            entity = await insert_entity(
+                conn, org_id=org, name=f"zorbulon{i}", namespace=namespace
+            )
+            # One seed per entity, so every entity is a graph seed.
+            await insert_proposition(
+                conn, org_id=org, collection_id=collection, namespace=namespace,
+                subject_id=entity, text="zorbulon reconciles the ledger",
+            )
+            await conn.execute(
+                """
+                INSERT INTO propositions
+                    (text, namespace, subject_id, org_id, collection_id)
+                SELECT 'derived fact ' || g, $1, $2, $3, $4
+                FROM generate_series(1, 12) g
+                """,
+                namespace, entity, org, collection,
+            )
+            rows = await conn.fetch(
+                """
+                INSERT INTO chunks (text, span_start, span_end, org_id,
+                                    collection_id)
+                SELECT 'a passage naming ' || $3 || ', number ' || g, 0, 30,
+                       $1, $2
+                FROM generate_series(1, 12) g
+                RETURNING id
+                """,
+                org, collection, str(entity),
+            )
+            edges.extend((entity, row["id"]) for row in rows)
+
+        async def facts_found() -> int:
+            rows = await conn.fetch(
+                """
+                SELECT proposition_id FROM pgkg_search(
+                    'zorbulon', NULL, 400, 400, $1, NULL, 30.0, TRUE, 60,
+                    $2::uuid[], $3::uuid[])
+                """,
+                namespace, [org], [collection],
+            )
+            return len(rows)
+
+        before = await facts_found()
+        await conn.executemany(
+            """
+            INSERT INTO entity_mentions (entity_id, chunk_id, org_id,
+                                         span_start, span_end)
+            VALUES ($1, $2, $3, 0, 8)
+            """,
+            [(entity, chunk, org) for entity, chunk in edges],
+        )
+        after = await facts_found()
+
+    assert before > 0, "the seeds were not retrievable at all"
+    assert after == before, (
+        f"pgkg_search() returned {before} propositions before the passages "
+        f"were mentioned and {after} after; the passages themselves are not "
+        f"part of its contract"
+    )

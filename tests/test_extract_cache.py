@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import json
 import os
+import uuid
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -18,6 +19,7 @@ from pgkg.ml import (
     compute_cache_key,
     extract_propositions_async,
 )
+from pgkg.config import DEFAULT_ORG_ID
 from pgkg.memory import PostgresExtractCache
 
 
@@ -37,21 +39,29 @@ def _make_prop(**kwargs) -> Proposition:
     return Proposition(**defaults)
 
 
-async def _seed_cache(pool: asyncpg.Pool, cache_key: str, props: list[Proposition]) -> None:
+async def _seed_cache(
+    pool: asyncpg.Pool,
+    cache_key: str,
+    props: list[Proposition],
+    *,
+    org_id: uuid.UUID = DEFAULT_ORG_ID,
+) -> None:
     payload = json.dumps([p.model_dump() for p in props])
     async with pool.acquire() as conn:
         await conn.execute(
             """
             INSERT INTO proposition_cache
-                (cache_key, chunk_hash, extractor_model, prompt_version, propositions)
-            VALUES ($1, $2, $3, $4, $5::jsonb)
-            ON CONFLICT (cache_key) DO NOTHING
+                (cache_key, chunk_hash, extractor_model, prompt_version,
+                 propositions, org_id)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            ON CONFLICT (cache_key, org_id) DO NOTHING
             """,
             cache_key,
             hashlib.sha256(b"dummy-chunk").hexdigest(),
             "test-model",
             PROMPT_VERSION,
             payload,
+            org_id,
         )
 
 
@@ -250,3 +260,79 @@ async def test_postgres_cache_hit_count_increments(pool: asyncpg.Pool):
 
     count = await _get_hit_count(pool, cache_key)
     assert count == 2
+
+
+# ---------------------------------------------------------------------------
+# The cache is keyed by the org that paid for the extraction (ADR 0001, D4)
+# ---------------------------------------------------------------------------
+
+async def test_the_cache_does_not_answer_another_orgs_key(pool: asyncpg.Pool):
+    """A cached extraction is the extracted facts themselves, not a vector.
+
+    D4 restricts the embedding cache to operator-licensed material because a
+    content-hash cache is probe-able: a hit confirms another tenant holds the
+    document.  The extraction cache carries the claims made out of that
+    document, so the key has to name the org that paid for it — the row policy
+    says so under pgkg_app, and the statement has to say so too, because the
+    deployments that run as the owning role are the ones RLS cannot help.
+    """
+    chunk = "Acme Holdings will be acquired for four hundred million."
+    model = "cross-org-extractor"
+    cache_key = compute_cache_key(chunk, model)
+
+    async with pool.acquire() as conn:
+        owner = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id", "cache_owner"
+        )
+        stranger = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id", "cache_stranger"
+        )
+        await conn.execute(
+            """
+            INSERT INTO proposition_cache
+                (cache_key, chunk_hash, extractor_model, prompt_version,
+                 propositions, org_id)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            """,
+            cache_key,
+            hashlib.sha256(chunk.encode()).hexdigest(),
+            model,
+            PROMPT_VERSION,
+            json.dumps([_make_prop(text=chunk).model_dump()]),
+            owner,
+        )
+
+    probe = PostgresExtractCache(pool, "ns", org_id=stranger)
+    assert await probe.get(cache_key) is None
+
+    # Non-vacuity: the row is there, and the org that wrote it still reads it.
+    holder = PostgresExtractCache(pool, "ns", org_id=owner)
+    assert (await holder.get(cache_key))[0].text == chunk
+
+
+async def test_two_orgs_hold_their_own_extraction_of_one_text(pool: asyncpg.Pool):
+    """The key is (cache_key, org), so the second org to hold a passage pays for
+    its own extraction rather than reading — or overwriting — the first's."""
+    chunk = "The board vote is scheduled for the third of March."
+    model = "per-org-extractor"
+    cache_key = compute_cache_key(chunk, model)
+
+    async with pool.acquire() as conn:
+        first = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id", "cache_first"
+        )
+        second = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id", "cache_second"
+        )
+
+    mine = PostgresExtractCache(pool, "ns", org_id=first)
+    theirs = PostgresExtractCache(pool, "ns", org_id=second)
+    await mine.put(
+        cache_key, "hash", model, PROMPT_VERSION, [_make_prop(text="mine")]
+    )
+    await theirs.put(
+        cache_key, "hash", model, PROMPT_VERSION, [_make_prop(text="theirs")]
+    )
+
+    assert (await mine.get(cache_key))[0].text == "mine"
+    assert (await theirs.get(cache_key))[0].text == "theirs"

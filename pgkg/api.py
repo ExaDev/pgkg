@@ -16,7 +16,7 @@ from pgkg.config import (
     get_settings,
     live_generations,
 )
-from pgkg.corpus import CorpusIngest, document_hash
+from pgkg.corpus import CorpusIngest, document_hash, dump_provenance
 from pgkg.db import make_pool, close_pool
 from pgkg.ingest_jobs import job_state
 from pgkg.memory import (
@@ -155,6 +155,20 @@ class DocumentRequest(ScopedRequest):
     # Batch ingest is the default posture for a corpus (D7); inline ingest is
     # for the single document a human just uploaded and is watching.
     queue: bool = False
+
+    @property
+    def effective_asserted_at(self) -> datetime | None:
+        """The world-time of this document's content.
+
+        Two fields, one clock: D5 says provenance.published_at feeds the
+        perishable decay profile and D6 keys that profile on asserted_at, so a
+        connector that states a publication date has stated the world-time as
+        well.  Left independent, a 2015 article ingested today decays from
+        today, which is the distinction between 'perishable' and 'timeless'.
+        """
+        if self.asserted_at is not None:
+            return self.asserted_at
+        return self.provenance.published_at if self.provenance else None
 
 
 class DocumentDeleteRequest(ScopedRequest):
@@ -308,7 +322,9 @@ WHERE p.org_id = $1
 
 # Enqueued through a connection carrying the org, because ingest_jobs holds the
 # document text and is therefore under RLS like every other tenant table.
-_ENQUEUE_SQL = "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6)"
+_ENQUEUE_SQL = (
+    "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)"
+)
 
 
 @asynccontextmanager
@@ -370,6 +386,13 @@ async def upsert_document(req: DocumentRequest) -> dict:
                 document_hash(req.text),
                 req.text,
                 req.uri,
+                req.source,
+                req.effective_asserted_at,
+                dump_provenance(
+                    Provenance(**req.provenance.model_dump())
+                    if req.provenance
+                    else None
+                ),
             )
         return {"job_id": str(job_id)}
 
@@ -382,7 +405,7 @@ async def upsert_document(req: DocumentRequest) -> dict:
             text=req.text,
             uri=req.uri,
             source=req.source,
-            asserted_at=req.asserted_at,
+            asserted_at=req.effective_asserted_at,
             provenance=provenance,
         )
     except ValueError as exc:
@@ -421,11 +444,16 @@ async def delete_document(req: DocumentDeleteRequest) -> Response:
 
 
 @app.get("/jobs/{job_id}", response_model=dict)
-async def read_job(job_id: UUID) -> dict:
-    """Is my corpus indexed yet — the first question a customer asks."""
+async def read_job(job_id: UUID, org_id: UUID | None = None) -> dict:
+    """Is my corpus indexed yet — the first question a customer asks.
+
+    The org is a parameter of the question, not an inference from the job id: a
+    status carries the document id and the extractor's error text, and a UUID a
+    caller happens to hold is not a claim on another tenant's queue.
+    """
     assert _pool is not None
     try:
-        state = await job_state(_pool, job_id)
+        state = await job_state(_pool, job_id, org_id=org_id or DEFAULT_ORG_ID)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {

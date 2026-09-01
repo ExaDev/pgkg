@@ -11,6 +11,19 @@ policies are written for, since Postgres exempts the table owner — once under
 the row's own org and once under a stranger's.  The first read is the control
 arm: without it a policy that hid everything would look identical to a policy
 that hid the right thing.
+
+The guard runs in the direction that can fail.  Pinning the set of tables that
+HAVE row security only notices a table that gains a policy; the likelier
+accident is a table that ships with an org column and never gains one, which is
+what 040 did with entity_mentions and entity_links while this module stayed
+green.  So the enumeration below starts from the tables that carry an org and
+requires each to be policied or explicitly excused, and the older assertion is
+kept because a policy still has to arrive with a case here.
+
+Its remaining blind spot, stated rather than left to be discovered: a table
+whose rows belong to an org without carrying the column — edges,
+proposition_provenance, corroborations — is org-scoped only through the row it
+references, and this guard cannot see it.
 """
 from __future__ import annotations
 
@@ -20,6 +33,7 @@ import asyncpg
 import pytest
 
 ORG_GUC = "pgkg.org_id"
+SYSTEM_ORG = uuid.UUID("00000000-0000-0000-0000-000000000000")
 
 
 async def new_org(conn: asyncpg.Connection) -> uuid.UUID:
@@ -174,16 +188,97 @@ async def _seed_ingest_jobs(conn: asyncpg.Connection, org: uuid.UUID) -> None:
     )
 
 
+async def _seed_entity_mentions(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    entity = await conn.fetchval(
+        "INSERT INTO entities (name, type, namespace, org_id)"
+        " VALUES ($1, 'concept', 'rls', $2) RETURNING id",
+        f"mention_{uuid.uuid4().hex[:8]}",
+        org,
+    )
+    chunk = await conn.fetchval(
+        "INSERT INTO chunks (text, org_id) VALUES ($1, $2) RETURNING id",
+        f"rls mention passage {uuid.uuid4().hex[:8]}",
+        org,
+    )
+    await conn.execute(
+        "INSERT INTO entity_mentions (entity_id, chunk_id, org_id, span_start,"
+        " span_end) VALUES ($1, $2, $3, 0, 4)",
+        entity,
+        chunk,
+        org,
+    )
+
+
+async def _seed_entity_links(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    """The shared side must live in the operator's org and the org side must
+    not, so this row exists only for a tenant: 040's direction trigger rejects
+    it in either other arrangement, and the policy is single-org for the same
+    reason."""
+    mine = await conn.fetchval(
+        "INSERT INTO entities (name, type, namespace, org_id)"
+        " VALUES ($1, 'concept', 'rls', $2) RETURNING id",
+        f"link_own_{uuid.uuid4().hex[:8]}",
+        org,
+    )
+    shared = await conn.fetchval(
+        "INSERT INTO entities (name, type, namespace, org_id)"
+        " VALUES ($1, 'concept', 'rls', pgkg_system_org()) RETURNING id",
+        f"link_shared_{uuid.uuid4().hex[:8]}",
+    )
+    await conn.execute(
+        "INSERT INTO entity_links (org_entity_id, shared_entity_id)"
+        " VALUES ($1, $2)",
+        mine,
+        shared,
+    )
+
+
+async def _seed_corpus_stats(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    await conn.execute(
+        "INSERT INTO corpus_stats (kind, namespace, org_id, collection_id,"
+        " n_total, total_len) VALUES ('proposition', $1, $2, $3, 3, 30)",
+        f"rls_{uuid.uuid4().hex[:8]}",
+        org,
+        uuid.uuid4(),
+    )
+
+
+async def _seed_lexeme_df(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    await conn.execute(
+        "INSERT INTO lexeme_df (kind, namespace, lexeme, org_id, collection_id,"
+        " df) VALUES ('proposition', $1, 'zzqhelios', $2, $3, 3)",
+        f"rls_{uuid.uuid4().hex[:8]}",
+        org,
+        uuid.uuid4(),
+    )
+
+
+async def _seed_proposition_cache(conn: asyncpg.Connection, org: uuid.UUID) -> None:
+    key = f"rls_{uuid.uuid4().hex}"
+    await conn.execute(
+        "INSERT INTO proposition_cache (cache_key, chunk_hash, extractor_model,"
+        " prompt_version, propositions, org_id)"
+        " VALUES ($1, $1, 'm', 'v1', '[]'::jsonb, $2)",
+        key,
+        org,
+    )
+
+
 SEEDS = {
     "chunks": _seed_chunks,
     "collection_subscriptions": _seed_collection_subscriptions,
     "collections": _seed_collections,
+    "corpus_stats": _seed_corpus_stats,
     "document_version_chunks": _seed_document_version_chunks,
     "document_versions": _seed_document_versions,
     "documents": _seed_documents,
     "entities": _seed_entities,
+    "entity_links": _seed_entity_links,
+    "entity_mentions": _seed_entity_mentions,
     "ingest_jobs": _seed_ingest_jobs,
+    "lexeme_df": _seed_lexeme_df,
     "org_embedders": _seed_org_embedders,
+    "proposition_cache": _seed_proposition_cache,
     "propositions": _seed_propositions,
     "provenance": _seed_provenance,
     "tenant_shards": _seed_tenant_shards,
@@ -204,6 +299,81 @@ FOUND_BY = {
 
 def _row_predicate(table: str) -> str:
     return FOUND_BY.get(table, "org_id = $1")
+
+
+# Tables whose read side widens to the operator's org, so that D3's
+# `org_id = ANY([tenant_org, SYSTEM_ORG])` can match its second element under
+# the app role.  A table is here because the read path resolves rows of another
+# org in the caller's read scope, never because the table looks shared:
+# entity_links is absent because its org_id is the org side of 040's bridge by
+# trigger and is never the system org, and the four request-scoped tables
+# (users, tenant_shards, ingest_jobs, collection_subscriptions) and provenance
+# are absent because no read path names another org's rows in them.
+WIDENED = (
+    "chunks",
+    "collections",
+    "corpus_stats",
+    "document_version_chunks",
+    "document_versions",
+    "documents",
+    "entities",
+    "entity_mentions",
+    "lexeme_df",
+    "org_embedders",
+    "proposition_cache",
+    "propositions",
+)
+
+# A table that carries an org column and deliberately has no policy, with the
+# reason it is not an isolation boundary.  Empty is the correct state: it exists
+# so that excusing a table is a decision someone writes down here, rather than
+# an omission the older assertion could not see.
+UNPROTECTED_BY_DESIGN: dict[str, str] = {}
+
+
+async def test_every_table_with_an_org_column_is_policied(
+    pool: asyncpg.Pool,
+) -> None:
+    """The guard in the direction that fails: a table shipping with an org
+    column and no policy is the accident, and 040 made it twice while every
+    assertion in this module stayed green."""
+    async with pool.acquire() as conn:
+        carries_org = {
+            r["relname"]
+            for r in await conn.fetch(
+                """
+                SELECT c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                JOIN pg_attribute a
+                  ON a.attrelid = c.oid AND a.attname = 'org_id' AND a.attnum > 0
+                WHERE n.nspname = 'public' AND c.relkind = 'r'
+                """
+            )
+        }
+        protected = {
+            r["relname"]
+            for r in await conn.fetch(
+                """
+                SELECT c.relname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relkind = 'r'
+                  AND c.relrowsecurity
+                """
+            )
+        }
+
+    assert carries_org, "no table carries an org column, so this guard is vacuous"
+    unguarded = sorted(carries_org - protected - set(UNPROTECTED_BY_DESIGN))
+    assert not unguarded, (
+        f"{unguarded} carry an org column, are reachable by pgkg_app and have "
+        "no row-level policy: add one, or name the table in "
+        "UNPROTECTED_BY_DESIGN with the reason its org column is not an "
+        "isolation boundary"
+    )
+    stale = sorted(set(UNPROTECTED_BY_DESIGN) - carries_org)
+    assert not stale, f"{stale} are excused but no longer carry an org column"
 
 
 async def test_every_rls_enabled_table_is_covered_here(pool: asyncpg.Pool) -> None:
@@ -258,3 +428,196 @@ async def test_the_application_role_reads_only_its_own_orgs_rows(
         "assertion below would hold for the wrong reason"
     )
     assert foreign == 0, f"{table}: a stranger's session read another org's rows"
+
+# ---------------------------------------------------------------------------
+# The sharing seam, at the policy level.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("table", WIDENED)
+async def test_the_operators_rows_are_readable_by_a_tenant(
+    pool: asyncpg.Pool, table: str
+) -> None:
+    """D3's predicate reads `org_id = ANY([tenant_org, SYSTEM_ORG])` and D4
+    ships that seam early because it sits in the hot path.  While every policy
+    was a single-org equality the second element could never match, so a tenant
+    reading with include_system_org got its own rows and silently nothing
+    else."""
+    async with pool.acquire() as conn:
+        tenant = await new_org(conn)
+        handle = await SEEDS[table](conn, SYSTEM_ORG) or SYSTEM_ORG
+
+        seen = await _count_as_app(conn, table=table, handle=handle, guc=tenant)
+
+    assert seen > 0, (
+        f"{table}: a tenant cannot read the operator's shared rows, so "
+        "include_system_org has no effect on this table"
+    )
+
+
+@pytest.mark.parametrize(
+    "table,statement",
+    [
+        (
+            "propositions",
+            "INSERT INTO propositions (text, org_id)"
+            " VALUES ('promoted upward', pgkg_system_org())",
+        ),
+        (
+            "chunks",
+            "INSERT INTO chunks (text, org_id)"
+            " VALUES ('promoted upward', pgkg_system_org())",
+        ),
+        (
+            "entities",
+            "INSERT INTO entities (name, type, namespace, org_id)"
+            " VALUES ('Promoted Upward', 'concept', 'rls', pgkg_system_org())",
+        ),
+    ],
+)
+async def test_a_tenant_cannot_write_into_the_operators_org(
+    pool: asyncpg.Pool, table: str, statement: str
+) -> None:
+    """The other half of the widening, and D4's first hard rule: nothing a
+    tenant ingests is ever promoted into a shared collection.  Reads widen,
+    writes do not, so WITH CHECK stays a single-org equality."""
+    async with pool.acquire() as conn:
+        tenant = await new_org(conn)
+        async with conn.transaction():
+            await conn.execute("SET LOCAL ROLE pgkg_app")
+            await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(tenant))
+            with pytest.raises(asyncpg.InsufficientPrivilegeError):
+                await conn.execute(statement)
+
+
+# ---------------------------------------------------------------------------
+# What the policies cost the plan.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+async def keyword_corpus(pool: asyncpg.Pool):
+    """Enough passages, and long enough ones, that a sequential scan is the
+    more expensive plan — otherwise the planner would choose one for reasons
+    that have nothing to do with the policy."""
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await conn.fetchval(
+            "INSERT INTO collections (org_id, owner_org_id, name, kind)"
+            " VALUES ($1, $1, $2, 'corpus') RETURNING id",
+            org,
+            f"kw_{uuid.uuid4().hex[:8]}",
+        )
+        await conn.execute(
+            """
+            INSERT INTO chunks (text, span_start, span_end, org_id, collection_id)
+            SELECT 'the reimbursement policy for lodging and equipment states '
+                   || 'that expense claim ' || g || ' needs approval before the '
+                   || 'operator reconciles the ledger '
+                   || repeat('filler phrase ' || (g % 91) || ' ', 12),
+                   0, 400, $1, $2
+            FROM generate_series(1, 4000) g
+            """,
+            org,
+            collection,
+        )
+        await conn.execute(
+            """
+            INSERT INTO chunks (text, span_start, span_end, org_id, collection_id)
+            SELECT 'zqxwv unobtainium sesquipedalian needle ' || g, 0, 40, $1, $2
+            FROM generate_series(1, 3) g
+            """,
+            org,
+            collection,
+        )
+        # VACUUM as well as ANALYZE: with fastupdate on, a freshly bulk-loaded
+        # GIN index still holds its pending list, and the planner charges a
+        # bitmap scan for reading it — which would make a sequential scan the
+        # cheaper plan for reasons that have nothing to do with the policy.
+        await conn.execute("VACUUM ANALYZE chunks")
+    return org, collection
+
+
+async def test_the_policy_does_not_cost_the_keyword_arm_its_index(
+    pool: asyncpg.Pool, keyword_corpus
+) -> None:
+    """`tsvector @@ tsquery` is ts_match_vq, and a qual whose function is not
+    leakproof may not be used as an index condition on a table with a policy:
+    it would be asked about rows the policy hides.  So the GIN index was
+    unreachable under the one role the policies are written for, and every BM25
+    arm degraded to a sequential scan whose cost grows with the table.
+
+    The plan under the role is asserted to carry the policy's own qual, because
+    `SET LOCAL ROLE` outside a transaction block is a no-op and a test that
+    measures the owner twice would pass whatever the planner did.
+    """
+    org, _ = keyword_corpus
+    probe = (
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*)"
+        " FROM chunks c WHERE c.tsv @@ to_tsquery('simple', 'unobtainium')"
+    )
+    async with pool.acquire() as conn:
+        as_owner = "\n".join(r[0] for r in await conn.fetch(probe))
+        async with conn.transaction():
+            await conn.execute("SET LOCAL ROLE pgkg_app")
+            await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(org))
+            role = await conn.fetchval("SELECT current_user")
+            as_app = "\n".join(r[0] for r in await conn.fetch(probe))
+
+    assert role == "pgkg_app", "the role never changed, so nothing was measured"
+    assert "pgkg.org_id" in as_app, (
+        f"the policy is not in the plan, so it was not in force:\n{as_app}"
+    )
+    assert "chunk_tsv_idx" in as_owner, (
+        f"the index is not the cheaper plan even as owner:\n{as_owner}"
+    )
+    assert "chunk_tsv_idx" in as_app, (
+        "under the application role the GIN index is unreachable and the "
+        f"keyword arm falls back to a sequential scan:\n{as_app}"
+    )
+
+async def test_the_application_role_can_still_maintain_the_statistics(
+    pool: asyncpg.Pool,
+) -> None:
+    """corpus_stats and lexeme_df are written by triggers on the content
+    tables, so a policy on them is a policy on the ingest path: an INSERT the
+    app role is allowed to make must not fail, or be silently lost, because the
+    statistics row it moves is behind a boundary.  The row's org is the writer's
+    org, which is why the single-org WITH CHECK is the right one here."""
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await conn.fetchval(
+            "INSERT INTO collections (org_id, owner_org_id, name, kind)"
+            " VALUES ($1, $1, $2, 'chat') RETURNING id",
+            org,
+            f"stats_{uuid.uuid4().hex[:8]}",
+        )
+        namespace = f"stats_{uuid.uuid4().hex[:8]}"
+
+        async with conn.transaction():
+            await conn.execute("SET LOCAL ROLE pgkg_app")
+            await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(org))
+            await conn.execute(
+                "INSERT INTO propositions (text, namespace, org_id, collection_id)"
+                " VALUES ('zzqhelios reconciles the ledger', $1, $2, $3)",
+                namespace,
+                org,
+                collection,
+            )
+
+        totals = await conn.fetchval(
+            "SELECT n_total FROM corpus_stats WHERE kind = 'proposition'"
+            " AND namespace = $1 AND org_id = $2 AND collection_id = $3",
+            namespace,
+            org,
+            collection,
+        )
+        df = await conn.fetchval(
+            "SELECT df FROM lexeme_df WHERE kind = 'proposition'"
+            " AND namespace = $1 AND lexeme = 'zzqhelio' AND org_id = $2"
+            " AND collection_id = $3",
+            namespace,
+            org,
+            collection,
+        )
+
+    assert totals == 1, f"the app role's write did not reach corpus_stats: {totals}"
+    assert df == 1, f"the app role's write did not reach lexeme_df: {df}"

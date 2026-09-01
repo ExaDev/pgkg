@@ -555,3 +555,66 @@ async def test_keyword_search_scans_propositions_once(pool: asyncpg.Pool) -> Non
     )
     assert counts.get("corpus_stats", 0) >= 1
     assert counts.get("lexeme_df", 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# The IDF is a per-tenant quantity (ADR 0001, D4)
+# ---------------------------------------------------------------------------
+
+async def test_another_tenants_writes_do_not_move_my_bm25_score(
+    pool: asyncpg.Pool,
+) -> None:
+    """N, avgdl and every term's document frequency were keyed on namespace and
+    kind alone.
+
+    Every tenant's Memory uses one namespace, so the whole IDF was computed
+    across all of them: a tenant could measure how much others had written
+    about a competitor's name or an acquisition codename purely by watching its
+    own scores move, with no access to a single row.  D4 calls a ranking signal
+    computed globally over shared content a real inference channel, and the
+    chunk half of the same function was already keyed per collection, so the
+    omission was asymmetric rather than a decision.
+    """
+    import uuid as _uuid
+
+    term = f"zzqnovaline{_uuid.uuid4().hex[:6]}"
+
+    async with pool.acquire() as conn:
+        mine = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id",
+            f"mine_{_uuid.uuid4().hex[:8]}",
+        )
+        theirs = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id",
+            f"theirs_{_uuid.uuid4().hex[:8]}",
+        )
+
+        for i in range(3):
+            await conn.execute(
+                "INSERT INTO propositions (text, org_id) VALUES ($1, $2)",
+                f"{term} appears in my own note number {i}",
+                mine,
+            )
+
+        async def my_score() -> float:
+            return await conn.fetchval(
+                "SELECT raw_score FROM pgkg_bm25_candidates("
+                " q_text => $1, p_org_ids => $2::uuid[]) ORDER BY rank LIMIT 1",
+                term,
+                [mine],
+            )
+
+        before = await my_score()
+        for i in range(200):
+            await conn.execute(
+                "INSERT INTO propositions (text, org_id) VALUES ($1, $2)",
+                f"{term} is discussed at length in a stranger's note {i}",
+                theirs,
+            )
+        after = await my_score()
+
+    assert before is not None and after is not None
+    assert after == pytest.approx(before, rel=1e-4), (
+        f"another tenant's writes changed this tenant's BM25 score: "
+        f"{before} -> {after}"
+    )

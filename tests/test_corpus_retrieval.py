@@ -100,6 +100,16 @@ async def insert_proposition(
 async def stats_row(
     conn: asyncpg.Connection, *, kind: str, domain: str
 ) -> asyncpg.Record | None:
+    """The statistics domain is (kind, namespace, org_id, collection_id): the
+    chunk half has no namespace axis and names its collection instead."""
+    if kind == "chunk":
+        return await conn.fetchrow(
+            """
+            SELECT n_total, total_len, avgdl FROM corpus_stats
+            WHERE kind = 'chunk' AND collection_id = $1::uuid
+            """,
+            domain,
+        )
     return await conn.fetchrow(
         """
         SELECT n_total, total_len, avgdl FROM corpus_stats
@@ -110,7 +120,7 @@ async def stats_row(
 
 
 async def chunk_domain(conn: asyncpg.Connection, collection_id: uuid.UUID) -> str:
-    return await conn.fetchval("SELECT pgkg_stats_domain($1)", collection_id)
+    return str(collection_id)
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +198,8 @@ async def test_chunk_statistics_track_deletes(pool: asyncpg.Pool) -> None:
         after = await stats_row(conn, kind="chunk", domain=domain)
 
         remaining = await conn.fetchval(
-            "SELECT df FROM lexeme_df WHERE kind = 'chunk' AND namespace = $1"
-            "   AND lexeme = 'receipt'",
+            "SELECT df FROM lexeme_df WHERE kind = 'chunk'"
+            "   AND collection_id = $1::uuid AND lexeme = 'receipt'",
             domain,
         )
 
@@ -310,7 +320,8 @@ async def test_chunk_bm25_scores_are_computed_from_the_chunk_statistics(
         df = await conn.fetchval(
             """
             SELECT df FROM lexeme_df
-            WHERE kind = 'chunk' AND namespace = $1 AND lexeme = 'mitochondria'
+            WHERE kind = 'chunk' AND collection_id = $1::uuid
+              AND lexeme = 'mitochondria'
             """,
             domain,
         )
@@ -1062,7 +1073,7 @@ async def test_refresh_repairs_drifted_chunk_statistics(
 
         await conn.execute(
             "UPDATE corpus_stats SET n_total = 999, total_len = 99999 "
-            "WHERE kind = 'chunk' AND namespace = $1",
+            "WHERE kind = 'chunk' AND collection_id = $1::uuid",
             domain,
         )
         await conn.execute("SELECT pgkg_refresh_chunk_stats($1)", collection)
@@ -1072,3 +1083,160 @@ async def test_refresh_repairs_drifted_chunk_statistics(
         repaired["n_total"], repaired["total_len"],
     )
     assert repaired["n_total"] == 4
+
+
+# ---------------------------------------------------------------------------
+# The bucket is a property of the row, not of a vocabulary word (D1)
+# ---------------------------------------------------------------------------
+
+async def quota_counts(conn, items, *, k_rerank=64, fraction=0.6, floor=8):
+    return await conn.fetch(
+        """
+        SELECT bucket, claim_scope, count(*) AS n
+        FROM pgkg_apply_quotas($1::pgkg_candidate[], $2, $3, $4)
+        GROUP BY bucket, claim_scope
+        """,
+        items, k_rerank, fraction, floor,
+    )
+
+
+async def test_the_ceiling_and_the_floor_hold_together(pool: asyncpg.Pool) -> None:
+    """Both halves of D1's split at once, on the same 64-row budget: 200
+    passages cannot take more than the corpus fraction of it, the caller's own
+    facts keep their reserved slots even though every one of them scores below
+    every passage, and the corpus allowance is divided across the claim scopes
+    present rather than handed to whichever scope sorted first."""
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        memory = await new_collection(
+            conn, org_id=org, kind="chat", claim_scope="user",
+            decay_profile="conversational",
+        )
+        corpus_world = await new_collection(
+            conn, org_id=org, kind="corpus", claim_scope="world",
+        )
+        corpus_org = await new_collection(
+            conn, org_id=org, kind="corpus", claim_scope="org",
+        )
+
+        candidates = []
+        score = 100.0
+        for collection in (corpus_world, corpus_org):
+            for _ in range(100):
+                chunk = await insert_chunk(
+                    conn, org_id=org, collection_id=collection,
+                    text=f"corpus passage {uuid.uuid4().hex}",
+                )
+                candidates.append((chunk, "fused", 0, score))
+                score -= 0.01
+        # Memory scores strictly below every passage: the floor has to come
+        # from the quota rather than from the ranking.
+        for _ in range(20):
+            fact = await insert_proposition(
+                conn, org_id=org, collection_id=memory,
+                text=f"personal fact {uuid.uuid4().hex}", claim_scope="user",
+            )
+            candidates.append((fact, "fused", 0, 0.001))
+
+        rows = await quota_counts(conn, candidates)
+
+    counts = {(row["bucket"], row["claim_scope"]): row["n"] for row in rows}
+    n_corpus = sum(n for (bucket, _), n in counts.items() if bucket == "corpus")
+    n_memory = sum(n for (bucket, _), n in counts.items() if bucket == "memory")
+
+    assert n_corpus <= 38, f"corpus took {n_corpus} of a 64-row budget"
+    assert n_memory >= 8, f"memory got {n_memory} slots, the floor is 8"
+    world = counts.get(("corpus", "world"), 0)
+    org_scope = counts.get(("corpus", "org"), 0)
+    assert abs(world - org_scope) <= 1, (
+        f"the per-scope split is {world} world against {org_scope} org"
+    )
+
+
+async def test_a_mixed_collections_passages_are_still_quota_capped(
+    pool: asyncpg.Pool,
+) -> None:
+    """collections.kind is a three-word vocabulary ('chat', 'corpus',
+    'mixed') and the bucket was read off it, so every passage in a mixed
+    collection was labelled memory and competed for the very slots the
+    personal-memory floor exists to protect.  A retrievable chunk is a document
+    passage by construction, whatever its collection is called.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        memory = await new_collection(
+            conn, org_id=org, kind="chat", claim_scope="user",
+            decay_profile="conversational",
+        )
+        mixed = await new_collection(
+            conn, org_id=org, kind="mixed", claim_scope="world",
+        )
+
+        candidates = []
+        score = 100.0
+        for _ in range(200):
+            chunk = await insert_chunk(
+                conn, org_id=org, collection_id=mixed,
+                text=f"handbook passage {uuid.uuid4().hex}",
+            )
+            candidates.append((chunk, "fused", 0, score))
+            score -= 0.01
+        personal = set()
+        for _ in range(20):
+            fact = await insert_proposition(
+                conn, org_id=org, collection_id=memory,
+                text=f"personal fact {uuid.uuid4().hex}", claim_scope="user",
+            )
+            personal.add(fact)
+            candidates.append((fact, "fused", 0, 0.001))
+
+        rows = await conn.fetch(
+            """
+            SELECT item_id, bucket
+            FROM pgkg_apply_quotas($1::pgkg_candidate[], 64, 0.6, 8)
+            """,
+            candidates,
+        )
+
+    kept = [row for row in rows if row["item_id"] in personal]
+    assert len(kept) >= 8, (
+        f"only {len(kept)} of the caller's own facts survived a 64-row budget "
+        f"against 200 mixed-collection passages. Buckets seen: "
+        f"{sorted({row['bucket'] for row in rows})}"
+    )
+
+
+async def test_a_passage_in_the_default_collection_is_corpus_material(
+    pool: asyncpg.Pool,
+) -> None:
+    """The reserved default collection is where an omitted collection_id lands,
+    which makes it the commonest case rather than an edge one."""
+    from pgkg.config import DEFAULT_COLLECTION_ID, DEFAULT_ORG_ID
+
+    async with pool.acquire() as conn:
+        kind = await conn.fetchval(
+            "SELECT kind FROM collections WHERE id = $1", DEFAULT_COLLECTION_ID
+        )
+        chunk = await insert_chunk(
+            conn, org_id=DEFAULT_ORG_ID, collection_id=DEFAULT_COLLECTION_ID,
+            text=f"handbook passage {uuid.uuid4().hex}",
+        )
+        bucket = await conn.fetchval(
+            "SELECT bucket FROM pgkg_item_scope(ARRAY[$1]::UUID[])", chunk
+        )
+        # A caller demanding no corpus at all.
+        survived = await conn.fetch(
+            """
+            SELECT item_id FROM pgkg_apply_quotas(
+                ARRAY[($1, 'fused', 0, 1.0)::pgkg_candidate], 64, 0.0, 8
+            )
+            """,
+            chunk,
+        )
+
+    assert bucket == "corpus", (
+        f"a passage in the default collection (kind={kind!r}) is bucketed "
+        f"{bucket!r}, so neither the ceiling nor the per-scope split applies "
+        f"to it"
+    )
+    assert not survived, "a corpus_fraction of 0.0 admitted a passage"

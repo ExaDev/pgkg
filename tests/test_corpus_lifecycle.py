@@ -1000,3 +1000,114 @@ async def test_the_shipped_state_widens_to_nothing(pool: asyncpg.Pool) -> None:
 
     assert orgs == [default_org]
     assert seeded == "private"
+
+
+# ---------------------------------------------------------------------------
+# Where the content address stops (D3, D4, D6)
+# ---------------------------------------------------------------------------
+
+async def test_a_passage_in_two_collections_is_a_row_in_each(
+    pool: asyncpg.Pool,
+) -> None:
+    """Dedup stops at the collection boundary, as it already stops at the org.
+
+    A chunk row is what the read predicate consults: collection_id selects the
+    claim scope, the decay profile, the statistics domain and the quota bucket,
+    and acl_group_id gates the read outright.  One row serving two collections
+    is therefore permanently scoped, decayed and gated as whichever collection
+    ingested it first, and the second collection cannot retrieve its own
+    document's passage at all.  D6's sketch addresses a chunk by (org,
+    content_hash); D3 requires collection_id on every retrievable row, and the
+    two cannot both hold once a passage is in two collections.
+    """
+    from pgkg.corpus import CorpusIngest
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        coll_a = await conn.fetchval(
+            "UPDATE collections SET claim_scope = 'world' WHERE id = $1"
+            " RETURNING id",
+            await new_collection(conn, org_id=org),
+        )
+        coll_b = await new_collection(conn, org_id=org)
+
+    body = (
+        "The reimbursement window for travel expenses closes thirty days "
+        "after the trip concludes. Receipts must be legible."
+    )
+    embed = lambda texts: [[0.0] * 1024 for _ in texts]
+
+    a = CorpusIngest(pool, org_id=org, collection_id=coll_a, embed=embed)
+    b = CorpusIngest(pool, org_id=org, collection_id=coll_b, embed=embed)
+    await a.upsert_document(external_id=unique("docA"), text=body)
+    res_b = await b.upsert_document(external_id=unique("docB"), text=body)
+
+    assert res_b.changed is True
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT c.id, c.collection_id
+            FROM document_version_chunks dvc
+            JOIN document_versions dv ON dv.id = dvc.document_version_id
+            JOIN documents d ON d.id = dv.document_id
+            JOIN chunks c ON c.id = dvc.chunk_id
+            WHERE d.collection_id = $1
+            """,
+            coll_b,
+        )
+    assert rows, "document B linked no chunks"
+    wrong = [row for row in rows if row["collection_id"] != coll_b]
+    assert not wrong, (
+        f"{len(wrong)} of {len(rows)} chunks reached by document B's current "
+        f"version carry collection_id {wrong[0]['collection_id']} instead of "
+        f"{coll_b}"
+    )
+
+
+async def test_two_concurrent_crawls_of_one_document_do_not_collide(
+    pool: asyncpg.Pool,
+) -> None:
+    """Opening a version takes MAX(version_no) + 1, and (document_id,
+    version_no) is unique.
+
+    Two connectors crawling one document at once — or an upsert racing a
+    re-crawl — both computed the same number, and the loser raised a unique
+    violation out of upsert_document.  The row lock on the document is what
+    makes the second one wait and number itself 2.
+    """
+    import asyncio
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        document = await new_document(
+            conn, org_id=org, collection_id=collection, external_id=unique("race")
+        )
+
+    async def open_version(payload: bytes) -> None:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "SELECT set_config('pgkg.org_id', $1, false)", str(org)
+            )
+            async with conn.transaction():
+                await conn.fetchrow(
+                    "SELECT version_id, is_new"
+                    " FROM pgkg_open_document_version($1, $2)",
+                    document,
+                    sha256(payload.decode()),
+                )
+                await asyncio.sleep(0.1)
+
+    await asyncio.gather(open_version(b"one"), open_version(b"two"))
+
+    async with pool.acquire() as conn:
+        numbers = [
+            row["version_no"]
+            for row in await conn.fetch(
+                "SELECT version_no FROM document_versions"
+                " WHERE document_id = $1 ORDER BY version_no",
+                document,
+            )
+        ]
+    assert numbers == [1, 2]

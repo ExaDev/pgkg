@@ -14,19 +14,33 @@ the same address and the vector it already carries is still the right vector.
 
 Everything that writes runs in ONE transaction, which is what D6 requires of
 the flip: retiring the outgoing version and promoting the incoming one in two
-round trips leaves a window where retrieval sees both versions or neither.  The
-embedder is called inside that transaction, deliberately.  It is the slow step
-and holding a connection across it is exactly what the online path must not do
-— but this path is batch, it runs under the ingest_jobs worker's slot budget
-rather than alongside recall, and the alternative is deciding what to embed
-from a read taken outside the transaction that writes it.
+round trips leaves a window where retrieval sees both versions or neither.
+
+The models run BEFORE that transaction opens.  D7 is explicit that corpus
+ingest must not compete with online recall for pool slots, and a document with
+fifty chunks and a two-second extractor would otherwise hold one pooled
+connection — and the row locks its extract-cache reads take — for a hundred
+seconds.  So a document is three phases: ask whether the hash moved, spend the
+model budget with no transaction open, then write everything in one transaction
+that contains no model call.  The per-chunk extractor runs holding nothing at
+all, and progress is reported between phases rather than during one, because a
+slot that holds a connection while its reporter asks for a second one is a slot
+that cannot report at all.
+
+What makes that ordering safe is content addressing.  The spend phase asks
+which chunk texts are already stored under this org and already carry a vector
+of the primary generation; the write phase asks the database the same question
+again, authoritatively, through pgkg_add_version_chunk().  A concurrent crawl
+that stores a passage in between can only cost us one redundant embedding of
+text that hashes to the row we then reuse — never a wrong vector, because a
+vector is only ever written against the content it was computed from.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime
 from uuid import UUID
 
@@ -34,10 +48,10 @@ import asyncpg
 from pgvector import HalfVector
 
 from pgkg import ml
-from pgkg.chunking import DEFAULT_MAX_CHARS, chunk_document
+from pgkg.chunking import DEFAULT_MAX_CHARS, Chunk, chunk_document
 from pgkg.config import DEFAULT_COLLECTION_ID, DEFAULT_ORG_ID, ORG_GUC
 from pgkg.memory import Provenance
-from pgkg.ml import ExtractCache, Proposition
+from pgkg.ml import Proposition
 
 EmbedFn = Callable[[list[str]], list[list[float]]]
 
@@ -85,15 +99,6 @@ class _Generation:
     generation_id: UUID
 
 
-@dataclass(frozen=True)
-class _Vectorised:
-    """What vectorising the new chunks of one version cost."""
-
-    new: int
-    embedded: int
-    cache_hits: int
-
-
 _COLLECTION_POLICY_SQL = """
 SELECT claim_scope, extract_propositions, public_source
 FROM collections WHERE id = $1
@@ -113,6 +118,28 @@ _FIND_DOCUMENT_SQL = """
 SELECT id FROM documents
 WHERE org_id = $1 AND collection_id = $2 AND external_id = $3
   AND deleted_at IS NULL
+"""
+
+# The no-op path, asked before anything is held or spent: this is the predicate
+# pgkg_open_document_version() applies to decide is_new, read here so that an
+# unchanged crawl opens no transaction at all.  The write phase asks again.
+_FIND_UNCHANGED_SQL = """
+SELECT d.id AS document_id, dv.id AS version_id
+FROM documents d
+JOIN document_versions dv ON dv.id = d.current_version_id
+WHERE d.org_id = $1 AND d.collection_id = $2 AND d.external_id = $3
+  AND d.deleted_at IS NULL AND dv.content_hash = $4
+"""
+
+# What is already stored, at the granularity the reuse path works at: a chunk
+# row with no document_id is the one pgkg_add_version_chunk() reuses, and its
+# vector is only reusable if it belongs to the generation this org writes in.
+_KNOWN_CONTENT_SQL = """
+SELECT c.content_hash,
+       (c.embedding IS NOT NULL AND c.embedder_generation_id = $2) AS has_vector
+FROM chunks c
+WHERE c.org_id = $1 AND c.document_id IS NULL
+  AND c.content_hash = ANY($3::bytea[])
 """
 
 _INSERT_DOCUMENT_SQL = """
@@ -145,8 +172,16 @@ RETURNING id
 # — the common one, once a corpus is steady — writes no provenance row at all.
 _ATTRIBUTE_VERSION_SQL = "UPDATE document_versions SET provenance_id = $2 WHERE id = $1"
 
-_ADD_CHUNK_SQL = """
-SELECT chunk_id, is_new FROM pgkg_add_version_chunk($1, $2, $3, $4, $5)
+# Every chunk of the document in one round trip.  A loop over this function is
+# one network round trip per chunk with the ingest transaction held open, which
+# on a 300-page handbook is the whole cost of the write phase; the lateral join
+# makes the pipeline set-based the way chat ingest already is.
+_ADD_CHUNKS_SQL = """
+SELECT t.n, added.chunk_id, added.is_new
+FROM unnest($2::int[], $3::text[]) WITH ORDINALITY AS t(ord, chunk_text, n)
+CROSS JOIN LATERAL
+    pgkg_add_version_chunk($1, t.ord, t.chunk_text, $4, $5) AS added
+ORDER BY t.n
 """
 
 # The immutability trigger fires on text and org only, so writing the vector of
@@ -185,21 +220,27 @@ ON CONFLICT DO NOTHING
 
 # The same table the online pipeline uses, keyed the same way: with
 # content-addressed chunks, a re-ingest after an edit is a cache hit for every
-# unchanged chunk (D2).  Bound to the ingest connection rather than taking one
-# of its own — a second acquire from inside an open ingest transaction is how a
-# batch pipeline starves the pool it shares with recall.
+# unchanged chunk (D2).  One statement for the whole document rather than one
+# per chunk, and consulted outside the ingest transaction: the hit_count bump
+# takes a row lock, and a fifty-chunk document held those locks for as long as
+# its extractor ran.
+# Keyed by the org as well as by the text and the model: a hit is the claims
+# extracted from a passage, so it answers only to the org that paid for them.
+# The row policy says the same thing, and cannot say it on the owner connection
+# a reference deployment uses (D4).
 _CACHE_GET_SQL = """
 UPDATE proposition_cache
 SET hit_count = hit_count + 1
-WHERE cache_key = $1
-RETURNING propositions
+WHERE cache_key = ANY($1::text[]) AND org_id = $2
+RETURNING cache_key, propositions
 """
 
 _CACHE_PUT_SQL = """
 INSERT INTO proposition_cache
-    (cache_key, chunk_hash, extractor_model, prompt_version, propositions)
-VALUES ($1, $2, $3, $4, $5::jsonb)
-ON CONFLICT (cache_key) DO NOTHING
+    (cache_key, chunk_hash, extractor_model, prompt_version, propositions,
+     org_id)
+SELECT *, $6 FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::jsonb[])
+ON CONFLICT (cache_key, org_id) DO NOTHING
 """
 
 # The cache is read and written under the same flag.  A cache HIT is itself the
@@ -242,21 +283,86 @@ def content_hash(text: str) -> bytes:
 document_hash = content_hash
 
 
-class _ConnExtractCache:
-    """ExtractCache over one held connection."""
+# A queued document is worked on by a process the connector never meets, so the
+# account it gave of where the document came from has to travel with it (D5,
+# D7).  The wire form is this module's to state rather than the queue's: the
+# queue holds it as opaque JSONB, and these two functions are the only place
+# that knows a published_at is a timestamp and an ingest_run_id is a UUID.
+_PROVENANCE_UUID_FIELDS = ("ingest_run_id", "actor_user_id", "source_id")
+_PROVENANCE_TIME_FIELDS = ("published_at", "retrieved_at")
 
-    def __init__(self, conn: asyncpg.Connection) -> None:
-        self._conn = conn
+
+def dump_provenance(given: Provenance | None) -> str | None:
+    """The derivation record as JSON, or None when the caller stated none."""
+    if given is None:
+        return None
+    stated = {
+        field.name: getattr(given, field.name)
+        for field in fields(given)
+        if getattr(given, field.name) is not None
+    }
+    return json.dumps(stated, default=str)
+
+
+def load_provenance(payload: object) -> Provenance | None:
+    """The record a connector stated, rebuilt with its types.
+
+    JSONB has no timestamp and no UUID, so a round trip through the queue that
+    did not restore them would hand the pipeline strings and store an ingest
+    date as text — which is the perishable profile reading a date it cannot
+    subtract.
+    """
+    if payload is None:
+        return None
+    raw = json.loads(payload) if isinstance(payload, str) else dict(payload)
+    known = {f.name for f in fields(Provenance)}
+    stated = {name: value for name, value in raw.items() if name in known}
+    for name in _PROVENANCE_UUID_FIELDS:
+        if isinstance(stated.get(name), str):
+            stated[name] = UUID(stated[name])
+    for name in _PROVENANCE_TIME_FIELDS:
+        if isinstance(stated.get(name), str):
+            stated[name] = datetime.fromisoformat(stated[name])
+    return Provenance(**stated)
+
+
+def _propositions(payload: object) -> list[Proposition]:
+    items = json.loads(payload) if isinstance(payload, str) else payload
+    return [Proposition(**item) for item in items]
+
+
+class _BatchExtractCache:
+    """ExtractCache for one document: one read for all its chunks, one write.
+
+    The read is deferred to the first get() rather than done up front, so a
+    caller that never consults the cache — the offline extractor — pays for
+    nothing and bumps nobody's hit count.  Writes are buffered and land in the
+    ingest transaction, which is the only place in this module that writes.
+    """
+
+    def __init__(
+        self, pool: asyncpg.Pool, texts: Sequence[str], *, org_id: UUID
+    ) -> None:
+        self._pool = pool
+        self._org_id = org_id
+        self._texts = list(dict.fromkeys(texts))
+        self._hits: dict[str, list[Proposition]] | None = None
+        self._puts: list[tuple[str, str, str, str, str]] = []
 
     async def get(self, cache_key: str) -> list[Proposition] | None:
-        # One round trip: the hit count is bumped by the statement that reads
-        # the payload, as it is on the online path.
-        row = await self._conn.fetchrow(_CACHE_GET_SQL, cache_key)
-        if row is None:
-            return None
-        raw = row["propositions"]
-        items = json.loads(raw) if isinstance(raw, str) else raw
-        return [Proposition(**item) for item in items]
+        if self._hits is None:
+            self._hits = await self._prefetch()
+        return self._hits.get(cache_key)
+
+    async def _prefetch(self) -> dict[str, list[Proposition]]:
+        # The key is derived the way ml derives it, from the settings actually
+        # in force: a prefetch under another model's key would miss every time.
+        settings = ml.get_settings()
+        model = settings.extractor_model or settings.llm_model
+        keys = [ml.compute_cache_key(text, model) for text in self._texts]
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(_CACHE_GET_SQL, keys, self._org_id)
+        return {row["cache_key"]: _propositions(row["propositions"]) for row in rows}
 
     async def put(
         self,
@@ -266,14 +372,21 @@ class _ConnExtractCache:
         prompt_version: str,
         props: list[Proposition],
     ) -> None:
-        await self._conn.execute(
-            _CACHE_PUT_SQL,
-            cache_key,
-            chunk_hash,
-            extractor_model,
-            prompt_version,
-            json.dumps([prop.model_dump() for prop in props]),
+        self._puts.append(
+            (
+                cache_key,
+                chunk_hash,
+                extractor_model,
+                prompt_version,
+                json.dumps([prop.model_dump() for prop in props]),
+            )
         )
+
+    async def flush(self, conn: asyncpg.Connection) -> None:
+        if not self._puts:
+            return
+        columns = [list(column) for column in zip(*self._puts)]
+        await conn.execute(_CACHE_PUT_SQL, *columns, self._org_id)
 
 
 class CorpusIngest:
@@ -340,46 +453,117 @@ class CorpusIngest:
         on_progress: ProgressFn | None = None,
     ) -> CorpusIngestResult:
         version_hash = document_hash(text)
+        given = provenance if provenance is not None else Provenance()
+        # D6 keys the perishable profile on asserted_at, and D5 says
+        # provenance.published_at is what feeds it: what makes an article stale
+        # is when it was published, not when this crawl reached it.  An explicit
+        # asserted_at still wins — a caller stating the world-time of a claim
+        # knows something a publication date does not.
+        asserted = asserted_at if asserted_at is not None else given.published_at
 
+        # Phase 1, ask whether there is any work.  The document hash is what
+        # makes an unchanged crawl of 100k documents free, so it is answered
+        # before the text is even chunked.
         async with self._pool.acquire() as conn:
             await conn.execute(_SET_ORG_SQL, str(self._org_id))
             policy = await self._policy(conn)
             generation = await self._generation(conn)
+            unchanged = await conn.fetchrow(
+                _FIND_UNCHANGED_SQL,
+                self._org_id,
+                self._collection_id,
+                external_id,
+                version_hash,
+            )
+        if unchanged is not None:
+            return CorpusIngestResult(
+                document_id=unchanged["document_id"],
+                version_id=unchanged["version_id"],
+                changed=False,
+            )
 
+        chunks = chunk_document(text, max_chars=self._max_chars)
+        # Distinct texts, not links: a passage repeated inside one document is
+        # one content-addressed chunk row, embedded once and extracted once.
+        texts = list(dict.fromkeys(chunk.text for chunk in chunks))
+        # Reported before the expensive step rather than after it, with nothing
+        # held: a progress row written inside the ingest transaction is
+        # invisible until it commits, which is when it stops being progress, and
+        # a slot that holds a connection while the reporter asks for a second
+        # one is a slot that cannot report at all.
+        await _report(on_progress, len(chunks), 0)
+
+        # Phase 2, spend.  The embedding cache lives on this connection — read
+        # what has already been paid for, embed the rest, put it back — and no
+        # transaction is open across it: the vectors are content-addressed and
+        # are valid whether or not the version below commits.
+        async with self._pool.acquire() as conn:
+            await conn.execute(_SET_ORG_SQL, str(self._org_id))
+            stored, vectored = await self._known_content(conn, generation, texts)
+            cached = await self._cache_lookup(
+                conn, policy, generation, [t for t in texts if t not in vectored]
+            )
+            missing = [t for t in texts if t not in vectored and t not in cached]
+            fresh = {
+                chunk_text: HalfVector(vector)
+                for chunk_text, vector in zip(missing, self._embed_texts(missing))
+            }
+            await self._cache_store(conn, policy, generation, fresh)
+
+        vectors = {**cached, **fresh}
+        await _report(on_progress, len(chunks), len(texts))
+        # The extractor is a model call per chunk, so it runs with nothing held
+        # at all: its cache takes a connection for one statement, once.
+        extracted, extract_cache = await self._extract(
+            policy, [t for t in texts if t not in stored]
+        )
+        proposition_vectors = [
+            HalfVector(vector)
+            for vector in self._embed_texts([prop.text for _, prop in extracted])
+        ]
+
+        # Phase 3, write.  One transaction, as D6 requires of the flip, and no
+        # model call inside it.
+        async with self._pool.acquire() as conn:
+            await conn.execute(_SET_ORG_SQL, str(self._org_id))
             async with conn.transaction():
                 document_id = await self._document(conn, external_id, uri, source)
                 opened = await conn.fetchrow(
                     _OPEN_VERSION_SQL, document_id, version_hash
                 )
                 version_id = opened["version_id"]
-
-                # The no-op path: the hash has not moved, so nothing below runs
-                # — no chunking, no embedder, no extractor, no writes.
+                # A crawl that landed the same content while we were embedding.
                 if not opened["is_new"]:
                     return CorpusIngestResult(
                         document_id=document_id, version_id=version_id, changed=False
                     )
 
-                provenance_id = await self._attribute(
-                    conn, version_id, provenance, uri
-                )
+                provenance_id = await self._attribute(conn, version_id, given, uri)
                 await self._update_document(conn, document_id, source, uri)
-                linked = await self._link_chunks(conn, version_id, text, asserted_at)
-                # Distinct rows, not links: a passage repeated inside one
-                # document is one content-addressed chunk row.
+                linked = await self._link_chunks(conn, version_id, chunks, asserted)
+                new_chunks = list(
+                    {
+                        chunk_id: chunk_text
+                        for chunk_id, chunk_text, is_new in linked
+                        if is_new
+                    }.items()
+                )
                 distinct = len({chunk_id for chunk_id, _, _ in linked})
-                # Reported before the expensive step rather than after it, and
-                # from a caller-supplied sink rather than written here: a
-                # progress row written inside this transaction is invisible
-                # until it commits, which is when it stops being progress.
-                await _report(on_progress, len(linked), 0)
-                vectorised = await self._vectorise(conn, policy, generation, linked)
-                await _report(on_progress, len(linked), distinct)
+                await self._write_vectors(conn, generation, new_chunks, vectors)
                 # Before the flip, in the order D6 gives: the facts a version
                 # carries have to exist by the time it becomes the current one.
-                extracted = await self._extract(
-                    conn, policy, generation, provenance_id, asserted_at, linked
+                propositions = await self._write_propositions(
+                    conn,
+                    policy,
+                    generation,
+                    provenance_id,
+                    asserted,
+                    linked,
+                    extracted,
+                    proposition_vectors,
                 )
+                if extract_cache is not None:
+                    await extract_cache.flush(conn)
                 await conn.execute(_PROMOTE_SQL, version_id)
 
         return CorpusIngestResult(
@@ -387,12 +571,34 @@ class CorpusIngest:
             version_id=version_id,
             changed=True,
             chunks_total=len(linked),
-            chunks_new=vectorised.new,
-            chunks_carried=distinct - vectorised.new,
-            embedded=vectorised.embedded,
-            cache_hits=vectorised.cache_hits,
-            propositions=extracted,
+            chunks_new=len(new_chunks),
+            chunks_carried=distinct - len(new_chunks),
+            embedded=len(fresh),
+            cache_hits=len(cached),
+            propositions=propositions,
         )
+
+    async def _known_content(
+        self,
+        conn: asyncpg.Connection,
+        generation: _Generation,
+        texts: Sequence[str],
+    ) -> tuple[set[str], set[str]]:
+        """Which of these texts are stored already, and which carry a vector.
+
+        Two answers from one round trip, because they drive two different
+        decisions: a stored text is one this version will carry without
+        extracting it again, and a vectored one is a text nobody has to embed.
+        """
+        by_hash = {content_hash(chunk_text): chunk_text for chunk_text in texts}
+        rows = await conn.fetch(
+            _KNOWN_CONTENT_SQL, self._org_id, generation.generation_id, list(by_hash)
+        )
+        stored = {by_hash[row["content_hash"]] for row in rows}
+        vectored = {
+            by_hash[row["content_hash"]] for row in rows if row["has_vector"]
+        }
+        return stored, vectored
 
     async def _policy(self, conn: asyncpg.Connection) -> _CollectionPolicy:
         row = await conn.fetchrow(_COLLECTION_POLICY_SQL, self._collection_id)
@@ -448,10 +654,9 @@ class CorpusIngest:
         self,
         conn: asyncpg.Connection,
         version_id: UUID,
-        provenance: Provenance | None,
+        given: Provenance,
         uri: str | None,
     ) -> UUID:
-        given = provenance if provenance is not None else Provenance()
         provenance_id = await conn.fetchval(
             _INSERT_PROVENANCE_SQL,
             self._org_id,
@@ -476,64 +681,55 @@ class CorpusIngest:
         self,
         conn: asyncpg.Connection,
         version_id: UUID,
-        text: str,
+        chunks: Sequence[Chunk],
         asserted_at: datetime | None,
     ) -> list[tuple[UUID, str, bool]]:
-        """Chunk the document and link every chunk to the open version.
+        """Link every chunk of the document to the open version, in one call.
 
         The database decides which chunks are new: it holds the content
         addresses, and a look-then-insert from here would race a second
         connector crawling the same boilerplate.
         """
-        chunks = chunk_document(text, max_chars=self._max_chars)
-        linked: list[tuple[UUID, str, bool]] = []
-        for chunk in chunks:
-            row = await conn.fetchrow(
-                _ADD_CHUNK_SQL,
-                version_id,
-                chunk.ordinal,
-                chunk.text,
-                None,
-                asserted_at,
-            )
-            linked.append((row["chunk_id"], chunk.text, row["is_new"]))
-        return linked
+        rows = await conn.fetch(
+            _ADD_CHUNKS_SQL,
+            version_id,
+            [chunk.ordinal for chunk in chunks],
+            [chunk.text for chunk in chunks],
+            None,
+            asserted_at,
+        )
+        return [
+            (row["chunk_id"], chunks[row["n"] - 1].text, row["is_new"])
+            for row in rows
+        ]
 
-    async def _vectorise(
+    async def _write_vectors(
         self,
         conn: asyncpg.Connection,
-        policy: _CollectionPolicy,
         generation: _Generation,
-        linked: list[tuple[UUID, str, bool]],
-    ) -> _Vectorised:
+        new_chunks: list[tuple[UUID, str]],
+        vectors: dict[str, HalfVector],
+    ) -> None:
         """Give a vector to every chunk the database created, and to no other.
 
         A carried-over chunk already holds the vector for its content, and its
-        content cannot have changed — that is what its address means.
+        content cannot have changed — that is what its address means.  A chunk
+        the decide phase expected to be carried and the write phase created is
+        left for the next crawl rather than embedded here, because embedding
+        here would be a model call inside this transaction.
         """
-        new = list(
-            {chunk_id: text for chunk_id, text, is_new in linked if is_new}.items()
-        )
-        if not new:
-            return _Vectorised(new=0, embedded=0, cache_hits=0)
-
-        cached = await self._cache_lookup(conn, policy, generation, new)
-        missing = [text for _, text in new if text not in cached]
-        fresh = {
-            text: HalfVector(vector)
-            for text, vector in zip(missing, self._embed_texts(missing))
-        }
-        await self._cache_store(conn, policy, generation, fresh)
-
-        vectors = {**cached, **fresh}
+        vectorised = [
+            (chunk_id, vectors[chunk_text])
+            for chunk_id, chunk_text in new_chunks
+            if chunk_text in vectors
+        ]
+        if not vectorised:
+            return
         await conn.execute(
             _WRITE_CHUNK_EMBEDDINGS_SQL,
             generation.generation_id,
-            [chunk_id for chunk_id, _ in new],
-            [vectors[text] for _, text in new],
-        )
-        return _Vectorised(
-            new=len(new), embedded=len(fresh), cache_hits=len(cached)
+            [chunk_id for chunk_id, _ in vectorised],
+            [vector for _, vector in vectorised],
         )
 
     async def _cache_lookup(
@@ -541,11 +737,11 @@ class CorpusIngest:
         conn: asyncpg.Connection,
         policy: _CollectionPolicy,
         generation: _Generation,
-        new: list[tuple[UUID, str]],
+        texts: Sequence[str],
     ) -> dict[str, HalfVector]:
-        if not policy.public_source:
+        if not policy.public_source or not texts:
             return {}
-        by_hash = {content_hash(text): text for _, text in new}
+        by_hash = {content_hash(chunk_text): chunk_text for chunk_text in texts}
         rows = await conn.fetch(
             _READ_CACHE_SQL, generation.generation_id, list(by_hash)
         )
@@ -563,11 +759,39 @@ class CorpusIngest:
         await conn.execute(
             _WRITE_CACHE_SQL,
             generation.generation_id,
-            [content_hash(text) for text in fresh],
+            [content_hash(chunk_text) for chunk_text in fresh],
             list(fresh.values()),
         )
 
     async def _extract(
+        self, policy: _CollectionPolicy, new_texts: Sequence[str]
+    ) -> tuple[list[tuple[str, Proposition]], _BatchExtractCache | None]:
+        """Extract from the chunks this version adds, if the collection opted in.
+
+        New content only, for the same reason only new content is embedded: a
+        carried chunk's text has not changed, so neither have the facts in it —
+        and extraction is the expensive half twice over, priced per token and
+        recurring on every prompt version bump.
+
+        Keyed by chunk text rather than by chunk id, because the ids do not
+        exist yet: this runs before the transaction that creates them.
+        """
+        if not policy.extract_propositions or not new_texts:
+            return [], None
+
+        cache = (
+            _BatchExtractCache(self._pool, new_texts, org_id=self._org_id)
+            if self._use_extract_cache
+            else None
+        )
+        extracted = [
+            (chunk_text, prop)
+            for chunk_text in new_texts
+            for prop in await ml.extract_propositions_async(chunk_text, cache=cache)
+        ]
+        return extracted, cache
+
+    async def _write_propositions(
         self,
         conn: asyncpg.Connection,
         policy: _CollectionPolicy,
@@ -575,34 +799,20 @@ class CorpusIngest:
         provenance_id: UUID,
         asserted_at: datetime | None,
         linked: list[tuple[UUID, str, bool]],
+        extracted: list[tuple[str, Proposition]],
+        vectors: list[HalfVector],
     ) -> int:
-        """Extract from the chunks this version added, if the collection opted in.
-
-        New chunks only, for the same reason only they are embedded: a carried
-        chunk's content has not changed, so neither have the facts in it — and
-        extraction is the expensive half twice over, priced per token and
-        recurring on every prompt version bump.
-        """
-        if not policy.extract_propositions:
-            return 0
-        new = list(
-            {chunk_id: text for chunk_id, text, is_new in linked if is_new}.items()
-        )
-        if not new:
-            return 0
-
-        cache: ExtractCache | None = (
-            _ConnExtractCache(conn) if self._use_extract_cache else None
-        )
-        extracted: list[tuple[UUID, Proposition]] = [
-            (chunk_id, prop)
-            for chunk_id, text in new
-            for prop in await ml.extract_propositions_async(text, cache=cache)
-        ]
+        """Land the extracted facts, each citing the passage it came from."""
         if not extracted:
             return 0
-
-        vectors = self._embed_texts([prop.text for _, prop in extracted])
+        chunk_ids = {chunk_text: chunk_id for chunk_id, chunk_text, _ in linked}
+        rows = [
+            (chunk_ids[chunk_text], prop, vector)
+            for (chunk_text, prop), vector in zip(extracted, vectors)
+            if chunk_text in chunk_ids
+        ]
+        if not rows:
+            return 0
         await conn.execute(
             _INSERT_PROPOSITIONS_SQL,
             self._org_id,
@@ -611,10 +821,10 @@ class CorpusIngest:
             provenance_id,
             asserted_at,
             generation.generation_id,
-            [prop.text for _, prop in extracted],
-            [HalfVector(vector) for vector in vectors],
-            [prop.predicate for _, prop in extracted],
-            [prop.object for _, prop in extracted],
-            [chunk_id for chunk_id, _ in extracted],
+            [prop.text for _, prop, _ in rows],
+            [vector for _, _, vector in rows],
+            [prop.predicate for _, prop, _ in rows],
+            [prop.object for _, prop, _ in rows],
+            [chunk_id for chunk_id, _, _ in rows],
         )
-        return len(extracted)
+        return len(rows)

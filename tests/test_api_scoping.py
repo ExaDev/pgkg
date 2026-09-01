@@ -169,6 +169,199 @@ def test_subscribed_collections_widen_reads_only() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1b. The sharing seam, against Postgres and under the application role
+# ---------------------------------------------------------------------------
+#
+# The two assertions above are about a dataclass: they say what read_org_ids
+# returns and nothing about what the database does with it.  D4 ships the seam
+# early because it sits in the hot-path predicate, so what has to be true is
+# that a tenant naming [own_org, SYSTEM_ORG] retrieves the operator's row — and
+# that has to be true as pgkg_app, since every policy is inert for the owner the
+# suite otherwise connects as, and a single-org policy would refuse the second
+# element of that array however correct the predicate was.
+#
+# The subscription is carried on the Scope rather than read from
+# collection_subscriptions, because D3 makes the collection list "own +
+# subscribed, resolved by the app": what the predicate is given is the resolved
+# list, and no code path reads that table yet.
+
+
+async def _shared_collection(pool: asyncpg.Pool, name: str) -> uuid.UUID:
+    """A collection the operator publishes: owned by the system org, which is
+    the only owner 023's CHECK lets a shared collection have."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO collections
+                (org_id, owner_org_id, name, kind, visibility, claim_scope,
+                 decay_profile, public_source, licence)
+            VALUES (pgkg_system_org(), pgkg_system_org(), $1, 'corpus',
+                    'shared', 'world', 'timeless', TRUE, 'operator-licensed')
+            RETURNING id
+            """,
+            f"{name}_{uuid.uuid4().hex[:8]}",
+        )
+
+
+async def _as_app(pool: asyncpg.Pool, org: uuid.UUID, sql: str, *args):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL ROLE pgkg_app")
+            await conn.execute(
+                "SELECT set_config('pgkg.org_id', $1, true)", str(org)
+            )
+            return await conn.fetch(sql, *args)
+
+
+async def test_a_subscriber_retrieves_a_shared_fact(pool: asyncpg.Pool) -> None:
+    """include_system_org, end to end: the same Scope that widens read_org_ids
+    is what the retrieval predicate is given, and the operator's fact comes
+    back."""
+    tenant = await _make_org(pool, "seam_fact")
+    shared = await _shared_collection(pool, "seam_fact")
+    ns = _ns("seam_fact")
+
+    async with pool.acquire() as conn:
+        fact = await conn.fetchval(
+            """
+            INSERT INTO propositions (text, namespace, org_id, collection_id,
+                                      claim_scope)
+            VALUES ('The zorbulon standard mandates quarterly reconciliation',
+                    $1, pgkg_system_org(), $2, 'world')
+            RETURNING id
+            """,
+            ns,
+            shared,
+        )
+
+    widened = Scope(
+        org_id=tenant,
+        collection_id=DEFAULT_COLLECTION_ID,
+        subscribed_collection_ids=(shared,),
+        include_system_org=True,
+    )
+    narrow = Scope(
+        org_id=tenant,
+        collection_id=DEFAULT_COLLECTION_ID,
+        subscribed_collection_ids=(shared,),
+    )
+    search = """
+        SELECT proposition_id FROM pgkg_search(
+            'zorbulon reconciliation', NULL, 20, 50, $1, NULL, 30.0, FALSE, 60,
+            $2::uuid[], $3::uuid[])
+    """
+
+    seen = await _as_app(
+        pool, tenant, search, ns, widened.read_org_ids, widened.read_collection_ids
+    )
+    without = await _as_app(
+        pool, tenant, search, ns, narrow.read_org_ids, narrow.read_collection_ids
+    )
+
+    assert fact in [r["proposition_id"] for r in seen], (
+        "a subscriber cannot read the operator's shared fact, so the seam D4 "
+        "ships early does not carry anything"
+    )
+    assert without == [], (
+        "the fact came back without include_system_org, so the arm above "
+        "proves nothing about the widening"
+    )
+
+
+async def test_a_subscriber_retrieves_a_shared_passage_with_its_context(
+    pool: asyncpg.Pool,
+) -> None:
+    """The corpus half of the same seam.  The passage is reached through
+    chunks, its neighbours through document_versions and the link table, and
+    its BM25 statistics through the per-org statistics domain — every one of
+    which the app role has to be able to read for the shared shelf to be worth
+    subscribing to."""
+    tenant = await _make_org(pool, "seam_passage")
+    shared = await _shared_collection(pool, "seam_passage")
+
+    async with pool.acquire() as conn:
+        document = await conn.fetchval(
+            """
+            INSERT INTO documents (source, org_id, collection_id, external_id)
+            VALUES ('operator handbook', pgkg_system_org(), $1, $2)
+            RETURNING id
+            """,
+            shared,
+            uuid.uuid4().hex,
+        )
+        version = await conn.fetchval(
+            "SELECT version_id FROM pgkg_open_document_version($1, $2)",
+            document,
+            hashlib.sha256(b"operator handbook v1").digest(),
+        )
+        for ord_, text in enumerate(
+            [
+                "Clause one covers the scope of the standard.",
+                "The zorbulon standard mandates quarterly reconciliation.",
+                "Clause three covers the appeals process.",
+            ]
+        ):
+            await conn.execute(
+                "SELECT pgkg_add_version_chunk($1, $2, $3)", version, ord_, text
+            )
+        await conn.execute("SELECT pgkg_promote_document_version($1)", version)
+
+    widened = Scope(
+        org_id=tenant,
+        collection_id=DEFAULT_COLLECTION_ID,
+        subscribed_collection_ids=(shared,),
+        include_system_org=True,
+    )
+    retrieve = """
+        SELECT text, context_text
+        FROM pgkg_retrieve(
+            q_text => 'zorbulon reconciliation',
+            k_retrieve => 20,
+            expand_graph => FALSE,
+            p_org_ids => $1::uuid[],
+            p_collection_ids => $2::uuid[],
+            p_sources => ARRAY['chunks']::text[]
+        )
+    """
+
+    seen = await _as_app(
+        pool, tenant, retrieve, widened.read_org_ids, widened.read_collection_ids
+    )
+    without = await _as_app(
+        pool, tenant, retrieve, [tenant], widened.read_collection_ids
+    )
+
+    hits = [r for r in seen if "mandates quarterly" in r["text"]]
+    assert hits, "a subscriber cannot read the operator's shared passage"
+    assert "appeals process" in hits[0]["context_text"], (
+        "the passage came back without its neighbours, so the window cannot "
+        "read the shared document it belongs to"
+    )
+    assert not [r for r in without if "mandates quarterly" in r["text"]], (
+        "the passage came back without the system org in scope"
+    )
+
+
+async def test_a_tenant_cannot_write_into_a_shared_collection(
+    pool: asyncpg.Pool,
+) -> None:
+    """The direction that must not widen (D4's first hard rule).  write_org_id
+    is one org by construction; this is the database refusing the write even
+    when the caller names another."""
+    tenant = await _make_org(pool, "seam_write")
+    shared = await _shared_collection(pool, "seam_write")
+
+    with pytest.raises(asyncpg.InsufficientPrivilegeError):
+        await _as_app(
+            pool,
+            tenant,
+            "INSERT INTO propositions (text, org_id, collection_id)"
+            " VALUES ('contributed back', pgkg_system_org(), $1)",
+            shared,
+        )
+
+
+# ---------------------------------------------------------------------------
 # 2. Scoping on the write path
 # ---------------------------------------------------------------------------
 

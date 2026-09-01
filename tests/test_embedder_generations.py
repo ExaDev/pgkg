@@ -671,3 +671,103 @@ async def test_generation_queries_are_the_last_search_parameter(
 
     assert len(signatures) == 1
     assert signatures[0]["args"].endswith("pgkg_gen_query[]")
+
+
+# ---------------------------------------------------------------------------
+# The primary vector arm stays in one model space (D8)
+# ---------------------------------------------------------------------------
+
+async def test_the_primary_vector_arm_stays_in_the_primary_model_space(
+    pool: asyncpg.Pool,
+) -> None:
+    """Cosines from two model spaces are not comparable, so they cannot share
+    an ORDER BY.
+
+    At step 5 of a cutover the new generation is primary and writes inline
+    while the demoted one's rows are still inline and still tagged with it.
+    The primary arm filtered on nothing but tenancy, so it computed distances
+    between a primary-space query vector and stale coordinates and ranked the
+    mixture — and the affected row got a second, correctly scoped vote through
+    the generation arm, double-counting it in the fusion.  memory.py's own MMR
+    query already nulls an embedding that is not the org's primary, so the
+    mixture was known to occur.
+    """
+    async with pool.acquire() as conn:
+        # A cutover demotes the generation every other org is bound to, so the
+        # scenario is built and read inside one transaction and rolled back:
+        # left behind, a second 'primary' generation would be bound to every
+        # org created after it.
+        transaction = conn.transaction()
+        await transaction.start()
+        dim = await primary_dim(conn)
+        org = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id",
+            f"cutover_{uuid.uuid4().hex[:8]}",
+        )
+        collection = await conn.fetchval(
+            """
+            INSERT INTO collections (org_id, owner_org_id, name, kind)
+            VALUES ($1, $1, $2, 'chat') RETURNING id
+            """,
+            org,
+            f"cutover_{uuid.uuid4().hex[:8]}",
+        )
+        gen_one = await conn.fetchval("SELECT pgkg_generation_1()")
+        gen_two = await register_generation(
+            conn, name=f"probe_{uuid.uuid4().hex[:8]}", dim=dim, status="primary"
+        )
+        await conn.execute(
+            "UPDATE embedder_generations SET status = 'retiring' WHERE id = $1",
+            gen_one,
+        )
+        await conn.execute(
+            """
+            INSERT INTO org_embedders (org_id, generation_id, role)
+            VALUES ($1, $2, 'secondary'), ($1, $3, 'primary')
+            ON CONFLICT (org_id, generation_id) DO UPDATE SET role = EXCLUDED.role
+            """,
+            org, gen_one, gen_two,
+        )
+
+        namespace = ns()
+
+        async def fact(text: str, generation: uuid.UUID, hot: int) -> uuid.UUID:
+            return await conn.fetchval(
+                f"""
+                INSERT INTO propositions
+                    (text, namespace, org_id, collection_id, embedding,
+                     embedder_generation_id)
+                VALUES ($1, $2, $3, $4, '{pg_vec(one_hot(dim, hot))}', $5)
+                RETURNING id
+                """,
+                text, namespace, org, collection, generation,
+            )
+
+        retiring_row = await fact(
+            "a fact embedded by the retiring model", gen_one, 0
+        )
+        primary_row = await fact(
+            "a fact embedded by the primary model", gen_two, 1
+        )
+
+        returned = {
+            row["item_id"]
+            for row in await conn.fetch(
+                f"""
+                SELECT item_id FROM pgkg_vector_candidates(
+                    '{pg_vec(one_hot(dim, 0))}', $1, NULL, 200,
+                    ARRAY[$2]::UUID[], ARRAY[$3]::UUID[], NULL, NULL, NULL,
+                    'propositions'
+                )
+                """,
+                namespace, org, collection,
+            )
+        }
+        await transaction.rollback()
+
+    assert primary_row in returned or not returned
+    assert retiring_row not in returned, (
+        "the primary vector arm scored a proposition whose vector belongs to "
+        "the retiring generation against a primary-space query vector, and "
+        "ranked it first"
+    )

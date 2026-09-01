@@ -406,20 +406,28 @@ FROM pgkg_believed_at($1, $2, $3, $4::uuid[], $5::uuid[], $6::uuid, $7::uuid[])
 # deletion are both invisible to retrieval and only the reason tells them apart.
 # COALESCE keeps the first withdrawal's reason, so forgetting twice does not
 # rewrite history.
+#
+# One org, singular: withdrawal is a write, and a Scope's reads widen where its
+# writes do not.  A widened read admits the system org's shared material, which
+# every subscriber reads and only the operator may withdraw.
 _FORGET_SQL = """
 UPDATE propositions
 SET superseded_by = COALESCE($1, superseded_by),
     invalidated_at = COALESCE(invalidated_at, now()),
     invalidation_reason = COALESCE(invalidation_reason, $2)
-WHERE id = $3 AND org_id = ANY($4::uuid[])
+WHERE id = $3 AND org_id = $4
 """
 
+# The org predicate is stated here as well as carried by the GUC: the counts are
+# grouped by the org that read them, and a row belonging to another org — one a
+# widened read returned — must not be credited even on a connection for which
+# RLS is inert.
 _FLUSH_ACCESS_SQL = """
 UPDATE propositions p
 SET access_count = p.access_count + a.n,
     last_accessed_at = now()
 FROM unnest($1::uuid[], $2::int[]) AS a(id, n)
-WHERE p.id = a.id
+WHERE p.id = a.id AND p.org_id = $3
 """
 
 # Session-level rather than transaction-local: it has to be in force for the
@@ -496,9 +504,19 @@ class PostgresExtractCache:
     the same chunk with the same extractor model and prompt version is free.
     """
 
-    def __init__(self, pool: asyncpg.Pool, namespace: str) -> None:
+    def __init__(
+        self,
+        pool: asyncpg.Pool,
+        namespace: str,
+        *,
+        org_id: UUID = DEFAULT_ORG_ID,
+    ) -> None:
         self._pool = pool
         self._namespace = namespace
+        # The org is part of the key, not only of the row policy: a hit is the
+        # extracted claims themselves, and the deployments that connect as the
+        # owning role are the ones RLS cannot help (ADR 0001, D4).
+        self._org_id = org_id
 
     async def get(self, cache_key: str) -> list[Proposition] | None:
         # The hit count is bumped by the same statement that reads the payload:
@@ -508,10 +526,11 @@ class PostgresExtractCache:
                 """
                 UPDATE proposition_cache
                 SET hit_count = hit_count + 1
-                WHERE cache_key = $1
+                WHERE cache_key = $1 AND org_id = $2
                 RETURNING propositions
                 """,
                 cache_key,
+                self._org_id,
             )
             if row is None:
                 return None
@@ -535,15 +554,17 @@ class PostgresExtractCache:
             await conn.execute(
                 """
                 INSERT INTO proposition_cache
-                    (cache_key, chunk_hash, extractor_model, prompt_version, propositions)
-                VALUES ($1, $2, $3, $4, $5::jsonb)
-                ON CONFLICT (cache_key) DO NOTHING
+                    (cache_key, chunk_hash, extractor_model, prompt_version,
+                     propositions, org_id)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+                ON CONFLICT (cache_key, org_id) DO NOTHING
                 """,
                 cache_key,
                 chunk_hash,
                 extractor_model,
                 prompt_version,
                 payload,
+                self._org_id,
             )
 
 
@@ -565,7 +586,11 @@ class Memory:
         self._use_extract_cache = use_extract_cache
         self._extract_propositions = extract_propositions
         self._extract_cache: ExtractCache | None = (
-            PostgresExtractCache(pool, namespace) if use_extract_cache and extract_propositions else None
+            PostgresExtractCache(
+                pool, namespace, org_id=self._scope.write_org_id
+            )
+            if use_extract_cache and extract_propositions
+            else None
         )
         self._access_flush_interval = access_flush_interval
         self._access = _AccessLedger()
@@ -639,9 +664,15 @@ class Memory:
             if self._extract_propositions
             else self._plan_chunks_only(chunks)
         )
-        return await self._write(
-            plan, source, session_id, asserted_at, self._resolve(provenance)
+        resolved = self._resolve(provenance)
+        # D5: published_at feeds the perishable decay profile, and D6 keys that
+        # profile on asserted_at.  Ingest time is what neither of them means, so
+        # a caller that gave a publication date and no world-time gets the
+        # publication date; one that gave both keeps its own.
+        asserted = (
+            asserted_at if asserted_at is not None else resolved.published_at
         )
+        return await self._write(plan, source, session_id, asserted, resolved)
 
     def _resolve(self, provenance: Provenance | None) -> Provenance:
         """Fill in what the ingest mode and the settings in force already know.
@@ -1145,6 +1176,11 @@ class Memory:
         number of propositions written.  On failure the counts are put back and
         the error is raised rather than swallowed, so nothing is lost silently
         and the caller can retry.
+
+        Each statement autocommits, so only the orgs whose statement did not
+        commit are put back: restoring an org whose UPDATE already landed would
+        apply its counts a second time on the next flush, and the frequency term
+        in the decay profile reads that column.
         """
         pending = self._access.drain()
         if not pending:
@@ -1154,16 +1190,27 @@ class Memory:
         for (org_id, prop_id), count in pending.items():
             by_org.setdefault(org_id, {})[prop_id] = count
 
+        applied: set[UUID] = set()
         try:
             async with self._pool.acquire() as conn:
                 for org_id, counts in by_org.items():
                     ids = list(counts)
                     await conn.execute(_SET_ORG_SQL, str(org_id))
                     await conn.execute(
-                        _FLUSH_ACCESS_SQL, ids, [counts[prop_id] for prop_id in ids]
+                        _FLUSH_ACCESS_SQL,
+                        ids,
+                        [counts[prop_id] for prop_id in ids],
+                        org_id,
                     )
+                    applied.add(org_id)
         except BaseException:
-            self._access.restore(pending)
+            self._access.restore(
+                {
+                    key: count
+                    for key, count in pending.items()
+                    if key[0] not in applied
+                }
+            )
             raise
         return len(pending)
 
@@ -1196,7 +1243,7 @@ class Memory:
                 supersede_with,
                 resolved,
                 proposition_id,
-                self._scope.read_org_ids,
+                self._scope.write_org_id,
             )
 
     async def believed_at(

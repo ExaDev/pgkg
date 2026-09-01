@@ -488,7 +488,17 @@ class FakeIngest:
     def for_collection(self, *, org_id, collection_id):
         return self
 
-    async def upsert_document(self, *, external_id, text, uri=None, on_progress=None):
+    async def upsert_document(
+        self,
+        *,
+        external_id,
+        text,
+        uri=None,
+        source=None,
+        asserted_at=None,
+        provenance=None,
+        on_progress=None,
+    ):
         from pgkg.corpus import CorpusIngestResult
 
         self.depth += 1
@@ -544,10 +554,14 @@ async def test_a_queued_document_is_ingested_by_the_worker(
         text=text,
     )
 
-    worker = IngestWorker(pool, ingest=ingest_for(pool, org, collection, spy))
+    # Bound to this org: an undrained job left by another test would otherwise
+    # be claimed here and counted.
+    worker = IngestWorker(
+        pool, ingest=ingest_for(pool, org, collection, spy), org_id=org
+    )
     assert await worker.run() == 1
 
-    state = await job_state(pool, job)
+    state = await job_state(pool, job, org_id=org)
     assert state.status == "done"
     assert state.chunks_total == 2
     assert state.chunks_embedded == 2
@@ -604,7 +618,7 @@ async def test_a_finished_document_can_be_offered_again(
     await worker.run()
 
     assert second != first
-    assert (await job_state(pool, second)).status == "done"
+    assert (await job_state(pool, second, org_id=org)).status == "done"
     assert len(spy.texts) == embedded_once
 
 
@@ -654,7 +668,7 @@ async def test_an_abandoned_job_is_reclaimed_once_its_lease_lapses(
     )
     assert await worker.run() == 1
 
-    state = await job_state(pool, job)
+    state = await job_state(pool, job, org_id=org)
     assert state.status == "done"
     assert state.attempts == 2
     assert len(await chunk_rows(pool, state.document_id)) == 2
@@ -728,12 +742,12 @@ async def test_a_failing_job_returns_to_the_queue_until_its_attempts_run_out(
     )
 
     await worker.run_once()
-    after_one = await job_state(pool, job)
+    after_one = await job_state(pool, job, org_id=org)
     assert after_one.status == "pending"
     assert "embedder died" in after_one.error
 
     await worker.run_once()
-    after_two = await job_state(pool, job)
+    after_two = await job_state(pool, job, org_id=org)
     assert after_two.status == "failed"
     assert after_two.attempts == 2
 
@@ -929,14 +943,15 @@ async def test_extraction_reuses_the_proposition_cache(
             """
             INSERT INTO proposition_cache
                 (cache_key, chunk_hash, extractor_model, prompt_version,
-                 propositions)
-            VALUES ($1, $2, $3, $4, $5::jsonb)
+                 propositions, org_id)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
             """,
             cache_key,
             hashlib.sha256(chunk.text.encode()).hexdigest(),
             model,
             ml.PROMPT_VERSION,
             json.dumps(stored),
+            org,
         )
 
     settings = MagicMock()
@@ -968,3 +983,463 @@ async def test_extraction_reuses_the_proposition_cache(
             cache_key,
         )
     assert hits == 1
+
+
+# ---------------------------------------------------------------------------
+# Publication date, not ingest time (D5, D6)
+# ---------------------------------------------------------------------------
+
+async def test_a_published_document_is_asserted_at_its_publication_date(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """D6 keys the perishable profile on asserted_at and D5 says published_at
+    feeds it, so the two cannot be independent parameters: left that way, an
+    eleven-year-old article decays from the moment this crawl reached it, and
+    'perishable' behaves exactly like the 'timeless' profile it is drawn against.
+    """
+    import math
+    from datetime import datetime, timezone
+
+    from pgkg.corpus import Provenance
+
+    org, collection, spy = tenant
+    published = datetime(2015, 1, 1, tzinfo=timezone.utc)
+
+    result = await ingest_for(pool, org, collection, spy).upsert_document(
+        external_id=unique("stale_article"),
+        text=document_text(words=("alpha",)),
+        provenance=Provenance(
+            kind="document_version", producer="chunker", published_at=published
+        ),
+    )
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT c.id, c.asserted_at,
+                   EXTRACT(EPOCH FROM (now() - c.asserted_at)) / 86400.0 AS age_days
+            FROM document_version_chunks dvc
+            JOIN chunks c ON c.id = dvc.chunk_id
+            WHERE dvc.document_version_id = $1
+            """,
+            result.version_id,
+        )
+        await conn.execute(
+            "UPDATE collections SET decay_profile = 'perishable' WHERE id = $1",
+            collection,
+        )
+        adjusted = await conn.fetchval(
+            """
+            SELECT adjusted_score FROM pgkg_apply_profile(
+                ARRAY[($1, 'fused', 0, 1.0)::pgkg_candidate]
+            )
+            """,
+            row["id"],
+        )
+
+    assert row["asserted_at"] == published
+    # The half-life the collection defaults to, read off the age the database
+    # itself computed: an assertion on a fixed number would expire with time.
+    assert adjusted == pytest.approx(
+        math.exp(-float(row["age_days"]) / 730.0), rel=0.01
+    )
+    assert adjusted < 0.01
+
+
+async def test_an_explicit_asserted_at_outranks_the_publication_date(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """A caller stating the world-time of a claim knows something a publication
+    date does not, so it is not overwritten by one."""
+    from datetime import datetime, timezone
+
+    from pgkg.corpus import Provenance
+
+    org, collection, spy = tenant
+    stated = datetime(2024, 6, 1, tzinfo=timezone.utc)
+
+    result = await ingest_for(pool, org, collection, spy).upsert_document(
+        external_id=unique("restated"),
+        text=document_text(words=("bravo",)),
+        asserted_at=stated,
+        provenance=Provenance(published_at=datetime(2015, 1, 1, tzinfo=timezone.utc)),
+    )
+
+    async with pool.acquire() as conn:
+        asserted = await conn.fetchval(
+            """
+            SELECT c.asserted_at
+            FROM document_version_chunks dvc
+            JOIN chunks c ON c.id = dvc.chunk_id
+            WHERE dvc.document_version_id = $1
+            """,
+            result.version_id,
+        )
+
+    assert asserted == stated
+
+
+# ---------------------------------------------------------------------------
+# What the connector knew has to survive the queue (D5, D6, D7)
+# ---------------------------------------------------------------------------
+
+async def test_a_queued_document_keeps_its_publication_date(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """Batch is the default posture for a corpus, so the queue is the path most
+    documents take.
+
+    A job carried only the org, the collection, the external id, the hash, the
+    text and the uri, so everything the connector knew about the document —
+    who published it, when, under what licence — was dropped at the door and
+    the worker re-derived asserted_at from its own clock.  That is the
+    perishable-decay defect one indirection further out: the fix on the inline
+    path is worth nothing if the queued path still decays from ingest time.
+    """
+    from datetime import datetime, timezone
+
+    from pgkg.corpus import Provenance
+    from pgkg.ingest_jobs import IngestWorker, enqueue_document, job_state
+
+    org, collection, spy = tenant
+    published = datetime(2015, 1, 1, tzinfo=timezone.utc)
+
+    job = await enqueue_document(
+        pool,
+        org_id=org,
+        collection_id=collection,
+        external_id=unique("queued_article"),
+        text=document_text(words=("alpha",)),
+        source="crawler",
+        provenance=Provenance(
+            kind="document_version",
+            producer="chunker",
+            publisher="The Wire",
+            published_at=published,
+        ),
+    )
+
+    worker = IngestWorker(
+        pool, ingest=ingest_for(pool, org, collection, spy), org_id=org
+    )
+    assert await worker.run() == 1
+
+    state = await job_state(pool, job, org_id=org)
+    assert state.status == "done"
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT c.asserted_at, pr.published_at, pr.publisher, d.source
+            FROM document_versions dv
+            JOIN documents d ON d.id = dv.document_id
+            JOIN document_version_chunks dvc ON dvc.document_version_id = dv.id
+            JOIN chunks c ON c.id = dvc.chunk_id
+            LEFT JOIN provenance pr ON pr.id = dv.provenance_id
+            WHERE dv.id = $1
+            """,
+            state.version_id,
+        )
+
+    assert row["published_at"] == published
+    assert row["publisher"] == "The Wire"
+    assert row["source"] == "crawler"
+    assert row["asserted_at"] == published
+
+
+async def test_a_withdrawn_document_keeps_the_id_it_was_ingested_under(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """Re-ingesting a withdrawn external id is a new document, and the
+    withdrawn one is the record of what was withdrawn.
+
+    The unique index did not exclude soft-deleted rows, so the only way to let
+    the new document claim the id was to take it off the old one — which erases
+    the very thing a deletion audit asks for.  The index is what should have
+    said 'live documents only'.
+    """
+    org, collection, spy = tenant
+    external_id = unique("withdrawn")
+    ingest = ingest_for(pool, org, collection, spy)
+
+    first = await ingest.upsert_document(
+        external_id=external_id, text=document_text(words=("alpha", "bravo"))
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE documents SET deleted_at = now() WHERE id = $1", first.document_id
+        )
+
+    second = await ingest.upsert_document(
+        external_id=external_id, text=document_text(words=("charlie", "delta"))
+    )
+    assert second.document_id != first.document_id
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, external_id, deleted_at FROM documents"
+            " WHERE org_id = $1 AND collection_id = $2 ORDER BY created_at",
+            org,
+            collection,
+        )
+
+    withdrawn = next(row for row in rows if row["id"] == first.document_id)
+    live = next(row for row in rows if row["id"] == second.document_id)
+    assert withdrawn["external_id"] == external_id
+    assert withdrawn["deleted_at"] is not None
+    assert live["external_id"] == external_id
+    assert live["deleted_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# What the pipeline costs: round trips, connections held, and pool slots
+# ---------------------------------------------------------------------------
+
+def sectioned_document(sections: int) -> str:
+    """A document of exactly `sections` distinct chunks."""
+    return "\n\n".join(
+        f"## Section {i}\n\nThe section {i} chapter explains how subsystem {i} "
+        f"behaves when the operator reconciles a ledger, naming {i} so no two "
+        f"chapters share text."
+        for i in range(sections)
+    )
+
+
+class RecordingPool:
+    """Counts round trips made through a pool, without changing what they do."""
+
+    def __init__(self, pool: asyncpg.Pool) -> None:
+        self._pool = pool
+        self.queries: list[str] = []
+
+    def acquire(self):
+        outer = self
+
+        class _Ctx:
+            async def __aenter__(self):
+                self._cm = outer._pool.acquire()
+                conn = await self._cm.__aenter__()
+                return _RecordingConn(conn, outer.queries)
+
+            async def __aexit__(self, *exc):
+                return await self._cm.__aexit__(*exc)
+
+        return _Ctx()
+
+
+class _RecordingConn:
+    def __init__(self, conn: asyncpg.Connection, log: list[str]) -> None:
+        self._conn = conn
+        self._log = log
+
+    def __getattr__(self, name):
+        attr = getattr(self._conn, name)
+        if name in ("execute", "fetch", "fetchrow", "fetchval"):
+            async def recorded(query, *args, **kwargs):
+                self._log.append(query)
+                return await attr(query, *args, **kwargs)
+
+            return recorded
+        return attr
+
+
+async def test_ingest_round_trips_do_not_grow_with_chunk_count(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """Chat ingest was made set-based in phase 0 — twelve chunks and sixty
+    facts are five statements.  The pipeline built for a 300-page handbook
+    called pgkg_add_version_chunk() once per chunk, each one a network round
+    trip with the ingest transaction held open.
+    """
+    org, collection, spy = tenant
+
+    small = RecordingPool(pool)
+    await ingest_for(small, org, collection, spy).upsert_document(
+        external_id=unique("rt_small"), text=sectioned_document(2)
+    )
+    large = RecordingPool(pool)
+    result = await ingest_for(large, org, collection, spy).upsert_document(
+        external_id=unique("rt_large"), text=sectioned_document(30)
+    )
+
+    assert result.chunks_total >= 20, "the document must span many chunks"
+    assert len(large.queries) == len(small.queries), (
+        f"{result.chunks_total} chunks cost {len(large.queries)} round trips; "
+        f"a 2-chunk document cost {len(small.queries)}"
+    )
+
+
+async def test_ingest_does_not_embed_inside_its_transaction(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """A pooled connection held across a model call is a pool slot spent at the
+    embedder's rate.
+
+    memory.py states the rule its own plan is built around — "holding the
+    ingest connection across them starves the pool under concurrent ingest" —
+    and the bulk pipeline, the one that runs for hours, opened its transaction
+    first and then called the embedder and a per-chunk extractor from inside
+    it.  A fifty-chunk document with a two-second extractor held one connection,
+    one transaction and the cache rows it had touched for a hundred seconds.
+    """
+    org, collection, spy = tenant
+    holder: list[asyncpg.Connection] = []
+    seen: list[bool] = []
+
+    class Watching(RecordingPool):
+        def acquire(self):
+            outer = self
+
+            class _Ctx:
+                async def __aenter__(self):
+                    self._cm = outer._pool.acquire()
+                    conn = await self._cm.__aenter__()
+                    holder.append(conn)
+                    return conn
+
+                async def __aexit__(self, *exc):
+                    return await self._cm.__aexit__(*exc)
+
+            return _Ctx()
+
+    class ProbingSpy(EmbedSpy):
+        def __call__(self, texts: list[str]) -> list[list[float]]:
+            seen.append(bool(holder) and holder[-1].is_in_transaction())
+            return super().__call__(texts)
+
+    probing = ProbingSpy(spy.dim)
+    await ingest_for(Watching(pool), org, collection, probing).upsert_document(
+        external_id=unique("tx_embed"), text=sectioned_document(6)
+    )
+
+    assert seen, "the embedder was never called"
+    assert not any(seen), (
+        "the embedder ran while the ingest transaction was open, holding a "
+        "pooled connection across a model call"
+    )
+
+
+async def test_the_worker_does_not_deadlock_at_its_slot_budget(
+    pg_dsn: str, pool: asyncpg.Pool, tenant
+) -> None:
+    """`slots` rations connections held, and a slot used to hold two.
+
+    The ingest transaction took one and the progress reporter deliberately took
+    a second, so that progress is visible while that transaction is open.  With
+    slots equal to the pool size every slot then waited for a connection every
+    other slot was holding, and `pgkg worker --slots 10` on the default pool
+    hung for ever with no error.  The control below is the same worker with one
+    slot spare: if that drains and this one hangs, the cause is the budget.
+    """
+    from pgvector.asyncpg import register_vector
+
+    from pgkg.corpus import CorpusIngest
+    from pgkg.ingest_jobs import IngestWorker, enqueue_document
+
+    org, collection, spy = tenant
+    for i in range(2):
+        await enqueue_document(
+            pool,
+            org_id=org,
+            collection_id=collection,
+            external_id=unique(f"deadlock_{i}"),
+            text=sectioned_document(3),
+        )
+
+    small = await asyncpg.create_pool(
+        pg_dsn, min_size=2, max_size=2, init=lambda c: register_vector(c)
+    )
+    try:
+        worker = IngestWorker(
+            small,
+            ingest=CorpusIngest(
+                small, org_id=org, collection_id=collection, embed=spy,
+                max_chars=200,
+            ),
+            org_id=org,
+            slots=2,
+        )
+        drained = await asyncio.wait_for(worker.run(concurrency=2), timeout=15)
+    finally:
+        await small.close()
+
+    assert drained == 2
+
+
+async def test_control_the_worker_drains_when_a_slot_is_spare(
+    pg_dsn: str, pool: asyncpg.Pool, tenant
+) -> None:
+    """The control for the test above: same pool, one fewer slot."""
+    from pgvector.asyncpg import register_vector
+
+    from pgkg.corpus import CorpusIngest
+    from pgkg.ingest_jobs import IngestWorker, enqueue_document
+
+    org, collection, spy = tenant
+    for i in range(2):
+        await enqueue_document(
+            pool,
+            org_id=org,
+            collection_id=collection,
+            external_id=unique(f"control_{i}"),
+            text=sectioned_document(3),
+        )
+
+    small = await asyncpg.create_pool(
+        pg_dsn, min_size=2, max_size=2, init=lambda c: register_vector(c)
+    )
+    try:
+        worker = IngestWorker(
+            small,
+            ingest=CorpusIngest(
+                small, org_id=org, collection_id=collection, embed=spy,
+                max_chars=200,
+            ),
+            org_id=org,
+            slots=1,
+        )
+        drained = await asyncio.wait_for(worker.run(concurrency=2), timeout=15)
+    finally:
+        await small.close()
+
+    assert drained == 2
+
+
+async def test_job_status_is_scoped_to_the_caller(pool: asyncpg.Pool) -> None:
+    """A job UUID is a handle, not an authorisation.
+
+    The status read named no org and set no GUC, so pgkg_current_org() fell
+    back to the default org and the queue's own policy had nothing to compare
+    against — on an owner connection it was inert entirely.  What the row
+    carries is the document id, the version id, the attempt count and the
+    extractor's error text, which is why "no such job" is the honest answer to
+    a question the caller was not entitled to ask.
+    """
+    from pgkg.ingest_jobs import job_state
+
+    async with pool.acquire() as conn:
+        stranger = await new_org(conn)
+        collection = await new_collection(conn, org_id=stranger)
+        job = await conn.fetchval(
+            "SELECT pgkg_enqueue_ingest_job($1, $2, $3, digest($4, 'sha256'), $4)",
+            stranger,
+            collection,
+            unique("ext"),
+            "a stranger's confidential document body",
+        )
+
+    leaked = None
+    try:
+        leaked = await job_state(pool, job)
+    except KeyError:
+        pass
+
+    # Its own org still reads it, and the queue is left as it was found: an
+    # undrained job is claimable by any worker a later test starts.
+    assert (await job_state(pool, job, org_id=stranger)).status == "pending"
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM ingest_jobs WHERE id = $1", job)
+
+    assert leaked is None, (
+        f"job_state read another org's job with no scope argument: {leaked!r}"
+    )

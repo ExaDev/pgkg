@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -37,7 +38,14 @@ from uuid import UUID
 
 import asyncpg
 
-from pgkg.corpus import CorpusIngestResult, document_hash
+from pgkg.config import DEFAULT_ORG_ID, ORG_GUC
+from pgkg.corpus import (
+    CorpusIngestResult,
+    Provenance,
+    document_hash,
+    dump_provenance,
+    load_provenance,
+)
 
 DEFAULT_LEASE_SECONDS = 300.0
 DEFAULT_MAX_ATTEMPTS = 3
@@ -59,6 +67,13 @@ class IngestJob:
     content_hash: bytes
     uri: str | None
     attempts: int
+    # What the connector knew about the document travels with it too (D5).  A
+    # queue that carried only the bytes made the worker's clock the world-time
+    # of every queued document, so a perishable article published in 2015 and
+    # crawled tonight decayed from tonight.
+    source: str | None = None
+    asserted_at: datetime | None = None
+    provenance: Provenance | None = None
 
 
 @dataclass(frozen=True)
@@ -93,15 +108,20 @@ class CorpusPipeline(Protocol):
         external_id: str,
         text: str,
         uri: str | None = ...,
+        source: str | None = ...,
+        asserted_at: datetime | None = ...,
+        provenance: Provenance | None = ...,
         on_progress: Callable[[int, int], Awaitable[None]] | None = ...,
     ) -> CorpusIngestResult: ...
 
 
-_ENQUEUE_SQL = "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6)"
+_ENQUEUE_SQL = (
+    "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)"
+)
 
 _CLAIM_SQL = """
 SELECT job_id, org_id, collection_id, external_id, uri, payload, content_hash,
-       attempts
+       attempts, source, asserted_at, provenance
 FROM pgkg_claim_ingest_job($1, make_interval(secs => $2))
 """
 
@@ -111,10 +131,17 @@ _FINISH_SQL = "SELECT pgkg_finish_ingest_job($1, $2, $3, $4, $5)"
 
 _FAIL_SQL = "SELECT pgkg_fail_ingest_job($1, $2, $3)"
 
+_SET_ORG_SQL = f"SELECT set_config('{ORG_GUC}', $1, false)"
+
+# A job UUID is a handle, not an authorisation: the org is stated in the read
+# rather than left to the connection, because a status carries the document id,
+# the attempt count and the extractor's error text (ADR 0001, D3).  The GUC is
+# set as well, so the policy on ingest_jobs has something to compare against
+# when the deployment connects as pgkg_app.
 _STATE_SQL = """
 SELECT status, attempts, chunks_total, chunks_embedded, document_id,
        version_id, error, enqueued_at, finished_at
-FROM ingest_jobs WHERE id = $1
+FROM ingest_jobs WHERE id = $1 AND org_id = $2
 """
 
 
@@ -126,6 +153,9 @@ async def enqueue_document(
     external_id: str,
     text: str,
     uri: str | None = None,
+    source: str | None = None,
+    asserted_at: datetime | None = None,
+    provenance: Provenance | None = None,
 ) -> UUID:
     """Offer one document to the queue, returning the job that holds it.
 
@@ -141,6 +171,9 @@ async def enqueue_document(
             document_hash(text),
             text,
             uri,
+            source,
+            asserted_at,
+            dump_provenance(provenance),
         )
 
 
@@ -164,12 +197,24 @@ async def claim_job(
         content_hash=row["content_hash"],
         uri=row["uri"],
         attempts=row["attempts"],
+        source=row["source"],
+        asserted_at=row["asserted_at"],
+        provenance=load_provenance(row["provenance"]),
     )
 
 
-async def job_state(pool: asyncpg.Pool, job_id: UUID) -> JobState:
+async def job_state(
+    pool: asyncpg.Pool, job_id: UUID, *, org_id: UUID = DEFAULT_ORG_ID
+) -> JobState:
+    """One job's status, as the org that enqueued it may see it.
+
+    A job belonging to another org is not found rather than reported: the caller
+    holding the UUID has no relationship to it, and "no such job" is the honest
+    answer to a question it was not entitled to ask.
+    """
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(_STATE_SQL, job_id)
+        await conn.execute(_SET_ORG_SQL, str(org_id))
+        row = await conn.fetchrow(_STATE_SQL, job_id, org_id)
     if row is None:
         raise KeyError(f"no such ingest job {job_id}")
     return JobState(
@@ -261,16 +306,35 @@ class IngestWorker:
             external_id=job.external_id,
             text=job.text,
             uri=job.uri,
+            source=job.source,
+            asserted_at=job.asserted_at,
+            provenance=job.provenance,
             on_progress=self._progress_reporter(job),
         )
+
+    @asynccontextmanager
+    async def _job_connection(self, job: IngestJob):
+        """A connection carrying the org of the job being worked on.
+
+        A worker draining several orgs runs as an owner or sets the org per
+        claim (033's policy comment); it knows which org each job belongs to, so
+        it sets it, and the queue's own isolation policy applies to the writes
+        the worker makes on that job's behalf.
+        """
+        async with self._pool.acquire() as conn:
+            await conn.execute(_SET_ORG_SQL, str(job.org_id))
+            yield conn
 
     def _progress_reporter(
         self, job: IngestJob
     ) -> Callable[[int, int], Awaitable[None]]:
         async def report(chunks_total: int, chunks_embedded: int) -> None:
             # A connection of its own, so the numbers are visible while the
-            # ingest transaction that produced them is still open.
-            async with self._pool.acquire() as conn:
+            # document that produced them is still being written.  The pipeline
+            # calls this between its phases rather than from inside its ingest
+            # transaction, so this acquire is never a second connection held on
+            # top of one — which at slots == pool size would never be granted.
+            async with self._job_connection(job) as conn:
                 await conn.execute(
                     _PROGRESS_SQL, job.id, chunks_total, chunks_embedded
                 )
@@ -278,7 +342,7 @@ class IngestWorker:
         return report
 
     async def _finish(self, job: IngestJob, result: CorpusIngestResult) -> None:
-        async with self._pool.acquire() as conn:
+        async with self._job_connection(job) as conn:
             await conn.execute(
                 _FINISH_SQL,
                 job.id,
@@ -292,7 +356,7 @@ class IngestWorker:
         # The usual reason a corpus job dies is transient — an embedder restart,
         # a dropped connection — so the queue keeps the error and tries again
         # until the attempt budget is spent.
-        async with self._pool.acquire() as conn:
+        async with self._job_connection(job) as conn:
             await conn.execute(
                 _FAIL_SQL, job.id, f"{type(failure).__name__}: {failure}",
                 self._max_attempts,

@@ -196,9 +196,23 @@ async def test_nothing_is_shared_by_default(pool: asyncpg.Pool) -> None:
 
 
 async def test_no_collection_is_subscribed_implicitly(pool: asyncpg.Pool) -> None:
+    """A subscription is a capability, so it has to be granted by a row.
+
+    Asked of a fresh org and of the operator's shelf rather than of the whole
+    table: a global count is an assertion about every other test in the suite,
+    and it fails for the wrong reason the day one of them subscribes something.
+    """
     async with pool.acquire() as conn:
+        org = await new_org(conn)
+        shared = await new_collection(
+            conn, org_id=SYSTEM_ORG, name=f"shelf_{uuid.uuid4().hex[:6]}",
+            claim_scope="world",
+        )
         subscriptions = await conn.fetchval(
             "SELECT count(*) FROM collection_subscriptions"
+            " WHERE org_id = $1 OR collection_id = $2",
+            org,
+            shared,
         )
 
     assert subscriptions == 0

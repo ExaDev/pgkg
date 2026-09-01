@@ -713,3 +713,117 @@ async def test_a_whale_tenant_can_be_promoted_to_its_own_shard(
         shard = await conn.fetchval("SELECT pgkg_tenant_shard($1)", org)
 
     assert shard == "whale_01"
+
+
+# ---------------------------------------------------------------------------
+# A link table is a write surface too (ADR 0001, D3)
+# ---------------------------------------------------------------------------
+
+async def test_a_stranger_org_cannot_attach_itself_to_my_passage(
+    pool: asyncpg.Pool,
+) -> None:
+    """document_version_chunks' policy reads the version, never the chunk.
+
+    So a tenant could link another tenant's chunk id into its own document
+    version — and because the window aggregates a version's ords, the victim's
+    own retrieval then came back carrying the attacker's prose as context_text.
+    A known UUID became a cross-org injection channel: nothing was read out,
+    something was written in.  The rule is stated as a constraint on the link
+    rather than as a policy term, because a link between two orgs is meaningless
+    for an owner connection too.
+    """
+    import uuid as _uuid
+
+    shared = (
+        "The standard reimbursement footer applies to every expense claim "
+        "filed quarterly under the zzqarbitrage policy schedule."
+    )
+    intruded = (
+        "Acme Holdings will be acquired for four hundred million zzqarbitrage."
+    )
+
+    async def collection(conn, org):
+        return await conn.fetchval(
+            "INSERT INTO collections (org_id, owner_org_id, name, kind,"
+            " decay_profile) VALUES ($1, $1, $2, 'corpus', 'timeless')"
+            " RETURNING id",
+            org,
+            f"coll_{_uuid.uuid4().hex[:8]}",
+        )
+
+    async def document_version(conn, org, coll):
+        document = await conn.fetchval(
+            "INSERT INTO documents (source, org_id, collection_id, external_id)"
+            " VALUES ('probe', $1, $2, $3) RETURNING id",
+            org, coll, _uuid.uuid4().hex,
+        )
+        return await conn.fetchval(
+            "SELECT version_id FROM pgkg_open_document_version($1, $2)",
+            document, _uuid.uuid4().bytes,
+        )
+
+    async with pool.acquire() as conn:
+        victim = await new_org(conn, "victim")
+        attacker = await new_org(conn, "attacker")
+        victim_collection = await collection(conn, victim)
+        attacker_collection = await collection(conn, attacker)
+
+        victim_version = await document_version(conn, victim, victim_collection)
+        chunk = await conn.fetchval(
+            "SELECT chunk_id FROM pgkg_add_version_chunk($1, 0, $2)",
+            victim_version, shared,
+        )
+        await conn.execute(
+            "SELECT pgkg_promote_document_version($1)", victim_version
+        )
+
+        attacker_version = await document_version(
+            conn, attacker, attacker_collection
+        )
+        await conn.execute(
+            "SELECT pgkg_add_version_chunk($1, 0, $2)",
+            attacker_version, intruded,
+        )
+        await conn.execute(
+            "SELECT pgkg_promote_document_version($1)", attacker_version
+        )
+
+        linked = True
+        async with conn.transaction():
+            await conn.execute("SET LOCAL ROLE pgkg_app")
+            await conn.execute(
+                "SELECT set_config('pgkg.org_id', $1, true)", str(attacker)
+            )
+            try:
+                await conn.execute(
+                    "INSERT INTO document_version_chunks"
+                    " (document_version_id, chunk_id, ord) VALUES ($1, $2, 1)",
+                    attacker_version, chunk,
+                )
+            except asyncpg.PostgresError:
+                linked = False
+
+        rows = await conn.fetch(
+            """
+            SELECT text, context_text
+            FROM pgkg_retrieve(
+                q_text => 'zzqarbitrage reimbursement footer',
+                k_retrieve => 20,
+                expand_graph => FALSE,
+                p_org_ids => $1::uuid[],
+                p_collection_ids => $2::uuid[],
+                p_sources => ARRAY['chunks']::text[]
+            )
+            """,
+            [victim], [victim_collection],
+        )
+
+    assert not linked, (
+        "a tenant grafted another tenant's chunk into its own document version"
+    )
+    leaked = [
+        row["context_text"]
+        for row in rows
+        if intruded in (row["context_text"] or "")
+    ]
+    assert not leaked, f"cross-org context_text: {leaked!r}"

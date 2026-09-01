@@ -331,3 +331,77 @@ async def test_recall_returns_asserted_at_in_result(pool: asyncpg.Pool, monkeypa
         if ts is not None and ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         assert ts == expected_ts, f"Result.asserted_at {ts!r} should equal {expected_ts!r}"
+
+
+# ---------------------------------------------------------------------------
+# The access ledger is accounting, so a retry must not double-count
+# ---------------------------------------------------------------------------
+
+async def test_a_failed_access_flush_does_not_double_count(
+    pool: asyncpg.Pool,
+) -> None:
+    """The flush writes one autocommitted statement per org and, on any
+    failure, used to restore every org's counts — including the orgs whose
+    statement had already committed.  Those were then applied again by the next
+    flush, and the decay profile's frequency term reads that column, so one
+    transient link failure permanently inflated the ranking of whichever tenant
+    happened to flush first.
+    """
+    import asyncpg as pg
+
+    async with pool.acquire() as conn:
+        org_a = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id",
+            f"flush_a_{uuid.uuid4().hex[:8]}",
+        )
+        org_b = await conn.fetchval(
+            "INSERT INTO orgs (name) VALUES ($1) RETURNING id",
+            f"flush_b_{uuid.uuid4().hex[:8]}",
+        )
+        prop_a = await conn.fetchval(
+            "INSERT INTO propositions (text, org_id) VALUES ('a', $1) RETURNING id",
+            org_a,
+        )
+        prop_b = await conn.fetchval(
+            "INSERT INTO propositions (text, org_id) VALUES ('b', $1) RETURNING id",
+            org_b,
+        )
+
+    memory = Memory(pool)
+    memory._access.record(org_a, [prop_a] * 3)
+    memory._access.record(org_b, [prop_b] * 3)
+
+    statements = {"n": 0}
+    real_execute = pg.Connection.execute
+
+    async def flaky(self, query, *args, **kwargs):
+        if "access_count" in query:
+            statements["n"] += 1
+            if statements["n"] == 2:
+                raise pg.PostgresConnectionError("link went away")
+        return await real_execute(self, query, *args, **kwargs)
+
+    pg.Connection.execute = flaky
+    try:
+        with pytest.raises(Exception):
+            await memory.flush_access()
+        pg.Connection.execute = real_execute
+        await memory.flush_access()
+    finally:
+        pg.Connection.execute = real_execute
+        await memory.aclose()
+
+    async with pool.acquire() as conn:
+        counts = dict(
+            await conn.fetch(
+                "SELECT id, access_count FROM propositions"
+                " WHERE id = ANY($1::uuid[])",
+                [prop_a, prop_b],
+            )
+        )
+
+    assert counts[prop_a] == 3, (
+        f"the org whose flush committed before the failure was counted "
+        f"{counts[prop_a]} times, not 3"
+    )
+    assert counts[prop_b] == 3

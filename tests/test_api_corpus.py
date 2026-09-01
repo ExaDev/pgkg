@@ -444,7 +444,7 @@ async def test_http_job_status_answers_is_my_corpus_indexed_yet(
             },
         )
         job_id = queued.json()["job_id"]
-        pending = (await client.get(f"/jobs/{job_id}")).json()
+        pending = (await client.get(f"/jobs/{job_id}?org_id={org}")).json()
 
         worker = IngestWorker(
             pool,
@@ -455,8 +455,8 @@ async def test_http_job_status_answers_is_my_corpus_indexed_yet(
         )
         await worker.run(max_jobs=1)
 
-        done = (await client.get(f"/jobs/{job_id}")).json()
-        unknown = await client.get(f"/jobs/{uuid.uuid4()}")
+        done = (await client.get(f"/jobs/{job_id}?org_id={org}")).json()
+        unknown = await client.get(f"/jobs/{uuid.uuid4()}?org_id={org}")
 
     assert queued.status_code == 200
     assert pending["status"] == "pending"
