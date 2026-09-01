@@ -574,6 +574,39 @@ async def test_the_policy_does_not_cost_the_keyword_arm_its_index(
         f"keyword arm falls back to a sequential scan:\n{as_app}"
     )
 
+
+async def test_the_reversed_operand_order_reaches_the_index_too(
+    pool: asyncpg.Pool, keyword_corpus
+) -> None:
+    """`tsquery @@ tsvector` is a different function — ts_match_qv — and the
+    planner tests leakproofness on the clause as written, before it commutes
+    anything.  So marking only the form today's arms happen to use leaves the
+    next arm one operand order away from the sequential scan 043 fixed, with
+    nothing to say so.  This is the test that the guard is on the operator
+    rather than on the style of the SQL that reaches it.
+    """
+    org, _ = keyword_corpus
+    probe = (
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) SELECT count(*)"
+        " FROM chunks c WHERE to_tsquery('simple', 'unobtainium') @@ c.tsv"
+    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL ROLE pgkg_app")
+            await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(org))
+            role = await conn.fetchval("SELECT current_user")
+            as_app = "\n".join(r[0] for r in await conn.fetch(probe))
+
+    assert role == "pgkg_app", "the role never changed, so nothing was measured"
+    assert "pgkg.org_id" in as_app, (
+        f"the policy is not in the plan, so it was not in force:\n{as_app}"
+    )
+    assert "chunk_tsv_idx" in as_app, (
+        "with the tsquery on the left the GIN index is unreachable under the "
+        f"application role, which is the defect 043 fixed one way round:\n{as_app}"
+    )
+
+
 async def test_the_application_role_can_still_maintain_the_statistics(
     pool: asyncpg.Pool,
 ) -> None:

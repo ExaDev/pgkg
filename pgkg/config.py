@@ -124,6 +124,26 @@ async def live_generations(
     )
 
 
+# The signatures are the database's list, not this module's: 046 marks them and
+# names them in one place, and a copy here could only ever disagree with what
+# was marked.
+_KEYWORD_LEAKPROOF_SQL = """
+SELECT signature, leakproof FROM pgkg_keyword_match_leakproof()
+"""
+
+
+async def keyword_match_leakproof(conn: _Queryable) -> dict[str, bool | None]:
+    """Whether each function behind `@@` may be used as an index condition.
+
+    `ALTER FUNCTION ... LEAKPROOF` needs ownership of a built-in, which a
+    managed Postgres will not grant, so 043 and 046 degrade to a NOTICE and the
+    keyword arms stay correct and lose the GIN index under a role with row
+    security.  Nothing can assert the mark; something has to be able to see it.
+    """
+    rows = await conn.fetch(_KEYWORD_LEAKPROOF_SQL)
+    return {row["signature"]: row["leakproof"] for row in rows}
+
+
 async def embed_dim(conn: _Queryable, org_id: UUID = DEFAULT_ORG_ID) -> int:
     """The width of the org's primary embedding space.
 
