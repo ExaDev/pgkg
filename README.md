@@ -412,12 +412,17 @@ return the same content twice and would keep returning the passage after the fac
 forgotten.
 
 Set `PGKG_EXTRACT_PROPOSITIONS=0` (or `pgkg ingest --chunks-only`) and the extractor is skipped: no
-API key, no `claude` CLI, no LLM cost. You still get hybrid retrieval, reranking, MMR and recency
-decay; you lose entity-level recall and multi-hop expansion, which need extracted facts. This is
-the fastest way to try the system, and for a lot of "drop in some files and search" cases it is
-enough. Caveat worth knowing: in this mode each chunk is still written as a proposition row with
-NULL `subject`/`predicate`/`object`, which is a leftover from before the corpus store existed. It
-works, and it is on the list to remove.
+API key, no `claude` CLI, no LLM cost. The turn goes into the **chunk store** instead — a versioned
+document whose passages are content-addressed, embedded and `tsvector`'d, retrievable in their own
+right and carrying no proposition rows at all. You still get hybrid retrieval, reranking, MMR and
+recency decay; you lose entity-level recall and multi-hop expansion, which need extracted facts.
+This is the fastest way to try the system, and for a lot of "drop in some files and search" cases
+it is enough.
+
+One thing to know before you scope it: a passage carries no `namespace`. Isolation for the chunk
+store is `org_id` and `collection_id`, so two chunks-only writers sharing a collection share a
+retrievable pool, however different their namespaces. Give each tenant — or each experiment — its
+own collection.
 
 **Corpus ingest** (`POST /documents`, `CorpusIngest.upsert_document`) is for documents. It versions
 the document, content-addresses its chunks so an unchanged crawl is free, embeds only what is new,
@@ -520,6 +525,13 @@ Proposition extraction is deterministic w.r.t. model + `prompt_version`, cached 
 ### Results
 
 _TBD_ — run `make bench-mem0-stack` (propositions) or `make bench-mem0-stack-chunks` (chunks ablation) when you have an OpenAI key.
+
+The two arms are what the ablation measures: the propositions arm answers out of `propositions`,
+the chunks arm out of `chunks`. Each benchmark item gets a collection of its own (`bench:{namespace}`)
+in both arms, because a namespace isolates propositions and nothing else — a passage carries no
+namespace, so without it every conversation's passages would be candidates for every other
+conversation's question. Wipe between arms (`make wipe`): the two runs share the item's namespace
+and collection, and the second arm would otherwise retrieve the first arm's rows.
 
 | Benchmark | pgkg (propositions) | pgkg (chunks) | Mem0 | Zep | MemGPT | Stack used |
 |---|---|---|---|---|---|---|

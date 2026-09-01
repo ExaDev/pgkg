@@ -82,9 +82,16 @@ async def _chunk_rows(
 
 
 async def _ingest(pool: asyncpg.Pool, namespace: str, text: str) -> None:
+    """Through the extraction path, because that is the one that keeps spans.
+
+    The subject here is the chunker, and either ingest mode reaches it — but a
+    chunks-only ingest now writes into the chunk store, where a passage shared
+    by two documents has no one offset into no one text and carries no
+    span_start (ADR 0001, D6).  The offline extractor keeps this a no-LLM test.
+    """
     from pgkg.memory import Memory
 
-    await Memory(pool, namespace=namespace, extract_propositions=False).ingest(text)
+    await Memory(pool, namespace=namespace).ingest(text)
 
 
 async def test_stored_spans_locate_the_chunk_in_the_source_document(
@@ -199,7 +206,7 @@ async def test_no_chunk_exceeds_the_requested_size(
     from pgkg.memory import Memory
 
     namespace = _ns("cap")
-    await Memory(pool, namespace=namespace, extract_propositions=False).ingest(
+    await Memory(pool, namespace=namespace).ingest(
         _document(), chunk_size=400
     )
 

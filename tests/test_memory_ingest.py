@@ -29,13 +29,34 @@ from pgvector import HalfVector
 
 from pgkg import ml
 from pgkg.chunking import chunk_document
-from pgkg.memory import Memory
+from pgkg.memory import Memory, Scope
 from pgkg.ml import Proposition
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _own_collection(pool: asyncpg.Pool) -> Scope:
+    """A collection of this test's own, for a test that writes passages.
+
+    A namespace isolates propositions and nothing else: D3 replaced
+    stringly-typed scoping with columns, and the chunk arms of retrieval read
+    those columns.  A chunks-only ingest into the default collection is a
+    retrievable passage every other default-scoped recall in the suite can see.
+    """
+    async with pool.acquire() as conn:
+        collection = await conn.fetchval(
+            """
+            INSERT INTO collections
+                (org_id, owner_org_id, name, kind, claim_scope, decay_profile)
+            VALUES (pgkg_default_org(), pgkg_default_org(), $1, 'chat', 'org',
+                    'conversational')
+            RETURNING id
+            """,
+            f"own_{uuid.uuid4().hex[:10]}",
+        )
+    return Scope(collection_id=collection)
 
 @pytest.fixture(scope="session")
 async def embed_dim(pool: asyncpg.Pool) -> int:
@@ -555,7 +576,7 @@ async def test_recall_does_not_write_access_counts_synchronously(
     monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
 
     ns = _ns("no_sync_bump")
-    mem = Memory(pool, namespace=ns, extract_propositions=False, access_flush_interval=3600.0)
+    mem = Memory(pool, namespace=ns, access_flush_interval=3600.0)
     await mem.ingest(_DOC)
 
     results = await mem.recall("analytical engine", with_rerank=False, with_mmr=False)
@@ -570,7 +591,7 @@ async def test_flush_access_applies_the_accumulated_counts(
     monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
 
     ns = _ns("flush_bump")
-    mem = Memory(pool, namespace=ns, extract_propositions=False, access_flush_interval=3600.0)
+    mem = Memory(pool, namespace=ns, access_flush_interval=3600.0)
     await mem.ingest(_DOC)
 
     seen: list[int] = []
@@ -599,7 +620,7 @@ async def test_access_accounting_still_boosts_ranking(
     monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
 
     ns = _ns("freq_rank")
-    mem = Memory(pool, namespace=ns, extract_propositions=False, access_flush_interval=3600.0)
+    mem = Memory(pool, namespace=ns, access_flush_interval=3600.0)
     await mem.ingest("Ada Lovelace wrote the first algorithm.")
 
     first = await mem.recall("algorithm", k=1, with_rerank=False, with_mmr=False)
@@ -620,7 +641,7 @@ async def test_flush_access_keeps_pending_counts_when_the_write_fails(
     monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
 
     ns = _ns("flush_fail")
-    mem = Memory(pool, namespace=ns, extract_propositions=False, access_flush_interval=3600.0)
+    mem = Memory(pool, namespace=ns, access_flush_interval=3600.0)
     await mem.ingest("Ada Lovelace wrote the first algorithm.")
     await mem.recall("algorithm", k=1, with_rerank=False, with_mmr=False)
 
@@ -678,7 +699,12 @@ async def test_recall_leaves_subject_and_object_none_for_chunk_rows(
     monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
 
     ns = _ns("spo_chunks")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(
+        pool,
+        namespace=ns,
+        scope=await _own_collection(pool),
+        extract_propositions=False,
+    )
     await mem.ingest("Ada Lovelace wrote the analytical engine notes.")
 
     results = await mem.recall(

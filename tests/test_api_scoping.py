@@ -380,7 +380,7 @@ async def test_ingest_writes_the_scope_columns(pool: asyncpg.Pool) -> None:
         acl_groups=(group,),
         acl_group_id=group,
     )
-    mem = Memory(pool, namespace=ns, scope=scope, extract_propositions=False)
+    mem = Memory(pool, namespace=ns, scope=scope)
     await mem.ingest(_FACT)
 
     async with pool.acquire() as conn:
@@ -552,7 +552,13 @@ async def test_chunks_only_ingest_records_the_chunker_as_producer(
 ) -> None:
     ns = _ns("prov_chunker")
     run_id = uuid.uuid4()
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    # An org of its own, because a chunks-only ingest writes a retrievable
+    # passage now and the chunk store has no namespace to keep it out of every
+    # other default-scoped recall in the suite (ADR 0001, D3).
+    org = await _make_org(pool, "prov_chunker")
+    mem = Memory(
+        pool, namespace=ns, scope=Scope(org_id=org), extract_propositions=False
+    )
     await mem.ingest(_FACT, provenance=Provenance(ingest_run_id=run_id))
 
     async with pool.acquire() as conn:
@@ -574,7 +580,10 @@ async def test_ingest_records_external_source_fields(pool: asyncpg.Pool) -> None
     published = datetime(2019, 4, 1, tzinfo=timezone.utc)
     retrieved = datetime(2026, 8, 1, tzinfo=timezone.utc)
 
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    org = await _make_org(pool, "prov_external")
+    mem = Memory(
+        pool, namespace=ns, scope=Scope(org_id=org), extract_propositions=False
+    )
     await mem.ingest(
         _FACT,
         provenance=Provenance(
@@ -610,7 +619,7 @@ async def test_ingest_links_every_proposition_to_its_provenance(
     """The many-to-one table is what makes erasure a COUNT(*) rather than a
     special case, so the link is written at ingest and not on first dedup."""
     ns = _ns("prov_link")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
     result = await mem.ingest(_FACT)
 
     async with pool.acquire() as conn:
@@ -628,7 +637,7 @@ async def test_retracting_an_ingest_run_withdraws_it_from_recall(
     pool: asyncpg.Pool,
 ) -> None:
     ns = _ns("prov_retract")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
     result = await mem.ingest(_FACT)
     assert await mem.recall("analytical engine", with_rerank=False, with_mmr=False)
 
@@ -647,7 +656,7 @@ async def test_retracting_an_ingest_run_withdraws_it_from_recall(
 
 async def test_forget_records_a_reason(pool: asyncpg.Pool) -> None:
     ns = _ns("forget_reason")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
     await mem.ingest(_FACT)
     results = await mem.recall("analytical engine", with_rerank=False, with_mmr=False)
     target = results[0].proposition_id
@@ -671,7 +680,7 @@ async def test_forget_with_a_replacement_records_supersession(
     pool: asyncpg.Pool,
 ) -> None:
     ns = _ns("forget_supersede")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
     await mem.ingest("The refund window is thirty days.")
     await mem.ingest("The refund window is sixty days.")
     rows = await mem.recall("refund window", k=10, with_rerank=False, with_mmr=False)
@@ -693,7 +702,7 @@ async def test_forget_with_a_replacement_records_supersession(
 
 async def test_forget_accepts_an_explicit_reason(pool: asyncpg.Pool) -> None:
     ns = _ns("forget_ttl")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
     await mem.ingest(_FACT)
     target = (
         await mem.recall("analytical engine", with_rerank=False, with_mmr=False)
@@ -720,17 +729,13 @@ async def test_forget_cannot_reach_another_orgs_fact(pool: asyncpg.Pool) -> None
     org_b = await _make_org(pool, "forget_b")
     ns = _ns("forget_cross")
 
-    theirs = Memory(
-        pool, namespace=ns, scope=Scope(org_id=org_b), extract_propositions=False
-    )
+    theirs = Memory(pool, namespace=ns, scope=Scope(org_id=org_b))
     await theirs.ingest(_FACT)
     target = (
         await theirs.recall("analytical engine", with_rerank=False, with_mmr=False)
     )[0].proposition_id
 
-    await Memory(
-        pool, namespace=ns, scope=Scope(org_id=org_a), extract_propositions=False
-    ).forget(target)
+    await Memory(pool, namespace=ns, scope=Scope(org_id=org_a)).forget(target)
 
     async with pool.acquire() as conn:
         still_live = await conn.fetchval(
@@ -748,7 +753,7 @@ async def test_believed_at_returns_what_was_believed_before_a_forget(
     pool: asyncpg.Pool,
 ) -> None:
     ns = _ns("audit")
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
     await mem.ingest(_FACT)
     target = (
         await mem.recall("analytical engine", with_rerank=False, with_mmr=False)
@@ -779,13 +784,9 @@ async def test_believed_at_is_org_scoped(pool: asyncpg.Pool) -> None:
     org_b = await _make_org(pool, "audit_b")
     ns = _ns("audit_cross")
 
-    await Memory(
-        pool, namespace=ns, scope=Scope(org_id=org_b), extract_propositions=False
-    ).ingest(_FACT)
+    await Memory(pool, namespace=ns, scope=Scope(org_id=org_b)).ingest(_FACT)
 
-    auditor = Memory(
-        pool, namespace=ns, scope=Scope(org_id=org_a), extract_propositions=False
-    )
+    auditor = Memory(pool, namespace=ns, scope=Scope(org_id=org_a))
     assert await auditor.believed_at(datetime.now(timezone.utc)) == []
 
 
@@ -865,7 +866,11 @@ async def _api(
     class _Settings:
         database_url = "unused"
         default_namespace = namespace
-        extract_propositions = False
+        # The extraction path, because /forget, /believed and the scoping
+        # assertions below are all about propositions.  Chunks-only mode writes
+        # into the chunk store now and produces none (ADR 0001, D1); the offline
+        # extractor keeps this a no-LLM fixture.
+        extract_propositions = True
 
     async def _make_pool(dsn):
         return _PinnedPool(pinned) if pinned is not None else _SharedPool(pool)
@@ -1016,7 +1021,11 @@ async def test_http_memorize_records_provenance(
 
     assert row["org_id"] == org
     assert row["kind"] == "chat_turn"
-    assert row["producer"] == "chunker"
+    # The producer follows the mode because it is the mode, and this fixture
+    # runs the extraction path: an LLM produced these propositions.  The
+    # chunker's own producer string is pinned on the chunks-only path, where the
+    # chunker is what produced the rows.
+    assert row["producer"] == "llm_extract"
     assert row["actor_user_id"] == actor
     assert row["source_url"] == "https://example.invalid/thread/1"
     assert orphans == 0
@@ -1206,10 +1215,22 @@ async def test_cli_ingest_writes_into_the_named_org(
     await cli.run_ingest(args)
 
     async with pool.acquire() as conn:
+        # Chunks, not propositions: --chunks-only writes into the chunk store
+        # (ADR 0001, D1), and the chunk store has no namespace to read — D3
+        # replaced stringly-typed scoping with columns, so the document is what
+        # ties a passage back to this run.
         orgs = [
             r["org_id"]
             for r in await conn.fetch(
-                "SELECT DISTINCT org_id FROM propositions WHERE namespace = $1", ns
+                """
+                SELECT DISTINCT c.org_id
+                FROM chunks c
+                JOIN document_version_chunks dvc ON dvc.chunk_id = c.id
+                JOIN document_versions dv ON dv.id = dvc.document_version_id
+                JOIN documents d ON d.id = dv.document_id
+                WHERE d.namespace = $1
+                """,
+                ns,
             )
         ]
 

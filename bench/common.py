@@ -16,7 +16,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from pgkg.config import get_settings
-from pgkg.memory import Memory, Result
+from pgkg.memory import Memory, Result, Scope
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +179,45 @@ def _parse_turn_timestamp(raw: object) -> datetime | None:
             )
             _timestamp_warn_logged = True
         return None
+
+
+# One collection per benchmark item, used by BOTH arms of the ablation.
+#
+# WHY THIS IS NOT OPTIONAL.  The propositions arm isolates an item by namespace;
+# the chunks arm cannot, because chunks carry no namespace — D3 replaced
+# stringly-typed scoping with explicit columns and the chunk arms of retrieval
+# read those columns.  Without a collection of its own, every LoCoMo
+# conversation's passages are candidates for every other conversation's
+# question, and the vector arm has no distance threshold to keep them out.  That
+# is a leak between items, and it would show up as an ablation result.
+#
+# Both arms get one, not just the chunks arm: an ablation whose two arms are
+# isolated by different mechanisms is measuring the mechanisms.
+#
+# Idempotent on (org_id, name), so re-running a benchmark reuses the item's
+# collection rather than accumulating one per run.
+_ITEM_COLLECTION_SQL = """
+WITH created AS (
+    INSERT INTO collections
+        (org_id, owner_org_id, name, kind, claim_scope, decay_profile)
+    VALUES (pgkg_default_org(), pgkg_default_org(), $1, 'chat', 'org',
+            'conversational')
+    ON CONFLICT (org_id, name) DO NOTHING
+    RETURNING id
+)
+SELECT id FROM created
+UNION ALL
+SELECT id FROM collections
+WHERE org_id = pgkg_default_org() AND name = $1
+LIMIT 1
+"""
+
+
+async def item_scope(pool, *, namespace: str) -> Scope:
+    """The scope one benchmark item writes and reads in."""
+    async with pool.acquire() as conn:
+        collection = await conn.fetchval(_ITEM_COLLECTION_SQL, f"bench:{namespace}")
+    return Scope(collection_id=collection)
 
 
 async def ingest_conversation(
@@ -434,7 +473,12 @@ async def run_bench(
 
         async with semaphore:
             ns = item.namespace
-            memory = Memory(pool, namespace=ns, extract_propositions=config.extract_propositions)
+            memory = Memory(
+                pool,
+                namespace=ns,
+                scope=await item_scope(pool, namespace=ns),
+                extract_propositions=config.extract_propositions,
+            )
             try:
                 # Ingest all conversation turns grouped by session_id
                 sessions: dict[str, list[dict]] = {}

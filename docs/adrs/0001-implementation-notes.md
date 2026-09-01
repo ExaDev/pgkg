@@ -15,7 +15,9 @@ Companion documents:
   adversarial verifiers found in phases 0–3, each with its reproduction and the commit that closed
   it, plus the re-verification pass that audited the fixes.
 
-**State at the time of writing.** Phases 0–3 complete, migrations 001–045, 534 tests green.
+**State at the time of writing.** Phases 0–3 complete, migrations 001–049, 567 tests green.
+Phase 2's last outstanding item — chunks-only ingest writing into the chunk store rather than
+faking proposition rows — landed in 049; see §3.
 Run them with:
 
 ```bash
@@ -132,7 +134,10 @@ Two things this process taught that generalise:
 
 Every item here is a place where the implementation does not do what the ADR says, on purpose.
 
-### D6's content address is `(org_id, collection_id, acl_group, content_hash)`, not `(org_id, content_hash)`
+### D6's content address is the scoping columns plus the hash, not `(org_id, content_hash)`
+
+*(042 made it `(org_id, collection_id, acl_group, content_hash)`; 049 added `visibility` and
+`owner_user_id` on the same rule — see the entry near the end of this section.)*
 
 **The ADR contradicts itself here.** D6's schema sketch writes `UNIQUE (org_id, content_hash)` on
 `chunks` and lists no `collection_id`; D3 requires `collection_id NOT NULL` on every retrievable
@@ -279,7 +284,7 @@ anyarray`) and `pgkg_gazetteer_key()`. Every arm of `pgkg_match_entity_mentions(
 sequential scan of the whole entity table under `pgkg_app`, on the ingest hot path (measured on
 40,001 entities: 42.6 / 186.6 / 74.3 ms against 4-70 buffers for the owner's index plans).
 
-046 marks the first two, with 043's argument and 043's `insufficient_privilege` handling.
+047 marks the first two, with 043's argument and 043's `insufficient_privilege` handling.
 `arraycontains` carries one stated reservation: it is polymorphic, so the marking covers arrays of
 every element type, and its residual leak surface is the element equality it resolves — `texteq`,
 itself leakproof, for the only containment this schema promotes.
@@ -304,19 +309,61 @@ overlapping content still hits) while making a cross-org hit impossible. The con
 the second org to hold a private passage re-extracts rather than reading the first org's facts,
 which is the direction D4 chooses.
 
-### Chunks-only mode still writes proposition rows
+### Chunks-only mode writes into the chunk store; the extraction path does not (049)
 
 Phase 2's ADR text says "chunks-only mode becomes 'retrieve from the chunk source' and the
-fake-proposition rows disappear". Half of this shipped. The chunk source exists, is retrievable in
-its own right, and `recall()` goes through `pgkg_retrieve()` with both stores — so the *corpus*
-path never creates a fake proposition. But `Memory.ingest(extract_propositions=False)`, which is
-what `--chunks-only` and `PGKG_EXTRACT_PROPOSITIONS=0` select, still writes one proposition row per
-chunk with NULL `subject`/`predicate`/`object` (`_plan_chunks_only` in `pgkg/memory.py`).
+fake-proposition rows disappear". Both halves have now shipped.
+`Memory.ingest(extract_propositions=False)` — what `--chunks-only` and `PGKG_EXTRACT_PROPOSITIONS=0`
+select — runs the corpus pipeline's write phase over a chat turn: one `documents` row, a version
+opened against the hash of the whole turn, its passages added through `pgkg_add_version_chunk()`,
+the vectors of the passages that call created, then `pgkg_promote_document_version()`. One
+transaction, no model call inside it, and **no proposition rows at all**.
 
-This is a deferral, not a decision: removing it means changing what `POST /memorize` returns and
-what the `Result` shape means for a chunk-mode caller, and the ablation benchmarks compare against
-the current shape. It should be done before the fake rows are load-bearing anywhere else.
-Documented in the README's "two modes" section so it does not mislead.
+`recall()` needed no change: `pgkg_retrieve()` already ran both stores, so a chunks-only caller now
+gets rows with `source = 'chunks'`, a `chunk_id`, and a NULL `proposition_id`. The ablation
+benchmark reads the chunk store, measured: a clean `--chunks-only` LoCoMo run leaves 419
+retrievable content-addressed chunks and zero propositions.
+
+**The extraction path deliberately did not move.** Its chunks exist as provenance for the facts
+extracted from them and are not retrievable content (041's bucketing rule turns on exactly that),
+so the only shape that would hold them under a document version without making them retrievable is
+a version that is never promoted — which is not what 030 means by `pending`. Paying a
+`document_versions` row and a `document_version_chunks` row per chat turn, on the hottest ingest
+path, to content-address rows no read predicate will ever reach is the pipeline conflation D7
+separates the two ingests to avoid. So the extraction path keeps `chunks.document_id`, the
+pre-lifecycle single-parent pointer, and keeps its per-chunk provenance locators — the span a
+citation names.
+
+### The content address gains `visibility` and `owner_user_id` (049), and stays partial
+
+Chunks-only chat ingest is the first writer of a *retrievable private* passage, and that exposed
+the half of 042's rule the corpus never exercised. `pgkg_visible()` reads five columns; 042 put
+three of them in the address. Every corpus chunk is `shared` with no owner, so the gap cost
+nothing — but a user's own note and the org's copy of the same sentence were one row under the old
+address, and one row cannot hold two owners. Whichever writer landed first would decide, and the
+answer is wrong in both directions: a private note published to the org, or an org passage only one
+user can retrieve. So the address is now
+`(org_id, collection_id, acl_group, visibility, owner_user_id, content_hash)`, on the same rule and
+for the same reason as `collection_id`. It costs disk on the private lane only: `shared`/NULL is one
+address, so every corpus row and every default-scoped chat row dedups exactly as before.
+
+030 said widening the address from partial (`WHERE document_id IS NULL`) to total is "one DROP and
+CREATE once ingest moves onto the function below". Only half of ingest moved, so it stays partial,
+and the claim was re-measured rather than assumed: a total index turns **19 tests red**, all but
+one of them the extraction path colliding with itself on repeated text in the default collection,
+and the one exception being `test_a_pre_lifecycle_chunk_is_not_content_addressed`, which pins the
+partial index on purpose. While `chunks.document_id` remains a single-parent pointer a total
+address is unrepresentable anyway: two pre-lifecycle documents in one collection sharing a
+paragraph would have to be one row, and that row can name only one parent. Widening it is
+therefore not a DROP and CREATE but the removal of `chunks.document_id`, which is a separate piece
+of work.
+
+**The bench harness now scopes each item to its own collection**, both arms. A namespace isolates
+propositions and nothing else — chunks carry no namespace, because D3 replaced stringly-typed
+scoping with columns — so without it every LoCoMo conversation's passages were candidates for every
+other conversation's question, and the vector arm has no distance threshold to keep them out. Both
+arms get one rather than only the chunks arm: an ablation whose two arms are isolated by different
+mechanisms is measuring the mechanisms.
 
 ---
 

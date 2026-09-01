@@ -10,12 +10,34 @@ import asyncpg
 import numpy as np
 import pytest
 
-from pgkg.memory import Memory
+from pgkg.memory import Memory, Scope
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+async def _own_collection(pool: asyncpg.Pool) -> Scope:
+    """A collection of this test's own, for a test that writes passages.
+
+    A namespace isolates propositions and nothing else: D3 replaced
+    stringly-typed scoping with columns, and the chunk arms of retrieval read
+    those columns.  A chunks-only ingest into the default collection is a
+    retrievable passage that every other default-scoped recall in the suite can
+    see, and the vector arm has no distance threshold to hide behind.
+    """
+    async with pool.acquire() as conn:
+        collection = await conn.fetchval(
+            """
+            INSERT INTO collections
+                (org_id, owner_org_id, name, kind, claim_scope, decay_profile)
+            VALUES (pgkg_default_org(), pgkg_default_org(), $1, 'chat', 'org',
+                    'conversational')
+            RETURNING id
+            """,
+            f"own_{uuid.uuid4().hex[:10]}",
+        )
+    return Scope(collection_id=collection)
 
 def _unit_vec(dim: int = 1024, *, hot: int = 0) -> list[float]:
     v = [0.0] * dim
@@ -229,7 +251,12 @@ async def test_recall_default_flags_with_pgvector_embedding(pool: asyncpg.Pool, 
     monkeypatch.setattr(ml_module, "rerank", lambda q, docs: [1.0 / (i + 1) for i in range(len(docs))])
 
     ns = f"recall_default_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(
+        pool,
+        namespace=ns,
+        scope=await _own_collection(pool),
+        extract_propositions=False,
+    )
     await mem.ingest("The chunks-only ingest mode skips LLM extraction entirely.")
     await mem.ingest("Hybrid retrieval fuses BM25 and vector similarity via RRF.")
 
@@ -254,7 +281,7 @@ async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
 
     expected_ts = datetime(2025, 1, 15, 10, 0, 0, tzinfo=timezone.utc)
     ns = f"assertedat_ingest_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
 
     await mem.ingest(
         "The sky is blue and the grass is green.",
@@ -312,7 +339,7 @@ async def test_recall_returns_asserted_at_in_result(pool: asyncpg.Pool, monkeypa
     monkeypatch.setattr(ml_module, "embed", _controlled_embed)
 
     ns = f"assertedat_recall_{uuid.uuid4().hex[:8]}"
-    mem = Memory(pool, namespace=ns, extract_propositions=False)
+    mem = Memory(pool, namespace=ns)
 
     await mem.ingest(target_text, asserted_at=expected_ts)
 

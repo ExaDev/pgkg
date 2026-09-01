@@ -114,6 +114,37 @@ async def test_run_bench_dry_run_exact_match(pool: asyncpg.Pool, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Isolation between benchmark items
+# ---------------------------------------------------------------------------
+
+async def test_each_bench_item_gets_a_collection_of_its_own(
+    pool: asyncpg.Pool,
+) -> None:
+    """The chunks arm cannot isolate an item by namespace.
+
+    A namespace isolates propositions and nothing else: chunks carry none,
+    because D3 replaced stringly-typed scoping with explicit columns and the
+    chunk arms of retrieval read those columns.  Two items sharing a collection
+    share a retrievable pool, and the vector arm has no distance threshold to
+    keep one item's passages out of the other item's candidates.
+
+    Idempotent on the item's namespace, so a re-run reuses the collection rather
+    than accumulating one per run.
+    """
+    from bench.common import item_scope
+
+    one = f"iso-a-{uuid.uuid4().hex[:8]}"
+    two = f"iso-b-{uuid.uuid4().hex[:8]}"
+
+    first = await item_scope(pool, namespace=one)
+    second = await item_scope(pool, namespace=two)
+    again = await item_scope(pool, namespace=one)
+
+    assert first.collection_id != second.collection_id
+    assert first.collection_id == again.collection_id
+
+
+# ---------------------------------------------------------------------------
 # test_bench_config_factory_resolves_stack
 # ---------------------------------------------------------------------------
 
