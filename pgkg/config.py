@@ -23,6 +23,19 @@ GENERATION_1_ID = UUID("00000000-0000-0000-0000-000000000010")
 ORG_GUC = "pgkg.org_id"
 
 
+# The model a provider is asked for when the caller named a provider and no
+# model.  `llm_model` has to default to something, and defaulting it to an
+# OpenAI id is right for the common case — but it meant selecting claude_code
+# alone sent that id to the `claude` CLI, which failed with a message about
+# logging in.  A provider's default belongs with the provider.
+PROVIDER_DEFAULT_MODELS = {
+    "openai": "gpt-4o-mini-2024-07-18",
+    "anthropic": "claude-haiku-4-5-20251001",
+    "claude_code": "claude-haiku-4-5-20251001",
+    "ollama": "llama3.1",
+}
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -60,7 +73,24 @@ class Settings(BaseSettings):
     extract_propositions: bool = True
     # Informational: the prompt version used for extraction (source of truth is
     # the PROMPT_VERSION constant in ml.py; this field is logged into BenchReport).
-    prompt_version: str = "v1"
+    prompt_version: str = "v2"
+
+
+    @property
+    def resolved_extractor_model(self) -> str:
+        """The model to extract with, honouring the provider when unasked.
+
+        Precedence: an explicit `extractor_model`, then an explicitly-set
+        `llm_model`, then the provider's own default.  The middle step is why
+        this reads `model_fields_set` rather than comparing against the default
+        value — a caller who deliberately sets the OpenAI id while pointing at
+        another provider is doing something unusual, and is entitled to.
+        """
+        if self.extractor_model:
+            return self.extractor_model
+        if "llm_model" in self.model_fields_set:
+            return self.llm_model
+        return PROVIDER_DEFAULT_MODELS.get(self.llm_provider, self.llm_model)
 
 
 @lru_cache(maxsize=1)

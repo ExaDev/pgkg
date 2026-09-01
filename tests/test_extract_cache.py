@@ -93,13 +93,12 @@ async def test_cache_hit_returns_stored_props_without_llm(
     import pgkg.config as config_module
     import pgkg.ml as ml_module
 
-    fake_settings = MagicMock()
-    fake_settings.extractor_model = model
-    fake_settings.llm_model = model
-    fake_settings.llm_provider = "openai"
-    fake_settings.openai_api_key = None
-    fake_settings.openai_base_url = None
-    fake_settings.prompt_version = PROMPT_VERSION
+    from pgkg.config import Settings
+
+    fake_settings = Settings(
+        extractor_model=model, llm_model=model, llm_provider="openai",
+        openai_api_key=None, prompt_version=PROMPT_VERSION, _env_file=None,
+    )
 
     monkeypatch.setattr(ml_module, "get_settings", lambda: fake_settings)
     monkeypatch.delenv("PGKG_OFFLINE_EXTRACT", raising=False)
@@ -131,13 +130,12 @@ async def test_cache_miss_then_hit(pool: asyncpg.Pool, monkeypatch):
 
     import pgkg.ml as ml_module
 
-    fake_settings = MagicMock()
-    fake_settings.extractor_model = model
-    fake_settings.llm_model = model
-    fake_settings.llm_provider = "openai"
-    fake_settings.openai_api_key = "fake"
-    fake_settings.openai_base_url = None
-    fake_settings.prompt_version = PROMPT_VERSION
+    from pgkg.config import Settings
+
+    fake_settings = Settings(
+        extractor_model=model, llm_model=model, llm_provider="openai",
+        openai_api_key="fake", prompt_version=PROMPT_VERSION, _env_file=None,
+    )
 
     monkeypatch.setattr(ml_module, "get_settings", lambda: fake_settings)
     monkeypatch.delenv("PGKG_OFFLINE_EXTRACT", raising=False)
@@ -177,9 +175,11 @@ async def test_offline_extract_bypasses_cache(pool: asyncpg.Pool, monkeypatch):
 
     import pgkg.ml as ml_module
 
-    fake_settings = MagicMock()
-    fake_settings.extractor_model = model
-    fake_settings.llm_model = model
+    from pgkg.config import Settings
+
+    fake_settings = Settings(
+        extractor_model=model, llm_model=model, _env_file=None
+    )
 
     monkeypatch.setattr(ml_module, "get_settings", lambda: fake_settings)
 
@@ -230,15 +230,17 @@ def test_cache_key_changes_with_prompt_version(monkeypatch):
     chunk = "Delta is the fourth letter of the Greek alphabet."
     model = "some-model"
 
-    key_v1 = compute_cache_key(chunk, model)
+    before = compute_cache_key(chunk, model)
 
-    # Monkeypatch the module-level PROMPT_VERSION
-    monkeypatch.setattr(ml_module, "PROMPT_VERSION", "v2")
+    # A sentinel rather than a literal version: this test hardcoded "v2", so it
+    # silently stopped testing anything the day PROMPT_VERSION actually became
+    # v2 — patching the value to what it already was compared a key with itself.
+    monkeypatch.setattr(
+        ml_module, "PROMPT_VERSION", ml_module.PROMPT_VERSION + "-changed"
+    )
+    after = ml_module.compute_cache_key(chunk, model)
 
-    # compute_cache_key reads module-level PROMPT_VERSION at call time
-    key_v2 = ml_module.compute_cache_key(chunk, model)
-
-    assert key_v1 != key_v2
+    assert before != after
 
 
 # ---------------------------------------------------------------------------

@@ -141,11 +141,17 @@ async def test_extract_propositions_dispatches_to_claude_code(monkeypatch):
     """extract_propositions_async dispatches to _extract_claude_code when provider=claude_code."""
     import pgkg.ml as ml_module
 
-    fake_settings = MagicMock()
-    fake_settings.llm_provider = "claude_code"
-    fake_settings.extractor_model = "claude-haiku-4-5-20251001"
-    fake_settings.llm_model = "claude-haiku-4-5-20251001"
-    monkeypatch.setattr(ml_module, "get_settings", lambda: fake_settings)
+    # A real Settings, not a MagicMock: the model handed to the provider is now
+    # resolved by Settings itself, and a mock would have answered with a mock
+    # and pinned nothing.
+    from pgkg.config import Settings
+
+    settings = Settings(
+        llm_provider="claude_code",
+        extractor_model="claude-haiku-4-5-20251001",
+        _env_file=None,
+    )
+    monkeypatch.setattr(ml_module, "get_settings", lambda: settings)
     monkeypatch.delenv("PGKG_OFFLINE_EXTRACT", raising=False)
 
     from pgkg.ml import Proposition
@@ -194,3 +200,84 @@ def test_call_llm_dispatches_to_claude_code(monkeypatch):
 
     result = bench_common._call_llm("test prompt", model="claude-haiku-4-5-20251001", provider="claude_code")
     assert result == "hello from claude"
+
+
+# ---------------------------------------------------------------------------
+# Which model the provider actually asks for
+# ---------------------------------------------------------------------------
+#
+# Found by standing the system up and driving it over MCP: selecting the
+# provider on its own sent `gpt-4o-mini-2024-07-18` to the `claude` CLI, which
+# failed — and the failure was reported as "install the CLI and log in", so the
+# real cause was invisible.  `.env.local-claude` sets both model variables and
+# therefore masked it; the README's Path B says only to set the provider.
+
+
+def test_selecting_claude_code_does_not_ask_it_for_an_openai_model(monkeypatch):
+    """The provider default has to follow the provider.
+
+    `llm_model` defaults to an OpenAI id because most callers use OpenAI.  A
+    caller who names a provider and no model is asking for that provider's
+    default, not for the other one's.
+    """
+    from pgkg.config import Settings
+
+    settings = Settings(llm_provider="claude_code", _env_file=None)
+
+    assert settings.resolved_extractor_model.startswith("claude-"), (
+        "claude_code was handed "
+        f"{settings.resolved_extractor_model!r}, which is not a Claude model"
+    )
+
+
+def test_an_explicit_model_still_wins_over_the_provider_default(monkeypatch):
+    """The fix must not take the choice away from someone who made one."""
+    from pgkg.config import Settings
+
+    explicit = Settings(
+        llm_provider="claude_code", llm_model="claude-opus-4-20250514", _env_file=None
+    )
+    assert explicit.resolved_extractor_model == "claude-opus-4-20250514"
+
+    override = Settings(
+        llm_provider="claude_code",
+        extractor_model="claude-sonnet-4-20250514",
+        _env_file=None,
+    )
+    assert override.resolved_extractor_model == "claude-sonnet-4-20250514"
+
+
+def test_the_other_providers_keep_their_own_default(monkeypatch):
+    from pgkg.config import Settings
+
+    assert Settings(llm_provider="openai", _env_file=None).resolved_extractor_model == (
+        "gpt-4o-mini-2024-07-18"
+    )
+
+
+async def test_a_failing_sdk_call_reports_what_actually_went_wrong(monkeypatch):
+    """The old handler replaced every failure with advice about logging in.
+
+    A wrong model id, a network error and a genuinely unauthenticated CLI all
+    read identically, which is how the model mismatch above stayed hidden.
+    """
+    from pgkg import ml
+
+    fake_sdk = types.ModuleType("claude_agent_sdk")
+
+    async def _boom(*args, **kwargs):
+        raise ValueError("model 'gpt-4o-mini-2024-07-18' not found")
+        yield  # pragma: no cover — makes this an async generator
+
+    fake_sdk.query = _boom
+    fake_sdk.ClaudeAgentOptions = lambda **kw: types.SimpleNamespace(**kw)
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake_sdk)
+
+    with pytest.raises(RuntimeError) as caught:
+        await ml._extract_claude_code("some text", system_prompt="x")
+
+    message = str(caught.value)
+    assert "gpt-4o-mini-2024-07-18" in message, (
+        f"the underlying cause is not in the message: {message}"
+    )
+    assert isinstance(caught.value.__cause__, ValueError)

@@ -955,12 +955,15 @@ async def test_extraction_reuses_the_proposition_cache(
             org,
         )
 
-    settings = MagicMock()
-    settings.extractor_model = model
-    settings.llm_model = model
-    settings.llm_provider = "openai"
-    settings.openai_api_key = None
-    settings.openai_base_url = None
+    # A real Settings: the model the cache key is computed from is resolved by
+    # Settings now, and a MagicMock answers that with a mock, which misses the
+    # cache and calls the LLM the test exists to prove is not called.
+    from pgkg.config import Settings
+
+    settings = Settings(
+        extractor_model=model, llm_model=model, llm_provider="openai",
+        openai_api_key=None, _env_file=None,
+    )
     monkeypatch.setattr(ml, "get_settings", lambda: settings)
     monkeypatch.delenv("PGKG_OFFLINE_EXTRACT", raising=False)
     monkeypatch.setattr(

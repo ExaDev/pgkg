@@ -54,6 +54,41 @@ def cmd_serve(args: argparse.Namespace) -> None:
     uvicorn.run("pgkg.api:app", host=args.host, port=args.port, reload=False)
 
 
+def cmd_mcp(args: argparse.Namespace) -> None:
+    """Serve the MCP tools over stdio.
+
+    The scope comes from these flags and nothing else.  A tool that took an org
+    argument would be taking it from a language model, whose context includes
+    whatever the corpus retrieved for it — so the tenant is fixed here, once,
+    by the operator launching the server (ADR-0001 D3; pgkg/mcp_server.py).
+    """
+    import asyncio
+
+    from pgkg.config import get_settings
+    from pgkg.db import make_pool, close_pool
+    from pgkg.mcp_server import ServerScope, build_server
+
+    scope = _scope(args)
+
+    async def _serve() -> None:
+        pool = await make_pool(get_settings().database_url)
+        try:
+            server = build_server(
+                pool,
+                ServerScope(
+                    org_id=scope.org_id,
+                    collection_id=scope.collection_id,
+                    user_id=scope.user_id,
+                ),
+                extract_propositions=get_settings().extract_propositions,
+            )
+            await server.run_stdio_async()
+        finally:
+            await close_pool(pool)
+
+    asyncio.run(_serve())
+
+
 def _scope(args: argparse.Namespace):
     """The tenant this invocation runs as.
 
@@ -183,6 +218,11 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--host", default="0.0.0.0")
     serve_parser.add_argument("--port", type=int, default=8000)
 
+    mcp_parser = subparsers.add_parser(
+        "mcp", help="Serve the MCP tools over stdio for an agent client"
+    )
+    _add_scope_flags(mcp_parser)
+
     ingest_parser = subparsers.add_parser("ingest", help="Ingest a file or stdin")
     ingest_parser.add_argument("path", help="Path to file or '-' for stdin")
     ingest_parser.add_argument(
@@ -235,6 +275,8 @@ def main() -> None:
         cmd_migrate(args)
     elif args.command == "serve":
         cmd_serve(args)
+    elif args.command == "mcp":
+        cmd_mcp(args)
     elif args.command == "ingest":
         cmd_ingest(args)
     elif args.command == "recall":
