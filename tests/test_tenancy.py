@@ -827,3 +827,146 @@ async def test_a_stranger_org_cannot_attach_itself_to_my_passage(
         if intruded in (row["context_text"] or "")
     ]
     assert not leaked, f"cross-org context_text: {leaked!r}"
+
+
+async def shared_collection(pool: asyncpg.Pool) -> uuid.UUID:
+    """A collection the operator publishes; 023 lets only the system org own
+    one."""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO collections
+                (org_id, owner_org_id, name, kind, visibility, claim_scope,
+                 decay_profile, public_source, licence)
+            VALUES (pgkg_system_org(), pgkg_system_org(), $1, 'corpus',
+                    'shared', 'world', 'timeless', TRUE, 'operator-licensed')
+            RETURNING id
+            """,
+            f"link_write_{uuid.uuid4().hex[:8]}",
+        )
+
+
+async def test_a_tenant_cannot_rewrite_the_operators_link_table(
+    pool: asyncpg.Pool,
+) -> None:
+    """The link table's policy tests the version's visibility, and 043 made the
+    operator's rows visible to every tenant so the sharing seam could carry
+    anything.  Visibility is the read rule; it is not the write rule.
+
+    With both sides of the link in the system org the same-org trigger is
+    satisfied and the refcount and retrievability triggers do not fire on an
+    UPDATE at all, so a tenant holding two ids it is entitled to READ could
+    repoint the operator's document at a passage from somewhere else in the
+    shared corpus.  That is C2's laundering shape reached by a write: every
+    subscriber's context_text for that document then carries prose from another
+    one, and the passage that was displaced keeps a refcount with no link
+    behind it.
+    """
+    shared = await shared_collection(pool)
+    async with pool.acquire() as conn:
+        tenant = await new_org(conn, "link_table_intruder")
+        document = await conn.fetchval(
+            """
+            INSERT INTO documents (source, org_id, collection_id, external_id)
+            VALUES ('operator handbook', pgkg_system_org(), $1, $2)
+            RETURNING id
+            """,
+            shared,
+            uuid.uuid4().hex,
+        )
+        version = await conn.fetchval(
+            "SELECT version_id FROM pgkg_open_document_version($1, $2)",
+            document,
+            uuid.uuid4().bytes,
+        )
+        for ord_, text in enumerate(
+            [
+                "Clause one covers the scope of the zzqlinkwrite standard.",
+                "Clause two covers the appeals process in full.",
+                "Clause three covers the schedule of fees.",
+            ]
+        ):
+            await conn.execute(
+                "SELECT pgkg_add_version_chunk($1, $2, $3)", version, ord_, text
+            )
+        await conn.execute("SELECT pgkg_promote_document_version($1)", version)
+
+        before = await conn.fetch(
+            "SELECT ord, chunk_id FROM document_version_chunks"
+            " WHERE document_version_id = $1 ORDER BY ord",
+            version,
+        )
+        first_chunk = before[0]["chunk_id"]
+
+        attempts: dict[str, str] = {}
+        for name, sql, args in [
+            (
+                "repoint",
+                "UPDATE document_version_chunks SET chunk_id = $1"
+                " WHERE document_version_id = $2 AND ord = 1",
+                (first_chunk, version),
+            ),
+            (
+                "renumber",
+                "UPDATE document_version_chunks SET ord = 99"
+                " WHERE document_version_id = $1 AND ord = 2",
+                (version,),
+            ),
+            (
+                "unlink",
+                "DELETE FROM document_version_chunks"
+                " WHERE document_version_id = $1",
+                (version,),
+            ),
+            (
+                "append",
+                "INSERT INTO document_version_chunks"
+                " (document_version_id, chunk_id, ord) VALUES ($1, $2, 99)",
+                (version, first_chunk),
+            ),
+        ]:
+            async with conn.transaction():
+                await conn.execute("SET LOCAL ROLE pgkg_app")
+                await conn.execute(
+                    "SELECT set_config('pgkg.org_id', $1, true)", str(tenant)
+                )
+                try:
+                    attempts[name] = await conn.execute(sql, *args)
+                except asyncpg.PostgresError as exc:
+                    attempts[name] = f"refused: {exc.__class__.__name__}"
+
+        readable = await conn.fetchval(
+            """
+            SELECT count(*) FROM (
+                SELECT 1 FROM document_version_chunks
+                WHERE document_version_id = $1
+            ) t
+            """,
+            version,
+        )
+        after = await conn.fetch(
+            "SELECT ord, chunk_id FROM document_version_chunks"
+            " WHERE document_version_id = $1 ORDER BY ord",
+            version,
+        )
+
+    assert readable == 3, "the fixture did not build the three links it needs"
+    # The policy refuses in the two shapes Postgres has for it, and the shape
+    # is part of what is asserted: USING hides the rows an UPDATE or a DELETE
+    # would have found, so the statement completes and touches nothing, while
+    # WITH CHECK rejects the row an INSERT offers, so it raises.  Any other
+    # error means some maintenance trigger downstream happened to raise
+    # instead, and a trigger is not this boundary — it is inert on the owner
+    # connection a worker runs as.
+    expected = {
+        "repoint": "UPDATE 0",
+        "renumber": "UPDATE 0",
+        "unlink": "DELETE 0",
+        "append": "refused: InsufficientPrivilegeError",
+    }
+    assert attempts == expected, (
+        f"a tenant reached the operator's link table: {attempts!r}"
+    )
+    assert [(row["ord"], row["chunk_id"]) for row in after] == [
+        (row["ord"], row["chunk_id"]) for row in before
+    ], "the operator's document carries different passages than it was given"

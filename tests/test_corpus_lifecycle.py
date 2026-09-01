@@ -1111,3 +1111,145 @@ async def test_two_concurrent_crawls_of_one_document_do_not_collide(
             )
         ]
     assert numbers == [1, 2]
+
+
+async def test_a_link_repointed_by_update_does_not_leave_a_ghost_passage(
+    pool: asyncpg.Pool,
+) -> None:
+    """Derived state has to survive every write that can change it.
+
+    041 moved chunk liveness off the hot retrieval path onto chunks.retrievable
+    and moved the BM25 population with it, both reconciled by trigger.  The
+    link table carried triggers for INSERT and DELETE — the ingest path and the
+    purge — and none for UPDATE, so repointing a link left the passage it
+    abandoned flagged retrievable for good: still counted in the statistics,
+    still returned by the keyword arm, and with a refcount no garbage collector
+    would ever bring to zero.  Before 041 liveness was recomputed per scan and
+    the same UPDATE was merely untidy; a stored flag makes it withdrawn content
+    that stays searchable.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org, kind="corpus")
+        document = await new_document(
+            conn, org_id=org, collection_id=collection
+        )
+        kept = "The zzqghostly calibration procedure runs once every quarter."
+        abandoned = "The zzqghostly appendix lists each discontinued fitting."
+        version, _, added = await ingest_version(
+            conn, document, [kept, abandoned]
+        )
+        kept_id, abandoned_id = added[0][0], added[1][0]
+
+        await conn.execute(
+            """
+            UPDATE document_version_chunks SET chunk_id = $1
+            WHERE document_version_id = $2 AND ord = 1
+            """,
+            kept_id,
+            version,
+        )
+
+        state = {
+            row["id"]: row
+            for row in await conn.fetch(
+                "SELECT id, refcount, retrievable FROM chunks"
+                " WHERE id = ANY($1::uuid[])",
+                [kept_id, abandoned_id],
+            )
+        }
+        reachable = await conn.fetch(
+            """
+            SELECT item_id FROM pgkg_bm25_candidates(
+                q_text => 'zzqghostly appendix discontinued fitting',
+                k_initial => 50,
+                p_org_ids => $1::uuid[],
+                p_collection_ids => $2::uuid[],
+                p_source => 'chunks')
+            """,
+            [org],
+            [collection],
+        )
+
+    assert not state[abandoned_id]["retrievable"], (
+        "a passage no version carries any more is still flagged retrievable, "
+        "so withdrawn content stays in the statistics and in the scan"
+    )
+    assert state[abandoned_id]["refcount"] == 0, (
+        "the abandoned passage keeps a refcount with no link behind it, so it "
+        "can never be collected"
+    )
+    assert abandoned_id not in [row["item_id"] for row in reachable], (
+        "the keyword arm still returns a passage that no live document carries"
+    )
+    assert state[kept_id]["refcount"] == 2, (
+        "the passage the link was moved onto did not gain the reference, so "
+        "the counter drifts in both directions"
+    )
+    assert state[kept_id]["retrievable"], (
+        "the passage the version still carries stopped being retrievable"
+    )
+
+
+async def test_reclaiming_a_retired_version_does_not_resurrect_its_passages(
+    pool: asyncpg.Pool,
+) -> None:
+    """Withdrawal has to outlive the version that carried the withdrawn text.
+
+    A passage dropped by a new version stops being retrievable at promotion,
+    correctly, because the only version still carrying it is retired.  Then
+    pgkg_purge_retired_versions reclaims that version, its links go, and the
+    passage matched the standalone arm of the liveness predicate — belongs to
+    no document, carried by no version — so it was readmitted as a passage
+    standing on its own.  Garbage collection resurrecting withdrawn content is
+    the wrong way round, and it is permanent for any passage a fact was
+    extracted from, since the collector refuses to take those.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org, kind="corpus")
+        document = await new_document(
+            conn, org_id=org, collection_id=collection
+        )
+        kept = "The zzqreclaim alpha clause covers the reclamation schedule."
+        dropped = "The zzqreclaim beta clause covers the discontinued fittings."
+
+        _, _, added = await ingest_version(conn, document, [kept, dropped])
+        dropped_id = added[1][0]
+        await ingest_version(conn, document, [kept])
+
+        withdrawn = await conn.fetchval(
+            "SELECT retrievable FROM chunks WHERE id = $1", dropped_id
+        )
+        purged = await conn.fetchval(
+            "SELECT pgkg_purge_retired_versions(INTERVAL '0 seconds', $1)", org
+        )
+        after = await conn.fetchrow(
+            "SELECT refcount, retrievable FROM chunks WHERE id = $1", dropped_id
+        )
+        reachable = await conn.fetch(
+            """
+            SELECT item_id FROM pgkg_bm25_candidates(
+                q_text => 'zzqreclaim beta discontinued fittings',
+                k_initial => 50,
+                p_org_ids => $1::uuid[],
+                p_collection_ids => $2::uuid[],
+                p_source => 'chunks')
+            """,
+            [org],
+            [collection],
+        )
+
+    assert withdrawn is False, (
+        "the dropped passage was still retrievable before the purge, so the "
+        "purge is not what this test is measuring"
+    )
+    assert purged == 1, "the retired version was not reclaimed"
+    assert after["refcount"] == 0, "the reclaimed links left the count behind"
+    assert after["retrievable"] is False, (
+        "reclaiming the retired version made the withdrawn passage retrievable "
+        "again"
+    )
+    assert dropped_id not in [row["item_id"] for row in reachable], (
+        "the keyword arm returns a passage the current version dropped"
+    )

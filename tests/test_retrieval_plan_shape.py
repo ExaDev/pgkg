@@ -22,7 +22,7 @@ import asyncpg
 import pytest
 
 LIVENESS = """
-    (c.refcount = 0 AND c.document_id IS NULL)
+    (c.document_id IS NULL AND NOT c.version_scoped)
     OR EXISTS (
         SELECT 1 FROM document_version_chunks dvc
         JOIN document_versions dv ON dv.id = dvc.document_version_id
