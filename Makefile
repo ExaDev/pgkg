@@ -35,6 +35,12 @@ migrate:
 test:
 	uv run pytest -q
 
+# End-to-end: a real Postgres, a real `pgkg mcp` server over stdio, real
+# embeddings.  Slower than `test` and it needs Docker; it catches the class of
+# defect that only appears when the layers compose.
+e2e:
+	scripts/e2e_mcp.sh
+
 # Smoke test: health check + memorize + recall
 smoke:
 	@echo "--- health ---"
