@@ -90,6 +90,7 @@ The headers are the primary documentation for the SQL; this table is the index i
 | `043_isolation_and_the_graph_arm.sql` | `ts_match_vq` marked `LEAKPROOF`; read policies widened to the operator's org; four unpolicied tables policied; `proposition_cache` attributed to an org; the graph arm takes `p_sources` |
 | `044_queue_provenance_and_two_keys.sql` | `documents_external_id_key` partial on `deleted_at IS NULL`; `proposition_cache` keyed `(cache_key, org_id)`; provenance carried through the ingest queue |
 | `045_link_table_writes.sql` | The link table's write side is own-org on both sides; the missing `UPDATE` reconciliation; liveness stops being a function of `refcount` |
+| `047_gazetteer_under_row_security.sql` | The same non-leakproof-qual mechanism on `entities`: `similarity_op` and `arraycontains` marked `LEAKPROOF`, and the gazetteer keys stored as generated columns so the name and alias arms compare columns instead of calling the normaliser |
 
 ---
 
@@ -270,6 +271,28 @@ the `DO` block fell through to its `NOTICE` is a monitorable fact rather than a 
 log. The suite can only ever observe the marked state, so the test that matters drives the
 endpoint through the unmarked state inside a transaction it rolls back.
 
+### The same mechanism on the gazetteer, and where a leakproof claim is the wrong remedy
+
+043 fixed the keyword arms and left `entities` — under row security since 020 — probed by three
+quals that are all non-leakproof: `similarity_op` (`text % text`), `arraycontains` (`anyarray @>
+anyarray`) and `pgkg_gazetteer_key()`. Every arm of `pgkg_match_entity_mentions()` was therefore a
+sequential scan of the whole entity table under `pgkg_app`, on the ingest hot path (measured on
+40,001 entities: 42.6 / 186.6 / 74.3 ms against 4-70 buffers for the owner's index plans).
+
+046 marks the first two, with 043's argument and 043's `insufficient_privilege` handling.
+`arraycontains` carries one stated reservation: it is polymorphic, so the marking covers arrays of
+every element type, and its residual leak surface is the element equality it resolves — `texteq`,
+itself leakproof, for the only containment this schema promotes.
+
+The third is the interesting one, and the reason this note exists: marking
+`pgkg_gazetteer_key()` leakproof was measured to change nothing. The planner inlines a simple SQL
+function's body before it judges the qual, so the claim on the wrapper is never consulted, and what
+the qual actually contains is `lower`/`regexp_replace`/`btrim` — marking *those* would be a claim
+over every qual in the database that lowercases or trims a column. A leakproofness marking on a
+function this schema owns also outlives the review of its body. So that arm gets a different
+remedy: the two keys are stored generated columns, and the quals become an equality on text
+(`texteq`, already leakproof) and containment on a plain `text[]`. The name arm becomes an Index
+Only Scan, which the expression index could not offer either.
 ### The extraction cache is keyed per org, not gated on `public_source`
 
 D4 restricts `embedding_cache` to operator-licensed material because "for a confidential document a

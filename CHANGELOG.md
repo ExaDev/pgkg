@@ -3,7 +3,7 @@
 ## 0.6.0
 
 ADR-0001 phases 0-3: the corpus becomes a first-class retrievable store alongside the proposition
-graph, and the whole schema gains a tenancy boundary. Migrations 010-046. See
+graph, and the whole schema gains a tenancy boundary. Migrations 010-047. See
 [`docs/adrs/0001-implementation-notes.md`](docs/adrs/0001-implementation-notes.md) for what was
 built against what was specified, and every deliberate deviation.
 
@@ -115,6 +115,11 @@ worth knowing about as a user of the schema:
   built-in, so where it cannot be applied `GET /health` now reports it as `keyword_index`: a
   deployment that missed the fix is a monitorable fact rather than a silent order-of-magnitude
   regression under load.
+- **The gazetteer reaches its indexes under the application role too**: `similarity_op` and
+  `arraycontains` are marked `LEAKPROOF` and the gazetteer keys are stored generated columns on
+  `entities`, so none of the three arms of `pgkg_match_entity_mentions()` is a sequential scan of
+  the entity table any more. Measured on 40,001 entities: 42.6 / 186.6 / 74.3 ms per probe under
+  `pgkg_app`, against a few buffers on the index plans. This runs per chunk on ingest.
 - **Performance**: BM25 scores each candidate once instead of twice; the IDF lookup is served by the
   primary key instead of aggregating the whole vocabulary; corpus ingest is set-based (16 round
   trips regardless of chunk count) and makes no model call inside a transaction; the ingest worker

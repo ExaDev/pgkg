@@ -606,7 +606,304 @@ async def test_the_reversed_operand_order_reaches_the_index_too(
         f"application role, which is the defect 043 fixed one way round:\n{as_app}"
     )
 
+# ---------------------------------------------------------------------------
+# The same mechanism on the gazetteer's three arms (issue #10).
+# ---------------------------------------------------------------------------
+#
+# `entities` has been under row security since 020 and 043 did not touch the
+# operators the gazetteer probes with, so every arm of
+# pgkg_match_entity_mentions() was a sequential scan of the whole entity table
+# under the one role the policies are written for — per candidate phrase, per
+# chunk, on the ingest path.
+#
+# Each arm is written here the way the matcher writes it: the phrase side is a
+# row of literals standing in for one row of the matcher's `usable` CTE, so the
+# plan under test is the nested-loop index probe the matcher is costed on and
+# not a simpler shape a constant would allow.
 
+ARM_SQL = {
+    "name": """
+        SELECT count(*)
+        FROM (VALUES ($1::uuid, $2::text)) AS u(org_id, phrase)
+        JOIN entities e
+          ON e.org_id = u.org_id
+         AND e.gazetteer_name_key = u.phrase
+    """,
+    "alias": """
+        SELECT count(*)
+        FROM (VALUES ($1::uuid, $2::text)) AS u(org_id, phrase)
+        JOIN entities e
+          ON e.org_id = u.org_id
+         AND e.gazetteer_alias_keys @> ARRAY[u.phrase]
+    """,
+    "fuzzy": """
+        SELECT count(*)
+        FROM (VALUES ($1::uuid, $2::text)) AS u(org_id, phrase)
+        JOIN entities e
+          ON e.org_id = u.org_id
+         AND e.name % u.phrase
+         AND similarity(e.gazetteer_name_key, u.phrase) >= 0.9
+    """,
+}
+
+# The index each arm exists to probe, and the phrase that reaches exactly one
+# entity through it.
+ARM_INDEX = {
+    "name": "entities_gazetteer_name_idx",
+    "alias": "entities_gazetteer_alias_idx",
+    "fuzzy": "entities_name_trgm_idx",
+}
+
+ARM_PHRASE = {
+    "name": "zorbulon unobtainium programme",
+    "alias": "zorbulon needle alias",
+    # One transposition away from the name, which is what the trigram arm is
+    # for: the typo and the missing accent, not guessing.
+    "fuzzy": "zorbulon unobtanium programme",
+}
+
+# What each arm's index condition is, and therefore what has to be leakproof
+# for the policy not to demote it to a filter.  The name arm is absent on
+# purpose: its remedy is a stored column, not a claim about a function.
+ARM_OPERATOR = {
+    "alias": "arraycontains(anyarray, anyarray)",
+    "fuzzy": "similarity_op(text, text)",
+}
+
+
+@pytest.fixture(scope="module")
+async def gazetteer_corpus(pool: asyncpg.Pool):
+    """Enough entities that the index is the cheaper plan.
+
+    At a few hundred rows a sequential scan is what the planner should pick and
+    every arm looks the same, so the fixture is sized where the choice is real
+    — the scale the finding was measured at.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        namespace = f"gaz_{uuid.uuid4().hex[:8]}"
+        await conn.execute("SELECT set_config($1, $2, false)", ORG_GUC, str(org))
+        await conn.execute(
+            """
+            INSERT INTO entities (name, type, aliases, namespace, org_id)
+            SELECT 'filler entity number ' || g, 'thing',
+                   ARRAY['filler alias alpha ' || g, 'filler alias beta ' || g],
+                   $1, $2
+            FROM generate_series(1, 40000) g
+            """,
+            namespace,
+            org,
+        )
+        await conn.execute(
+            """
+            INSERT INTO entities (name, type, aliases, namespace, org_id)
+            VALUES ('Zorbulon Unobtainium Programme', 'thing',
+                    ARRAY['Zorbulon Needle Alias'], $1, $2)
+            """,
+            namespace,
+            org,
+        )
+        # VACUUM as well as ANALYZE, for the reason the keyword fixture gives:
+        # a freshly bulk-loaded GIN index still holds its pending list, and the
+        # planner charges a bitmap scan for reading it.
+        await conn.execute("VACUUM ANALYZE entities")
+    return org, namespace
+
+
+async def _plan(conn: asyncpg.Connection, sql: str, *args: object) -> str:
+    rows = await conn.fetch(
+        f"EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF) {sql}", *args
+    )
+    return "\n".join(row[0] for row in rows)
+
+
+async def _plan_as_app(
+    conn: asyncpg.Connection, org: uuid.UUID, sql: str, *args: object
+) -> str:
+    """The plan the application role gets, with the role change inside a
+    transaction: `SET LOCAL ROLE` outside one is scoped to asyncpg's implicit
+    single-statement transaction, and a test that measured the owner twice
+    would pass whatever the planner did."""
+    async with conn.transaction():
+        await conn.execute("SET LOCAL ROLE pgkg_app")
+        await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(org))
+        role = await conn.fetchval("SELECT current_user")
+        plan = await _plan(conn, sql, *args)
+    assert role == "pgkg_app", "the role never changed, so nothing was measured"
+    assert "pgkg.org_id" in plan, (
+        f"the policy is not in the plan, so it was not in force:\n{plan}"
+    )
+    return plan
+
+
+@pytest.mark.parametrize("arm", sorted(ARM_SQL))
+async def test_the_policy_does_not_cost_the_gazetteer_its_indexes(
+    pool: asyncpg.Pool, gazetteer_corpus, arm: str
+) -> None:
+    """A qual whose function is not leakproof may not become an index
+    condition on a table with a policy, so each of the three gazetteer arms
+    was demoted to a filter over the whole entity table under pgkg_app while
+    the owner got the index.  This is the ingest hot path: the matcher runs
+    per chunk and probes once per candidate phrase.
+    """
+    org, _ = gazetteer_corpus
+    index = ARM_INDEX[arm]
+    async with pool.acquire() as conn:
+        as_owner = await _plan(conn, ARM_SQL[arm], org, ARM_PHRASE[arm])
+        as_app = await _plan_as_app(conn, org, ARM_SQL[arm], org, ARM_PHRASE[arm])
+
+    assert index in as_owner, (
+        f"the {arm} arm does not reach {index} even as owner, so the "
+        f"comparison below would be vacuous:\n{as_owner}"
+    )
+    assert index in as_app, (
+        f"under the application role the {arm} arm cannot reach {index} and "
+        f"falls back to a sequential scan of every entity:\n{as_app}"
+    )
+    assert "Seq Scan on entities" not in as_app, (
+        f"the {arm} arm still scans the whole entity table under the "
+        f"application role:\n{as_app}"
+    )
+
+
+@pytest.mark.parametrize("arm", sorted(ARM_OPERATOR))
+async def test_unmarking_the_operator_returns_the_arm_to_a_sequential_scan(
+    pool: asyncpg.Pool, gazetteer_corpus, arm: str
+) -> None:
+    """The marking is what buys the plan, and this is the probe that proves it:
+    with the operator's function unmarked the same arm reverts to a sequential
+    scan under the role, and marking it again restores the index.  Without
+    this a test asserting the index could be passing for any other reason.
+    """
+    org, _ = gazetteer_corpus
+    function = ARM_OPERATOR[arm]
+    index = ARM_INDEX[arm]
+    async with pool.acquire() as conn:
+        await conn.execute(f"ALTER FUNCTION {function} NOT LEAKPROOF")
+        try:
+            unmarked = await _plan_as_app(
+                conn, org, ARM_SQL[arm], org, ARM_PHRASE[arm]
+            )
+        finally:
+            await conn.execute(f"ALTER FUNCTION {function} LEAKPROOF")
+        restored = await _plan_as_app(conn, org, ARM_SQL[arm], org, ARM_PHRASE[arm])
+
+    assert index not in unmarked, (
+        f"the {arm} arm reached {index} with {function} not leakproof, so the "
+        f"marking is not what the other test is measuring:\n{unmarked}"
+    )
+    assert "Seq Scan on entities" in unmarked, (
+        f"unmarking {function} did not put the {arm} arm back on a sequential "
+        f"scan:\n{unmarked}"
+    )
+    assert index in restored, (
+        f"re-marking {function} leakproof did not restore the index:\n{restored}"
+    )
+
+
+async def test_the_gazetteer_key_is_a_stored_column_and_not_a_leakproof_claim(
+    pool: asyncpg.Pool, gazetteer_corpus
+) -> None:
+    """Why the name and alias arms read columns rather than calling the
+    normaliser.  A leakproof marking on pgkg_gazetteer_key() would buy
+    nothing — the planner inlines a SQL function's body before it judges the
+    qual, and the body is lower/regexp_replace/btrim, none of them leakproof —
+    so the arm would need those three marked instead, which is a far wider
+    claim than this schema needs.  The stored column moves the normalisation to
+    write time and leaves the qual an equality on text, which is leakproof
+    already.
+    """
+    org, _ = gazetteer_corpus
+    as_expression = """
+        SELECT count(*)
+        FROM (VALUES ($1::uuid, $2::text)) AS u(org_id, phrase)
+        JOIN entities e
+          ON e.org_id = u.org_id
+         AND pgkg_gazetteer_key(e.name) = u.phrase
+    """
+    async with pool.acquire() as conn:
+        claimed = {
+            row["proname"]: row["proleakproof"]
+            for row in await conn.fetch(
+                "SELECT proname, proleakproof FROM pg_proc"
+                " WHERE proname = ANY($1::text[])",
+                ["pgkg_gazetteer_key", "pgkg_gazetteer_keys"],
+            )
+        }
+        expression_plan = await _plan_as_app(
+            conn, org, as_expression, org, ARM_PHRASE["name"]
+        )
+        column_plan = await _plan_as_app(
+            conn, org, ARM_SQL["name"], org, ARM_PHRASE["name"]
+        )
+
+    assert claimed and not any(claimed.values()), (
+        f"a gazetteer normaliser is marked leakproof: {claimed}. The claim "
+        "cannot be honoured — the body is inlined before the qual is judged — "
+        "and it would outlive any review of what the body does."
+    )
+    assert "Seq Scan on entities" in expression_plan, (
+        "the expression form of the name arm no longer needs the stored "
+        f"column, so this test has stopped explaining anything:\n"
+        f"{expression_plan}"
+    )
+    assert ARM_INDEX["name"] in column_plan, (
+        "the stored column is what makes the name arm's qual promotable:\n"
+        f"{column_plan}"
+    )
+
+
+async def test_the_stored_gazetteer_keys_agree_with_the_normaliser(
+    pool: asyncpg.Pool, gazetteer_corpus
+) -> None:
+    """A stored key is only a valid substitute for the call if it says the same
+    thing, so the two are compared over every seeded entity rather than on one
+    row: the column is the function's answer for that row, maintained by the
+    database and unable to drift.
+    """
+    org, namespace = gazetteer_corpus
+    async with pool.acquire() as conn:
+        disagreements = await conn.fetchval(
+            """
+            SELECT count(*) FROM entities e
+            WHERE e.namespace = $1
+              AND (e.gazetteer_name_key
+                       IS DISTINCT FROM pgkg_gazetteer_key(e.name)
+                OR e.gazetteer_alias_keys
+                       IS DISTINCT FROM pgkg_gazetteer_keys(e.aliases))
+            """,
+            namespace,
+        )
+        seeded = await conn.fetchval(
+            "SELECT count(*) FROM entities WHERE namespace = $1", namespace
+        )
+
+    assert seeded == 40001, f"the fixture seeded {seeded} entities"
+    assert disagreements == 0, (
+        f"{disagreements} entities carry a stored gazetteer key that differs "
+        "from what the normaliser returns for that row"
+    )
+
+
+async def test_the_matcher_probes_the_stored_keys(pool: asyncpg.Pool) -> None:
+    """And the arm that no test can reach through a plan: the matcher's own
+    body has to name the columns, or the indexes above are reachable by a
+    query nobody runs.
+    """
+    async with pool.acquire() as conn:
+        body = await conn.fetchval(
+            "SELECT prosrc FROM pg_proc WHERE proname = $1",
+            "pgkg_match_entity_mentions",
+        )
+
+    assert "gazetteer_name_key" in body and "gazetteer_alias_keys" in body, (
+        "pgkg_match_entity_mentions() does not probe the stored gazetteer "
+        "keys, so its quals are still the non-promotable expression form"
+    )
+    assert "pgkg_gazetteer_key(e.name)" not in body, (
+        "pgkg_match_entity_mentions() still normalises the entity's name per "
+        "row, which is the qual the policy demotes to a filter"
+    )
 async def test_the_application_role_can_still_maintain_the_statistics(
     pool: asyncpg.Pool,
 ) -> None:
