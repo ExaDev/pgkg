@@ -85,7 +85,11 @@ async def test_api_shutdown_flushes_pending_access_counts(
     class _Settings:
         database_url = "unused"
         default_namespace = namespace
-        extract_propositions = False
+        # The extraction path: access counts live on propositions and nowhere
+        # else — a passage has no frequency term in its decay profile — so the
+        # accounting this test is about only exists in this mode.  Chunks-only
+        # mode writes into the chunk store now (ADR 0001, D1).
+        extract_propositions = True
 
     async def _make_pool(dsn):
         return _SharedPool(pool)
@@ -119,7 +123,7 @@ async def test_cli_recall_flushes_pending_access_counts(
     monkeypatch.setattr(ml, "rerank", lambda query, docs: [1.0] * len(docs))
 
     namespace = _ns("cli")
-    await Memory(pool, namespace=namespace, extract_propositions=False).ingest(_TEXT)
+    await Memory(pool, namespace=namespace).ingest(_TEXT)
 
     @asynccontextmanager
     async def _pool_from_settings():
@@ -127,7 +131,7 @@ async def test_cli_recall_flushes_pending_access_counts(
 
     class _Settings:
         default_namespace = namespace
-        extract_propositions = False
+        extract_propositions = True
 
     monkeypatch.setattr(db, "pool_from_settings", _pool_from_settings)
     monkeypatch.setattr("pgkg.config.get_settings", lambda: _Settings())
@@ -168,7 +172,7 @@ async def test_bench_run_flushes_pending_access_counts(
         with_rerank=False,
         with_mmr=False,
         expand_graph=False,
-        extract_propositions=False,
+        extract_propositions=True,
         output_path=tmp_path,
     )
 

@@ -233,6 +233,11 @@ class _PendingChunk:
     text: str
     span_start: int
     span_end: int
+    ordinal: int = 0
+    # Set by the chunks-only planner and by nobody else: in that mode the chunk
+    # is the retrievable row, so it carries the vector the extracted mode puts
+    # on a proposition (ADR 0001, D1).
+    embedding: HalfVector | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +337,56 @@ INSERT INTO proposition_provenance (proposition_id, provenance_id)
 SELECT id, provenance_id FROM inserted
 ON CONFLICT DO NOTHING
 """
+
+# The chunks-only path, which writes into the chunk store instead (ADR 0001,
+# D1 and phase 2).  It is the corpus pipeline's write phase over a chat turn:
+# one document, one version, its passages added through the function that holds
+# the content addresses, then the flip.
+#
+# ONE DERIVATION RECORD PER VERSION, not per chunk.  A content-addressed passage
+# is shared by every version carrying it, so it cannot record which ingest
+# produced it — the version can, and pgkg_add_version_chunk() reads it from
+# there.  The locator carries no span for the same reason: a shared row has no
+# one offset into no one text.
+_INSERT_VERSION_PROVENANCE_SQL = """
+INSERT INTO provenance
+    (org_id, kind, source_id, source_locator, producer, producer_model,
+     prompt_version, ingest_run_id, actor_user_id, source_url, publisher,
+     published_at, retrieved_at, licence, source_authority)
+VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+RETURNING id
+"""
+
+# The version hash is digested in SQL rather than in Python so that the one
+# statement of what a version hash is stays the one the database applies.
+_OPEN_VERSION_SQL = """
+SELECT version_id
+FROM pgkg_open_document_version($1, digest($2, 'sha256'), $3)
+"""
+
+# Every passage of the turn in one round trip, the shape corpus ingest uses: a
+# loop over this function is one network round trip per chunk with the ingest
+# transaction held open.
+_ADD_VERSION_CHUNKS_SQL = """
+SELECT t.n, added.chunk_id, added.is_new
+FROM unnest($2::int[], $3::text[]) WITH ORDINALITY AS t(ord, chunk_text, n)
+CROSS JOIN LATERAL
+    pgkg_add_version_chunk($1, t.ord, t.chunk_text, $4, $5, $6, $7) AS added
+ORDER BY t.n
+"""
+
+# The immutability trigger fires on text and org only, so writing the vector of
+# a chunk the database just created is not a rewrite of its content.  Only the
+# rows it created: a reused passage already holds the vector for its content,
+# and its content cannot have changed — that is what its address means.
+_WRITE_CHUNK_EMBEDDINGS_SQL = """
+UPDATE chunks c
+SET embedding = e.embedding
+FROM unnest($1::uuid[], $2::halfvec[]) AS e(id, embedding)
+WHERE c.id = e.id
+"""
+
+_PROMOTE_VERSION_SQL = "SELECT pgkg_promote_document_version($1)"
 
 _INSERT_EDGES_SQL = """
 INSERT INTO edges (src_entity, dst_entity, relation, proposition_id)
@@ -655,6 +710,7 @@ class Memory:
                 text=chunk.text,
                 span_start=chunk.span_start,
                 span_end=chunk.span_end,
+                ordinal=chunk.ordinal,
             )
             for chunk in chunk_document(text, max_chars=chunk_size)
         )
@@ -672,6 +728,8 @@ class Memory:
         asserted = (
             asserted_at if asserted_at is not None else resolved.published_at
         )
+        if not self._extract_propositions:
+            return await self._write_chunk_store(plan, text, source, asserted, resolved)
         return await self._write(plan, source, session_id, asserted, resolved)
 
     def _resolve(self, provenance: Provenance | None) -> Provenance:
@@ -820,26 +878,159 @@ class Memory:
         )
 
     def _plan_chunks_only(self, chunks: tuple[_PendingChunk, ...]) -> _IngestPlan:
-        """Chunks-only mode: embed each chunk directly, no LLM extraction, no
-        entity linking, no edge creation."""
+        """Chunks-only mode: the passage is the retrievable row.
+
+        So the vector goes on the chunk, and the plan carries no propositions,
+        no entities and no edges at all.  It used to carry one proposition per
+        chunk with a NULL subject, predicate and object — the hack D1 lists
+        under what not to build and tells us to undo: a 600-token passage
+        BM25 length-normalised against 12-token facts, on a chat fact's
+        lifecycle, under a chat fact's index.
+        """
         embeddings = ml.embed([chunk.text for chunk in chunks])
         return _IngestPlan(
-            chunks=chunks,
-            entities=(),
-            propositions=tuple(
-                _PendingProposition(
-                    id=uuid.uuid4(),
-                    text=chunk.text,
-                    embedding=HalfVector(embedding),
-                    chunk_id=chunk.id,
-                    predicate=None,
-                    subject_name=None,
-                    object_name=None,
-                    object_literal=None,
-                    metadata='{"mode": "chunk"}',
-                )
+            chunks=tuple(
+                replace(chunk, embedding=HalfVector(embedding))
                 for chunk, embedding in zip(chunks, embeddings)
             ),
+            entities=(),
+            propositions=(),
+        )
+
+    async def _write_chunk_store(
+        self,
+        plan: _IngestPlan,
+        text: str,
+        source: str | None,
+        asserted_at: datetime | None,
+        provenance: Provenance,
+    ) -> IngestResult:
+        """Land a chunks-only ingest in the chunk store, through the lifecycle.
+
+        The same ordered sequence D6 gives the corpus, because it is the same
+        write: a document, a version opened against the hash of the whole turn,
+        its passages added through the function that owns the content addresses,
+        the vectors of the passages that function created, then the flip.  One
+        transaction, so retrieval never sees a version whose passages are only
+        half embedded.
+
+        Nothing here calls a model.  The embedder already ran, in the planner,
+        outside this connection — a chat turn is small, but the rule that keeps
+        the pool free under concurrent ingest does not care how small.
+        """
+        doc_id = uuid.uuid4()
+        async with self._connection() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    _INSERT_DOCUMENT_SQL,
+                    doc_id,
+                    source,
+                    self._namespace,
+                    self._scope.write_org_id,
+                    self._scope.write_collection_id,
+                )
+                provenance_id = await self._write_version_provenance(
+                    conn, provenance, source
+                )
+                version_id = await conn.fetchval(
+                    _OPEN_VERSION_SQL, doc_id, text, provenance_id
+                )
+                added = await self._add_version_chunks(
+                    conn, version_id, plan.chunks, asserted_at
+                )
+                await self._write_chunk_embeddings(conn, added)
+                await conn.execute(_PROMOTE_VERSION_SQL, version_id)
+
+        return IngestResult(
+            documents=1,
+            chunks=len(plan.chunks),
+            propositions=0,
+            entities=0,
+            ingest_run_id=provenance.ingest_run_id,
+            provenance_ids=(provenance_id,),
+        )
+
+    async def _write_version_provenance(
+        self,
+        conn: asyncpg.Connection,
+        provenance: Provenance,
+        source: str | None,
+    ) -> UUID:
+        return await conn.fetchval(
+            _INSERT_VERSION_PROVENANCE_SQL,
+            self._scope.write_org_id,
+            provenance.kind,
+            provenance.source_id,
+            json.dumps({"source": source}),
+            provenance.producer,
+            provenance.producer_model,
+            provenance.prompt_version,
+            provenance.ingest_run_id,
+            provenance.actor_user_id,
+            provenance.source_url,
+            provenance.publisher,
+            provenance.published_at,
+            provenance.retrieved_at,
+            provenance.licence,
+            provenance.source_authority,
+        )
+
+    async def _add_version_chunks(
+        self,
+        conn: asyncpg.Connection,
+        version_id: UUID,
+        chunks: tuple[_PendingChunk, ...],
+        asserted_at: datetime | None,
+    ) -> list[tuple[_PendingChunk, UUID, bool]]:
+        """Which row each passage landed on, and which of them are new.
+
+        The database decides, not this process: it holds the content addresses,
+        and a look-then-insert from here would race a second ingest of the same
+        text.  The scope travels with the call because it is part of the address
+        — a passage is reused only by a writer that agrees about who may read it.
+
+        Paired back by the ordinality the statement returns rather than by row
+        order, so nothing here depends on how the lateral join is executed.
+        """
+        if not chunks:
+            return []
+        rows = await conn.fetch(
+            _ADD_VERSION_CHUNKS_SQL,
+            version_id,
+            [chunk.ordinal for chunk in chunks],
+            [chunk.text for chunk in chunks],
+            self._scope.acl_group_id,
+            asserted_at,
+            self._scope.visibility,
+            self._scope.owner_user_id,
+        )
+        return [
+            (chunks[row["n"] - 1], row["chunk_id"], row["is_new"]) for row in rows
+        ]
+
+    async def _write_chunk_embeddings(
+        self,
+        conn: asyncpg.Connection,
+        added: list[tuple[_PendingChunk, UUID, bool]],
+    ) -> None:
+        """A vector for every passage the database created, and for no other.
+
+        A reused passage already holds the vector for its content, and its
+        content cannot have changed — that is what its address means.  Keyed by
+        the row rather than by the position, because a turn that repeats a
+        paragraph holds two positions on one row.
+        """
+        vectored = {
+            chunk_id: chunk.embedding
+            for chunk, chunk_id, is_new in added
+            if is_new and chunk.embedding is not None
+        }
+        if not vectored:
+            return
+        await conn.execute(
+            _WRITE_CHUNK_EMBEDDINGS_SQL,
+            list(vectored),
+            list(vectored.values()),
         )
 
     async def _write_provenance(

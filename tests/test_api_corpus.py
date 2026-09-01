@@ -131,7 +131,10 @@ async def _api(pool: asyncpg.Pool, namespace: str, monkeypatch):
     class _Settings:
         database_url = "unused"
         default_namespace = namespace
-        extract_propositions = False
+        # The extraction path: the quota tests below need /memorize to produce
+        # personal memory, and chunks-only mode produces corpus passages now
+        # (ADR 0001, D1).  The offline extractor keeps this a no-LLM fixture.
+        extract_propositions = True
 
     async def _make_pool(dsn):
         return _SharedPool(pool)
