@@ -9,3 +9,4 @@ never editing history.
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-corpus-embeddings-and-knowledge-graph.md) | Corpus embeddings alongside the proposition knowledge graph | Accepted |
+| [0001-findings](0001-verification-findings.md) | Adversarial verification of the phases 0-3 implementation | Open |
