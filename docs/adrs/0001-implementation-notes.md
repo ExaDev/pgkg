@@ -145,6 +145,34 @@ Two things this process taught that generalise:
 
 ---
 
+### D2's mention payoff is built, wired, and unreachable through `recall()`
+
+The mention edge exists end to end: `pgkg maintain --task mentions` populates `entity_mentions`,
+and `pgkg_graph_candidates` emits the document a chat fact's entity points at. What D2 actually
+promises — that the document comes back *for a query whose wording matches it not at all* — does
+not happen at any corpus size, and the measurement is recorded here so it does not have to be
+retaken. Issue #21 carries the decision.
+
+Two independent effects meet. Above roughly 38 competing passages, a graph candidate scores
+`w_graph (0.5) × MIN(seed fused score)` — 010's `pgkg_fuse`, the neighbour floor 043 names — so it
+sits below every keyword and vector candidate by construction, and `pgkg_apply_quotas` keeps only
+`floor(k_rerank × corpus_fraction)` = 38 corpus items, cutting it before the cross-encoder that is
+the one stage able to promote it on merit. Below that size the passage is inside the arms' own
+`k_initial = 200` list, which makes it a *seed*, and 043's `per_seed` branch excludes seeds from
+expansion. Measured: byte-identical `recall()` output with the mention rows present and deleted at
+11 items; absent entirely at 310; present only once `k_rerank` reaches 1000, the point at which
+the quota stops cutting at all.
+
+**The test that appears to cover this cannot.**
+`tests/test_entity_mentions.py::test_a_chat_fact_pulls_in_the_document_that_defines_what_it_names`
+passes, and its docstring claims "D2, end to end, over the real ingest pipelines". It calls
+`pgkg_retrieve` with `q_text` and no `q_embedding`, so the vector arm returns nothing, the chunk
+is never a candidate, and it is therefore never a seed — the one geometry where a graph candidate
+survives, and not the one `Memory.recall` runs at, since it always passes an embedding. The test
+is correct about the SQL mechanism and says less than a reader assumes. This is the second time a
+test has passed for a reason unrelated to the property it names (see §2 on the eight unobservable
+RLS policies); both were found by asking what the test does when the thing it guards is removed.
+
 ## 3. Conscious deviations from the ADR
 
 Every item here is a place where the implementation does not do what the ADR says, on purpose.
