@@ -208,6 +208,35 @@ def cmd_worker(args: argparse.Namespace) -> None:
     asyncio.run(run_worker(args))
 
 
+async def run_maintain(args: argparse.Namespace) -> None:
+    """Run this org's scheduled jobs and print what each one did.
+
+    The crontab entry, and the only thing that makes `entity_mentions` non-empty
+    in normal operation (ADR 0001, D2; issue #19).  Safe to overlap itself: a
+    task another run holds is declined, and says so in the report.
+    """
+    from pgkg.db import pool_from_settings
+    from pgkg.maintenance import Maintenance
+
+    scope = _scope(args)
+    async with pool_from_settings() as pool:
+        maintenance = Maintenance(
+            pool,
+            org_id=scope.org_id,
+            namespace=args.namespace,
+            batch=args.batch,
+            max_batches=args.max_batches,
+            iterations=args.iterations,
+            damping=args.damping,
+        )
+        report = await maintenance.run(tasks=args.task)
+    print(json.dumps(report.as_dict()))
+
+
+def cmd_maintain(args: argparse.Namespace) -> None:
+    asyncio.run(run_maintain(args))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pgkg", description="pgkg knowledge graph CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -265,6 +294,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_scope_flags(worker_parser)
 
+    # The scheduled path.  One command for four jobs, because what an operator
+    # installs is a crontab line and four of them is three chances to forget
+    # one; every task individually selectable, because they belong on different
+    # intervals (pgkg/maintenance.py).
+    from pgkg.maintenance import (
+        DEFAULT_BATCH,
+        DEFAULT_DAMPING,
+        DEFAULT_ITERATIONS,
+        DEFAULT_MAX_BATCHES,
+        TASKS,
+    )
+
+    maintain_parser = subparsers.add_parser(
+        "maintain",
+        help="Run the scheduled jobs: mention sweep, pagerank, contradictions, "
+             "expiries",
+        description=(
+            "Safe to run on a timer and safe to overlap itself: a task another "
+            "run is already doing is declined rather than repeated, and the "
+            "report says which."
+        ),
+    )
+    maintain_parser.add_argument(
+        "--task",
+        action="append",
+        choices=list(TASKS),
+        default=[],
+        help="Run only this task; repeatable. Default: every task.",
+    )
+    maintain_parser.add_argument(
+        "--batch",
+        type=int,
+        default=DEFAULT_BATCH,
+        help="Rows per batch for the sweeps that drain a backlog",
+    )
+    maintain_parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=DEFAULT_MAX_BATCHES,
+        help=(
+            "Batches per sweep direction before the run declares the watermark "
+            "stalled and fails"
+        ),
+    )
+    maintain_parser.add_argument(
+        "--namespace",
+        default=None,
+        help=(
+            "Restrict to one namespace (default: every namespace this org has "
+            "entities in)"
+        ),
+    )
+    maintain_parser.add_argument(
+        "--iterations",
+        type=int,
+        default=DEFAULT_ITERATIONS,
+        help="PageRank power iterations",
+    )
+    maintain_parser.add_argument(
+        "--damping", type=float, default=DEFAULT_DAMPING, help="PageRank damping"
+    )
+    _add_scope_flags(maintain_parser)
+
     return parser
 
 
@@ -283,6 +375,8 @@ def main() -> None:
         cmd_recall(args)
     elif args.command == "worker":
         cmd_worker(args)
+    elif args.command == "maintain":
+        cmd_maintain(args)
 
 
 if __name__ == "__main__":

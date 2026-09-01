@@ -15,9 +15,12 @@ Companion documents:
   adversarial verifiers found in phases 0–3, each with its reproduction and the commit that closed
   it, plus the re-verification pass that audited the fixes.
 
-**State at the time of writing.** Phases 0–3 complete, migrations 001–049, 567 tests green.
+**State at the time of writing.** Phases 0–3 complete, migrations 001–053, 630 tests green.
 Phase 2's last outstanding item — chunks-only ingest writing into the chunk store rather than
-faking proposition rows — landed in 049; see §3.
+faking proposition rows — landed in 049; see §3. Four defects found after phase 3 are closed in
+051–053 and `pgkg/corpus.py`; see the second fix-pass table in §1. **Migration 050 does not
+exist**: the number was assigned to the fix that turned out to need no DDL, and the gap is
+deliberate rather than a lost file.
 Run them with:
 
 ```bash
@@ -93,6 +96,18 @@ The headers are the primary documentation for the SQL; this table is the index i
 | `044_queue_provenance_and_two_keys.sql` | `documents_external_id_key` partial on `deleted_at IS NULL`; `proposition_cache` keyed `(cache_key, org_id)`; provenance carried through the ingest queue |
 | `045_link_table_writes.sql` | The link table's write side is own-org on both sides; the missing `UPDATE` reconciliation; liveness stops being a function of `refcount` |
 | `047_gazetteer_under_row_security.sql` | The same non-leakproof-qual mechanism on `entities`: `similarity_op` and `arraycontains` marked `LEAKPROOF`, and the gazetteer keys stored as generated columns so the name and alias arms compare columns instead of calling the normaliser |
+
+### The second fix pass — four defects found after phase 3
+
+Found by re-reading the shipped tree rather than by a verifier, and fixed in parallel on disjoint
+file ownership like the first pass. Each entry is one issue.
+
+| Issue | Where it landed | What it fixes |
+|---|---|---|
+| **#16 — a passage in two collections lost its vector** | `pgkg/corpus.py` | The reuse lookup restated the content address instead of reading it, and had drifted from it twice (042 added three columns, 049 added two). It answered "already stored and vectored" about a row at another address; the write phase then correctly created a new row and the vector write skipped it, and no later crawl revisits it because the document hash short-circuits first. The lookup is now generated from the unique index that enforces the address, and the residual race — phase 2 saw a row phase 3 did not — is paid for after the transaction instead of stranding the chunk. No DDL was needed. |
+| **#17 — entity dedup read every name** | `051_entity_dedup_reaches_the_trigram_index.sql` | `pgkg_link_entity()` stage 2 generated its candidates with `similarity(name, p_name) > 0.6`, a function call over a column that no index can serve, so every near-duplicate check was a sequential scan of `entities` — for the owner as well as for `pgkg_app`, which is what makes it a different defect from the one 047 fixed. It now generates with `name % p_name` against `entities_name_trgm_idx`. Measured on 40,001 names in one org: 78.4 ms and 949 buffers becomes 0.65 ms and 70. |
+| **#18 — retrievability was inferred from parentage** | `052_retrievability_stops_being_a_property_of_parentage.sql` | Liveness and the content address's partial predicate both read `chunks.document_id` to mean "this row is not retrievable content", which is not a fact about parentage at all. Both now read `chunks.provenance_only`, which the writer states. The column itself survives as the record of which document a chat-provenance chunk came out of, and 052 records what removing it still costs; see §3. |
+| **#19 — nothing ran the gazetteer** | `053_scheduling_what_was_already_built.sql`, `pgkg/maintenance.py`, `pgkg maintain` | Four jobs existed in the schema, were tested, and were reachable only from a test or an operator's psql session. `entity_mentions` was therefore empty in every deployment, which is D2's corpus-to-graph edge missing entirely. One entry point now runs all four, each selectable and each guarded by an advisory lock per (task, org). 053 adds the name-side mention watermark, without which the reverse direction — a name created after the corpus was swept — could never meet the passages that predate it. |
 
 ---
 
@@ -190,7 +205,9 @@ so purging a retired version resurrected the passages its successor had dropped.
 
 Liveness is now `chunks.retrievable`, a stored column reconciled by trigger, derived from "carried
 by the current version of a live document, or belonging to no document and never carried by any
-version". The second clause needs a record the purge used to destroy, which is `chunks.version_scoped`.
+version". (052 keeps the shape and moves the second arm's guard off the parent pointer: it reads
+`NOT provenance_only`, in the position `document_id IS NULL` held. Same answer for every existing
+row — see the 052 entry below.) The second clause needs a record the purge used to destroy, which is `chunks.version_scoped`.
 `refcount` keeps its documented meaning — a count of `document_version_chunks` links, which is what
 the collector reads — and is out of the liveness predicate entirely.
 
@@ -332,7 +349,9 @@ a version that is never promoted — which is not what 030 means by `pending`. P
 path, to content-address rows no read predicate will ever reach is the pipeline conflation D7
 separates the two ingests to avoid. So the extraction path keeps `chunks.document_id`, the
 pre-lifecycle single-parent pointer, and keeps its per-chunk provenance locators — the span a
-citation names.
+citation names. (052 keeps the decision and removes the reason it needed the pointer: the path now
+states `provenance_only` itself, and the pointer is only the record of which document a passage came
+out of. See below.)
 
 ### The content address gains `visibility` and `owner_user_id` (049), and stays partial
 
@@ -358,6 +377,51 @@ paragraph would have to be one row, and that row can name only one parent. Widen
 therefore not a DROP and CREATE but the removal of `chunks.document_id`, which is a separate piece
 of work.
 
+### The claim above is wrong twice, and 052 corrects both halves
+
+**A total address is not the goal, and never was.** The right question is not "which columns key
+the address" but "which rows does content addressing govern", and the answer is: the rows that are
+retrievable content. A passage stored as provenance for the facts extracted from it must never be
+reused by another writer, and the extraction path repeats a paragraph as two rows on purpose — each
+carries its own span and its own per-chunk derivation record. So the address is *permanently*
+partial, and `WHERE document_id IS NULL` was only ever a proxy for the predicate that decides it.
+052 says it directly: `WHERE NOT provenance_only`. Over the rows it covers the address is total,
+which is what 030 was reaching for. Re-measured on top of 052: a genuinely total index — one that
+content-addresses provenance rows too — turns **22 tests red**, the same 19 plus the three that now
+pin the partial predicate on purpose. The number in the paragraph above is right; its conclusion is
+not.
+
+**Removing the column is also not what unblocks it.** Three things read `chunks.document_id`:
+liveness (045's `document_id IS NULL AND NOT version_scoped`), the address's partial predicate, and
+the join from a chat-provenance chunk back to the document it came out of. Only the third is about
+parentage. The first two are the same claim — "this row is not retrievable content" — and it is not
+a fact about parentage at all, so the answer is that a writer states it. `chunks.provenance_only` is
+that statement: an input, in the position `document_id IS NULL` held, guarding the standalone arm
+only, so a version that carries a passage still makes it retrievable and every existing row keeps
+the answer it had. After 052 nothing in the schema decides retrievability or membership of the
+address from the pointer.
+
+The column is still there, and dropping it is still separate work, but the reason is now only the
+third use. `chunks.document_id` is the only record of which document a chat-provenance chunk came
+out of, and eleven test modules read it as that join. Giving those chunks their parentage through
+`document_version_chunks` instead needs a `document_versions` row and a link per chat turn; it moves
+the extraction path's provenance from per-chunk to per-version (049's rule: a shared row cannot
+record which ingest produced it) and so gives up the span a citation names; and it makes every chat
+chunk carried by a version, which flips 041's proposition quota bucket —
+`EXISTS (document_version_chunks ...)` — from `memory` to `corpus` for every chat fact, restoring
+D1's drowning failure mode. That re-keying belongs with the retrieval statistics.
+
+One object still reads the pointer: `pgkg_chunks_provenance_bridge()`, a `BEFORE INSERT OR UPDATE`
+trigger that sets `provenance_only` on a row which names one document and states nothing. Migrations
+are forward-only and cannot reach the callers, so without it every writer that still states the
+pointer would produce retrievable content-addressed passages the moment the predicates moved.
+Measured by deleting the trigger: five tests across three modules assert that inference directly and
+two more collide on the address. It only ever sets TRUE, so it cannot overrule a writer
+that states its own answer, and its `WHEN` clause keeps every writer that has moved off the pointer
+out of the function. Retiring the direct writers, dropping the trigger and dropping the column is
+one mechanical change; it is also the prerequisite for making `provenance_only` an absolute veto,
+which is the stronger property the extraction path would need if it ever did move onto versions.
+
 **The bench harness now scopes each item to its own collection**, both arms. A namespace isolates
 propositions and nothing else — chunks carry no namespace, because D3 replaced stringly-typed
 scoping with columns — so without it every LoCoMo conversation's passages were candidates for every
@@ -377,11 +441,11 @@ still deferred, and this is what the seam actually looks like.
 |---|---|---|
 | **Partitioning by shard key** | `tenant_shards` table and `pgkg_tenant_shard()`; every retrievable row carries `org_id` | Convert `propositions` and `chunks` to partitioned tables on the shard key and rebuild the HNSW indexes per partition. D3 calls this a correctness matter, not just speed: a scoped vector search over one global HNSW index under-returns. The interim mitigation is `hnsw.iterative_scan`, set at connection startup by the pool. |
 | **Binary quantization with exact rescore** | `halfvec` storage everywhere, width read from the column by `pgkg_embedding_dim()`, `embedder_generations.storage_type` names the representation | Add a binary index and a two-stage retrieve-then-rescore arm. The ADR's ~14× index saving is the motivation; the decision needs real tenant sizes. |
-| **Consolidation and contradiction jobs** | `pgkg_contradict()` and `pgkg_expire_due()` exist and are tested; `invalidated_at`, `valid_from`, `valid_to` and `invalidation_reason` are all populated | Schedule them, partitioned by claim scope. Nothing runs them today — they are called by tests and by an operator, not by a job. |
+| **Consolidation and contradiction jobs** | **Scheduled** since 053: `pgkg maintain` runs the mention sweep, PageRank, `pgkg_contradict_superseded()` and `pgkg_expire_due()`, each selectable and overlap-safe | What is left is the part that needs a vocabulary: the ADR's "same subject and predicate, different object" rule is undecidable over free-text predicates without a `predicates` table carrying `is_functional`, so the scheduled rule closes the contradiction someone already asserted rather than inferring one. Also unbuilt: a tenant loop — a run names one org (§6). |
 | **The predicate vocabulary and `corroborations`** | `propositions.predicate` is free text; `edges.relation` likewise | Both tables named in the ADR are absent. The ADR's rule — record agreement, never collapse it across claim scopes — has nothing to record it in yet. |
 | **Summaries as a source class** | `pgkg_retrieve()` takes `p_sources TEXT[]`, and `pgkg_item_scope()`/`pgkg_apply_quotas()` bucket by kind | A third source class plus its own arm and quota bucket. The two-store plumbing generalises to three; the quota shape does not, since the ceiling is currently a single corpus fraction. |
 | **Cold tiering for old sessions** | Nothing | Not started. |
-| **Physical GC and index rebuild schedule** | `pgkg_purge_retired_versions()`, `pgkg_gc_chunks()`, `pgkg_erase_provenance()`, `pgkg_retract_ingest_run()` all exist with per-org limits | Schedule them. See the sharp edge in §6 about orphans a purge leaves behind. |
+| **Physical GC and index rebuild schedule** | `pgkg_purge_retired_versions()`, `pgkg_gc_chunks()`, `pgkg_erase_provenance()`, `pgkg_retract_ingest_run()` all exist with per-org limits, and `pgkg maintain` is now the shape a scheduled job takes | Deliberately *not* added to `pgkg maintain` in 053: these four delete rows where the other four withdraw them, and a destructive job behind the same one-line crontab entry as four idempotent ones needs its own decision. See the sharp edge in §6 about orphans a purge leaves behind. |
 | **First live embedder cutover end-to-end** | The whole D8 registry: `embedder_generations`, `org_embedders`, one primary per org, `pgkg_live_generations()`, `pgkg_create_generation_storage()`, the dual-generation vector arm, and the primary-generation restriction on the main arm | Rehearse it on a staging tenant. No cutover has ever been run; the protocol is tested step by step but not as a sequence. |
 | **Web-source ingest hygiene** | Nothing | Phase 3's ADR text puts HTML extraction, boilerplate stripping and syndication dedup here. None of it exists — `CorpusIngest` takes text. Relevant the moment a connector points at the open web. |
 | **Document ACLs, end to end** | Both halves. `acl_group_id` on `chunks` and `propositions`, read by `pgkg_visible()` and part of the content address; written by `CorpusIngest.upsert_document(acl_group_id=...)`, the `/documents` field, and the queue; `048`'s triggers refuse an untagged row in a collection whose `acl_mode` is not `none` | A permissions source to synchronise groups from: nothing populates a group automatically, so a connector states it or the ACL-bounded collection refuses the document. Also unbuilt: re-grouping content already ingested — the document hash short-circuits an unchanged crawl, so a document does not change group by being offered again. |
@@ -414,6 +478,37 @@ Things that will look wrong at first glance and are not.
 - **A worker draining several orgs sets the job's org on every connection it uses.** Progress,
   finish and fail included, not just the claim — otherwise `pgkg_current_org()` falls back to the
   default org and the `ingest_jobs` policy cannot help.
+- **The corpus reuse lookup is generated from the index, not written beside it.** `pgkg/corpus.py`
+  reads the content address out of `chunks_content_addressed_key` — key columns, key *expressions*,
+  and the partial predicate — and builds the "already stored and vectored?" statement from it. The
+  address is stated once, by the object that enforces it, because `pgkg_add_version_chunk()`'s
+  `ON CONFLICT` names that same index; a copy of it in Python drifted twice and cost a defect each
+  time (#16). A column in the address the pipeline states no value for stops the ingest by name,
+  before it spends anything, rather than guessing.
+- **The comparison for each key comes from the key expression, not from the column's nullability.**
+  042 wraps the two nullable axes in `COALESCE`, so a bare `owner_user_id IS NOT DISTINCT FROM $n`
+  cannot be matched to the key however cheap it looks, and the address would stop being
+  index-usable at the third of its six columns. The lookup is also driven one probe per hash
+  through a `LATERAL`, because a trailing `= ANY(...)` is not an index condition and the hash is
+  the last key and the only selective one. Measured on 30,000 passages in one collection: 2,096
+  buffers as a sequential scan, 30,688 as the index prefix with the hash filtered, 6 as one probe
+  per hash.
+- **`pgkg_link_entity()` pins its own trigram threshold in `proconfig`.** `SET
+  pg_trgm.similarity_threshold = 0.6` on the function, not `set_limit()` and not `SET LOCAL` in the
+  body: Postgres saves and restores it around each call, so the caller cannot narrow entity dedup
+  by raising the threshold and the function cannot leave the caller's `%` redefined — the
+  gazetteer's fuzzy arm included. The `similarity(name, p_name) > 0.6` recheck is kept behind the
+  operator although it is provably redundant (no `float4` widens to exactly 0.6), so that a later
+  migration that replaces the function and forgets the `SET` can only lose matches, never invent
+  merges.
+- **The gazetteer runs on a timer, not on the ingest path.** D7 rules out both online placements: a
+  corpus ingest must not hold a pooled connection across a cross-product against every name the org
+  knows, and a chat ingest must not match one new name against an unbounded corpus on the request
+  path. `pgkg maintain` drains both directions of the sweep instead, and both watermarks are what
+  make it re-runnable. An inline `match_chunks()` after a version is promoted was considered and
+  rejected: it is a latency optimisation, it is not what makes the edge exist, and a best-effort
+  call whose failures are swallowed on the hottest write path is a worse thing to own than a job
+  whose report says what it did.
 
 ---
 
@@ -445,6 +540,24 @@ Not defects with a fix pending — things a maintainer should know before being 
   that module's docstring.
 - **Two live embedder generations double query-embedding latency during a cutover window.** The
   ADR says so; it has never been measured, because no cutover has been run.
+- **A chunk whose post-transaction repair fails keeps `embedding IS NULL` for good.** When phase 2
+  sees a vectored row that phase 3 finds gone, `CorpusIngest` embeds the replacement after the
+  version is promoted (#16). If that embed or its write raises, the caller sees the failure — but
+  the document is already committed, so re-offering it short-circuits on the unchanged hash and the
+  passage is retrievable by the keyword arm only. The durable answer is a sweep over
+  `chunks WHERE retrievable AND embedding IS NULL`, which is a fifth maintenance task and a
+  decision about a scheduled job that spends money at the embedder; it is deliberately not in
+  `pgkg maintain`.
+- **`pgkg maintain` runs one org and has to be installed.** Nothing schedules it: a deployment with
+  no crontab entry still has an empty `entity_mentions`, which is the defect #19 closed the
+  mechanism for and not the operational habit. `Maintenance.for_org()` builds the per-tenant runner,
+  but iterating every tenant needs a tenant list and a fairness policy — the problem the ingest
+  queue's claim-and-lease design already solves for its own workload.
+- **`pgkg_chunks_provenance_bridge()` is the last reader of `chunks.document_id`.** A `BEFORE INSERT
+  OR UPDATE OF document_id` trigger that sets `provenance_only` on a row which names a document and
+  states nothing. It exists because a forward-only migration cannot reach the callers, it only ever
+  sets TRUE so it cannot overrule a writer that states its own answer, and it is what makes dropping
+  the column mechanical: retire the direct writers, drop the trigger, drop the column.
 
 ---
 

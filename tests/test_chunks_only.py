@@ -142,7 +142,8 @@ async def test_chunks_only_ingest_writes_retrievable_chunks(
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT text, embedding IS NOT NULL AS vectored, doc_len, retrievable,"
-            " document_id, content_hash IS NOT NULL AS addressed"
+            " document_id, provenance_only,"
+            " content_hash IS NOT NULL AS addressed"
             " FROM chunks WHERE org_id = $1",
             scope.org_id,
         )
@@ -153,6 +154,10 @@ async def test_chunks_only_ingest_writes_retrievable_chunks(
         assert row["doc_len"] > 0
         assert row["retrievable"] is True
         assert row["document_id"] is None
+        # Not withheld, and nobody had to say so: a passage added to a document
+        # version is retrievable content by construction, which is why 052's
+        # partial content address covers it (ADR 0001, D1, D6).
+        assert row["provenance_only"] is False
         assert row["addressed"] is True
 
 
@@ -365,6 +370,58 @@ async def test_two_users_private_passages_never_share_a_row(
 
     assert sorted(owners) == sorted([one, two])
     assert visibilities == ["private", "private"]
+
+
+async def test_a_passage_and_the_provenance_of_a_fact_are_never_one_row(
+    pool: asyncpg.Pool, monkeypatch
+) -> None:
+    """The two ingest modes can write the same sentence into one collection, and
+    the rows mean different things.
+
+    A chunks-only passage is retrievable content.  The extraction path's chunk
+    exists so the facts extracted from it can cite a span, and is not
+    retrievable (041); reusing one for the other would either publish provenance
+    or make a passage unreachable.  That is what keeps the content address
+    partial after 052 — a total index would make these one row — and it is now
+    said in the terms that decide it rather than through the parent pointer.
+    """
+    import pgkg.ml as ml_module
+    monkeypatch.setattr(ml_module, "embed", _fake_embed)
+
+    async def _no_propositions(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(
+        ml_module, "extract_propositions_async", _no_propositions
+    )
+
+    shared_text = "The refund window closes thirty days after delivery."
+    scope = await _fresh_scope(pool, "two_lanes")
+
+    passage = Memory(
+        pool, namespace=_unique("ns"), scope=scope, extract_propositions=False
+    )
+    await passage.ingest(shared_text)
+
+    provenance = Memory(
+        pool, namespace=_unique("ns"), scope=scope, extract_propositions=True
+    )
+    await provenance.ingest(shared_text)
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT provenance_only, retrievable, document_id IS NOT NULL AS parented"
+            " FROM chunks WHERE org_id = $1 AND text = $2"
+            " ORDER BY provenance_only",
+            scope.org_id,
+            shared_text,
+        )
+
+    assert len(rows) == 2
+    assert (rows[0]["provenance_only"], rows[0]["retrievable"]) == (False, True)
+    assert (rows[1]["provenance_only"], rows[1]["retrievable"]) == (True, False)
+    assert rows[0]["parented"] is False
+    assert rows[1]["parented"] is True
 
 
 # ---------------------------------------------------------------------------

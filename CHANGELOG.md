@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+Four defects found by re-reading the tree after phase 3, fixed on disjoint file ownership and
+integrated together. Migrations 051-053 (050 was reserved for a fix that needed no DDL; the gap is
+deliberate). Full reasoning in
+[`docs/adrs/0001-implementation-notes.md`](docs/adrs/0001-implementation-notes.md) §1.
+
+- **A passage held in two collections is now vectored in both.** The corpus reuse lookup restated
+  the content address in Python instead of reading it, and had drifted from it twice — so it
+  answered "already stored and vectored" about a row at another address, the write phase correctly
+  created a new row, and the vector write skipped it. Nothing revisited it: the next crawl
+  short-circuits on the unchanged document hash, so the passage was retrievable by the keyword arm
+  only, for good. The lookup is now generated from `chunks_content_addressed_key` itself — keys, key
+  expressions and partial predicate — so it cannot drift again, and a column added to the address
+  that the pipeline cannot name stops the ingest by name rather than quietly asking a broader
+  question. The remaining window (phase 2 saw a row phase 3 did not) is paid for after the
+  transaction instead of stranding the chunk. Also two orders of magnitude cheaper: measured on
+  30,000 passages in one collection, the lookup reads 6 buffers where the old shape read 2,096.
+- **`pgkg maintain`: the scheduled jobs have an entry point.** The gazetteer mention sweep,
+  PageRank, contradiction closing and expiry withdrawal all existed, were tested, and were reachable
+  only from a test or a psql session — so `entity_mentions` was empty in every deployment and graph
+  expansion had nothing to expand through. One command runs all four for one org, each task
+  individually selectable, each guarded by an advisory lock per (task, org) so an overlapping cron
+  run declines instead of repeating work. It prints a JSON report per task: `ran`, `scanned`,
+  `changed`. Migration 053 adds the name-side mention watermark the reverse direction needs — a name
+  created after a corpus was swept could otherwise never meet the passages that predate it — plus a
+  candidate rule for contradictions and an org argument on `pgkg_expire_due()`. See the README for a
+  sample crontab.
+- **Entity dedup reaches its index.** `pgkg_link_entity()` generated near-duplicate candidates with
+  `similarity(name, p_name) > 0.6`, a function call over a column that no index can serve, so every
+  new name was a sequential scan of `entities` — under the owner as well as under `pgkg_app`.
+  Candidates now come from `name % p_name` against `entities_name_trgm_idx`, with the threshold
+  pinned in the function's own `proconfig` so a caller can neither narrow entity dedup by raising it
+  nor have their own `%` redefined by calling. Measured on 40,001 names in one org: 78.4 ms and 949
+  buffers becomes 0.65 ms and 70.
+- **Retrievability is stated, not inferred from parentage.** Chunk liveness and the content
+  address's partial predicate both read `chunks.document_id` to mean "this row is provenance for
+  extracted facts, not retrievable content". That is not a fact about parentage, and it is what made
+  the content address unable to cover two documents sharing a paragraph. Both now read the new
+  `chunks.provenance_only`, which the writer states; every existing row keeps the answer it had. The
+  pointer survives only as the record of which document a chat-provenance chunk came out of, read by
+  one named bridge trigger — which is what makes eventually dropping it mechanical.
+
 ## 0.6.0
 
 ADR-0001 phases 0-3: the corpus becomes a first-class retrievable store alongside the proposition

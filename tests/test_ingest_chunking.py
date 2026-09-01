@@ -214,3 +214,53 @@ async def test_no_chunk_exceeds_the_requested_size(
 
     assert len(rows) > 1
     assert all(len(text) <= 400 for text, _, _ in rows)
+
+
+async def test_the_extraction_path_says_its_passages_are_provenance(
+    pool: asyncpg.Pool, embed_dim: int, monkeypatch
+) -> None:
+    """This path's chunks exist so the facts extracted from them can cite a
+    span, and are not retrievable content (041).
+
+    Until 052 the only way to say that was to point each one at one document,
+    which is what makes a total content address unrepresentable — two documents
+    sharing a paragraph would have to be one row that can name only one parent
+    (#18).  The writer says it now, and it says it in its own statement rather
+    than leaving 052's bridge to derive it from the pointer: the bridge is meant
+    to be retired, and a writer that leans on it stores a different row the day
+    it goes.
+    """
+    monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
+
+    namespace = _ns("provenance")
+    # With 052's bridge switched off, nothing derives the answer from the parent
+    # pointer, so what the rows say is what this writer said.  That is the
+    # difference the test is about: the bridge exists for writers a forward-only
+    # migration could not reach and is meant to be retired, and a writer leaning
+    # on it stores a different row the day it goes.
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE chunks DISABLE TRIGGER pgkg_chunks_provenance_bridge"
+        )
+    try:
+        await _ingest(pool, namespace, _document())
+    finally:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE chunks ENABLE TRIGGER pgkg_chunks_provenance_bridge"
+            )
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT c.provenance_only, c.retrievable
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE d.namespace = $1
+            """,
+            namespace,
+        )
+
+    assert len(rows) > 1
+    assert all(row["provenance_only"] for row in rows)
+    assert not any(row["retrievable"] for row in rows)

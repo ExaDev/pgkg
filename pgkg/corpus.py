@@ -28,9 +28,12 @@ slot that holds a connection while its reporter asks for a second one is a slot
 that cannot report at all.
 
 What makes that ordering safe is content addressing.  The spend phase asks
-which chunk texts are already stored under this org and already carry a vector
-of the primary generation; the write phase asks the database the same question
-again, authoritatively, through pgkg_add_version_chunk().  A concurrent crawl
+which chunk texts are already stored at the address this document writes at and
+already carry a vector of the primary generation; the write phase asks the
+database the same question again, authoritatively, through
+pgkg_add_version_chunk().  That is one question, so it is asked in one place:
+the address is read from the unique index that enforces it, because a copy of it
+written out beside the lookup has now drifted twice (#16).  A concurrent crawl
 that stores a passage in between can only cost us one redundant embedding of
 text that hashes to the row we then reuse — never a wrong vector, because a
 vector is only ever written against the content it was computed from.
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, fields
 from datetime import datetime
@@ -100,6 +104,111 @@ class _Generation:
     generation_id: UUID
 
 
+# The content address: the columns that decide whether two writers storing the
+# same text share one chunk row.  Stated once, by the unique index — the reuse
+# path's ON CONFLICT names that same index, so Postgres itself holds the writer
+# to it — and read from the catalogue here rather than restated.
+#
+# Restating it is what #16 was.  This lookup asked "already stored and
+# vectored?" keyed on (org_id, content_hash) while the address moved twice
+# underneath it: 042 added collection_id and acl_group_id, 049 added visibility
+# and owner_user_id.  A lookup broader than the address answers yes for a row
+# that does not exist, the write phase then correctly creates that row, and
+# _write_vectors() skips it — leaving a passage with embedding IS NULL that no
+# later crawl revisits, because the document hash short-circuits first.
+CONTENT_ADDRESS_INDEX = "chunks_content_addressed_key"
+
+@dataclass(frozen=True)
+class _AddressKey:
+    """One key of the content address, as the index declares it.
+
+    The KEY, not the column: 042 wraps the two nullable axes in COALESCE so that
+    "no group" is a value of the axis rather than the absence of one, and the
+    index enforces the address over those expressions.  So the expression comes
+    with the column, and the comparison is built from it — a predicate over the
+    bare column cannot be matched to an expression key however cheap it looks,
+    and the address stops being index-usable at the first one that is.
+
+    Nullability is still carried, because it is what decides the comparison for
+    a key that is a PLAIN column: a nullable axis holds NULL as one of its
+    values and `= NULL` matches nothing.
+    """
+
+    column: str
+    type_name: str
+    nullable: bool
+    key: str
+
+    def over(self, alias: str) -> str:
+        """The key as it reads on a row of `alias`."""
+        return self._substituted(f"{alias}.{self.column}")
+
+    def asked(self, position: int) -> str:
+        """The key as it reads on the value being asked about."""
+        return self._substituted(f"${position}::{self.type_name}")
+
+    def predicate(self, position: int) -> str:
+        return f'{self.over("c")} {self._comparison} {self.asked(position)}'
+
+    @property
+    def _comparison(self) -> str:
+        # An expression key is compared with `=` because that is what the index
+        # can serve, and the expression is what makes it total: COALESCE over a
+        # nullable column cannot itself be NULL.  A plain nullable column has no
+        # such wrapper, so it needs the null-safe comparison — which no index
+        # can serve, which is the honest reason 042 wrapped them.
+        if self.key != self.column:
+            return "="
+        return "IS NOT DISTINCT FROM" if self.nullable else "="
+
+    def _substituted(self, value: str) -> str:
+        return re.sub(rf"\b{re.escape(self.column)}\b", value, self.key)
+
+
+@dataclass(frozen=True)
+class _ContentAddress:
+    """The address the database enforces: these keys, over these rows."""
+
+    keys: tuple[_AddressKey, ...]
+    row_condition: str
+
+
+@dataclass(frozen=True)
+class _ChunkAddress:
+    """Where this pipeline stores a passage, in the address's own columns.
+
+    Stated once and used twice — the reuse lookup asks about this address and
+    _link_chunks() writes at it — so the question and the write cannot disagree
+    about which row the answer was about.  Every field is named after the column
+    it fills, because the columns come from the catalogue and are matched to
+    values by name.
+    """
+
+    org_id: UUID
+    collection_id: UUID
+    acl_group_id: UUID | None
+    visibility: str
+    owner_user_id: UUID | None
+
+    def value_for(self, column: str) -> object:
+        """This pipeline's value for one column of the address.
+
+        Refuses rather than guesses.  A column in the address that the pipeline
+        states no value for means the address has moved again, and the two ways
+        to guess are both #16: dropping the column asks a broader question than
+        the address answers and strands a chunk with no vector, while assuming a
+        value asks about a row that is not the one being written.
+        """
+        stated = {field.name: getattr(self, field.name) for field in fields(self)}
+        if column not in stated:
+            raise ValueError(
+                f"the chunk content address is keyed on {column!r}, which this"
+                " pipeline states no value for: the reuse lookup cannot stand"
+                f" in for an address it cannot name (see {CONTENT_ADDRESS_INDEX})"
+            )
+        return stated[column]
+
+
 _COLLECTION_POLICY_SQL = """
 SELECT claim_scope, extract_propositions, public_source, acl_mode
 FROM collections WHERE id = $1
@@ -132,16 +241,166 @@ WHERE d.org_id = $1 AND d.collection_id = $2 AND d.external_id = $3
   AND d.deleted_at IS NULL AND dv.content_hash = $4
 """
 
-# What is already stored, at the granularity the reuse path works at: a chunk
-# row with no document_id is the one pgkg_add_version_chunk() reuses, and its
-# vector is only reusable if it belongs to the generation this org writes in.
-_KNOWN_CONTENT_SQL = """
-SELECT c.content_hash,
-       (c.embedding IS NOT NULL AND c.embedder_generation_id = $2) AS has_vector
-FROM chunks c
-WHERE c.org_id = $1 AND c.document_id IS NULL
-  AND c.content_hash = ANY($3::bytea[])
+# The address as the catalogue holds it, one row per KEY of the index rather
+# than per column.  pg_get_indexdef() with a column number returns exactly what
+# the index is keyed on at that position — the bare column where it is one, the
+# expression where 042 wrapped it — which is the only place the two forms are
+# distinguishable.  The partial predicate travels with them: which rows are
+# content-addressed is as much part of the address as which keys key it.
+_ADDRESS_KEYS_SQL = """
+SELECT n AS position,
+       pg_get_indexdef(i.indexrelid, n::int, true) AS key,
+       pg_get_expr(i.indpred, i.indrelid) AS row_condition
+FROM pg_index i
+JOIN pg_class ic ON ic.oid = i.indexrelid
+CROSS JOIN generate_series(1, i.indnkeyatts) AS n
+WHERE ic.relname = $1
+ORDER BY n
 """
+
+_CHUNK_COLUMNS_SQL = """
+SELECT a.attname AS column_name,
+       format_type(a.atttypid, a.atttypmod) AS column_type,
+       NOT a.attnotnull AS nullable
+FROM pg_attribute a
+WHERE a.attrelid = 'chunks'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+"""
+
+_HASH_COLUMN = "content_hash"
+
+# Every corpus passage is shared with the org and owned by nobody: a nightly
+# crawl has no owning user, and D3's private lane belongs to chat ingest (049).
+# Stated here rather than left to pgkg_add_version_chunk()'s defaults, because
+# 049 put both columns in the address — the value the reuse lookup asks about
+# has to be the value the write uses, and a default is a second place for that
+# to be decided.
+CORPUS_VISIBILITY = "shared"
+CORPUS_OWNER_USER_ID: UUID | None = None
+
+
+async def content_address(conn: asyncpg.Connection) -> _ContentAddress:
+    """The content address, read from the unique index that enforces it."""
+    rows = await conn.fetch(_ADDRESS_KEYS_SQL, CONTENT_ADDRESS_INDEX)
+    if not rows:
+        raise ValueError(
+            f"chunks carries no index {CONTENT_ADDRESS_INDEX}: the reuse lookup"
+            " derives the content address from it and will not guess it"
+        )
+    columns = {
+        row["column_name"]: row
+        for row in await conn.fetch(_CHUNK_COLUMNS_SQL)
+    }
+    return _ContentAddress(
+        keys=tuple(_address_key(row["key"], columns) for row in rows),
+        # A total address is a WHERE TRUE.  052 keeps it partial on
+        # `NOT provenance_only`: content addressing governs retrievable content,
+        # and a passage stored as provenance for the facts extracted from it
+        # must never be reused by another writer.  Which rows the address covers
+        # is read from the index for the same reason its keys are — this
+        # pipeline writes retrievable content, so it satisfies the predicate,
+        # but it does not get to decide what the predicate is.
+        row_condition=rows[0]["row_condition"] or "TRUE",
+    )
+
+
+def _address_key(key: str, columns: dict[str, asyncpg.Record]) -> _AddressKey:
+    """One key of the index, matched to the column whose value fills it.
+
+    A key is only useful to this lookup if the pipeline can put its own value
+    into it, which means knowing which column it reads.  Word-bounded, so
+    `acl_group_id` is not found inside a hypothetical `group_id`, and exactly
+    one match is required: a key over two columns has no single value to bind
+    and is refused rather than guessed, for the same reason value_for() refuses.
+    """
+    named = [
+        column
+        for column in columns
+        if re.search(rf"\b{re.escape(column)}\b", key)
+    ]
+    if len(named) != 1:
+        raise ValueError(
+            f"index {CONTENT_ADDRESS_INDEX} is keyed on {key!r}, which names"
+            f" {sorted(named)} of chunks: the reuse lookup can only stand in"
+            " for a key it can put one value into"
+        )
+    column = columns[named[0]]
+    return _AddressKey(
+        column=named[0],
+        type_name=column["column_type"],
+        nullable=column["nullable"],
+        key=key,
+    )
+
+
+def reuse_lookup(
+    address: _ContentAddress,
+) -> tuple[str, Callable[[_ChunkAddress], tuple[object, ...]]]:
+    """What is already stored at an address, and which of it carries a vector.
+
+    Generated from the address rather than written out beside it, because a
+    written-out copy is exactly what drifted twice (#16).  $1 is the generation a
+    vector has to belong to to be reusable, which is not part of the address —
+    where a passage lives and which embedding space its vector belongs to are
+    different questions — and $2 is the hashes being asked about; the rest of the
+    address follows in the index's own key order.
+
+    Returned with the binder that fills it, so the statement and its arguments
+    are built from one reading of the catalogue and cannot be paired wrongly.
+
+    WHY IT IS ONE PROBE PER HASH RATHER THAN ONE PASS WITH `= ANY`.  Every
+    predicate is written in the index's own terms, which is what makes the
+    address usable as an index condition instead of a prefix of it — a bare
+    `owner_user_id IS NOT DISTINCT FROM $n` cannot be matched to the COALESCE key
+    042 declared, and the address stops being usable at the first such column,
+    which is the third of six.  Getting the leading five is not enough: the hash
+    is the last key and the only selective one, and a btree will not take a
+    trailing `= ANY(...)` as an index condition, so it is left to a filter that
+    reads every passage of the collection to answer.  Driving the statement from
+    the hashes turns that into an equality the index can serve, and the LATERAL
+    is what stops the planner flattening it back — it estimates one row for the
+    prefix, so left to itself it puts the whole collection on the outer side.
+    The LIMIT is free: an address is unique, which is what makes it an address.
+
+    Measured on 30,000 passages in one collection (issue #18 measured the first
+    half of this and left it): 2096 buffers as a sequential scan, 30,698 as the
+    index prefix with the hash filtered, 6 as one probe per hash.  This runs
+    once per changed document of a nightly crawl, so on a 600k-passage store the
+    difference is the cost of the crawl.
+    """
+    hashed = [key for key in address.keys if key.column == _HASH_COLUMN]
+    if not hashed:
+        raise ValueError(
+            f"index {CONTENT_ADDRESS_INDEX} is not keyed on {_HASH_COLUMN}, so it"
+            " is not a content address this lookup can stand in for"
+        )
+    hash_key = hashed[0]
+    scoped = tuple(key for key in address.keys if key.column != _HASH_COLUMN)
+    predicates = "".join(
+        f"\n          AND {key.predicate(position)}"
+        for position, key in enumerate(scoped, start=3)
+    )
+    sql = (
+        f"SELECT h.{_HASH_COLUMN}, found.has_vector\n"
+        f"FROM unnest($2::{hash_key.type_name}[]) AS h({_HASH_COLUMN})\n"
+        "JOIN LATERAL (\n"
+        "    SELECT (c.embedding IS NOT NULL"
+        " AND c.embedder_generation_id = $1) AS has_vector\n"
+        "    FROM chunks c\n"
+        f"    WHERE ({address.row_condition})\n"
+        # `=` and not the null-safe comparison whatever the catalogue says the
+        # column allows: unnest supplies a hash for every element, so there is
+        # no NULL to be careful of, and `=` is what the index can serve.
+        f'          AND {hash_key.over("c")} = {hash_key.over("h")}'
+        f"{predicates}\n"
+        "    LIMIT 1\n"
+        ") AS found ON TRUE\n"
+    )
+
+    def binder(stored: _ChunkAddress) -> tuple[object, ...]:
+        return tuple(stored.value_for(key.column) for key in scoped)
+
+    return sql, binder
+
 
 _INSERT_DOCUMENT_SQL = """
 INSERT INTO documents (source, uri, org_id, collection_id, external_id)
@@ -177,11 +436,16 @@ _ATTRIBUTE_VERSION_SQL = "UPDATE document_versions SET provenance_id = $2 WHERE 
 # one network round trip per chunk with the ingest transaction held open, which
 # on a 300-page handbook is the whole cost of the write phase; the lateral join
 # makes the pipeline set-based the way chat ingest already is.
+#
+# Visibility and owner are passed rather than defaulted: they joined the content
+# address in 049, and the address this writes at is the address the reuse lookup
+# asked about, from the same _ChunkAddress.
 _ADD_CHUNKS_SQL = """
 SELECT t.n, added.chunk_id, added.is_new
 FROM unnest($2::int[], $3::text[]) WITH ORDINALITY AS t(ord, chunk_text, n)
 CROSS JOIN LATERAL
-    pgkg_add_version_chunk($1, t.ord, t.chunk_text, $4, $5) AS added
+    pgkg_add_version_chunk($1, t.ord, t.chunk_text, $4, $5, $6::text, $7::uuid)
+    AS added
 ORDER BY t.n
 """
 
@@ -199,7 +463,12 @@ _PROMOTE_SQL = "SELECT pgkg_promote_document_version($1)"
 # Extraction over corpus chunks is opt-in per collection, so this statement runs
 # for the fact-dense minority only (D2).  No entity linking and no edges: the
 # derivation edge is chunk_id and it is free, while the mention edge that joins
-# a passage to the entities it names is gazetteer work and belongs with phase 3.
+# a passage to the entities it names is gazetteer work and belongs on a timer —
+# `pgkg maintain --task mentions`, not this pipeline.  A cross-product against
+# every name the org knows, on every changed document of a nightly crawl, is
+# what D7 separates the two ingests to avoid, and the sweep's watermarks are
+# what make the edge exist whether or not this path ever calls the matcher
+# (pgkg/maintenance.py; implementation notes §5).
 # The object of a claim therefore survives as text rather than as an entity, and
 # is not dropped on the floor while waiting for that.
 _INSERT_PROPOSITIONS_SQL = """
@@ -414,6 +683,9 @@ class CorpusIngest:
         self._embed = embed
         self._max_chars = max_chars
         self._use_extract_cache = use_extract_cache
+        # Read once per pipeline: the catalogue cannot move under a running
+        # process, and a crawl of 100k documents should not ask 100k times.
+        self._address: _ContentAddress | None = None
 
     @property
     def org_id(self) -> UUID:
@@ -471,6 +743,7 @@ class CorpusIngest:
             policy = await self._policy(conn)
             self._require_acl_group(policy, acl_group_id)
             generation = await self._generation(conn)
+            address = self._chunk_address(acl_group_id)
             unchanged = await conn.fetchrow(
                 _FIND_UNCHANGED_SQL,
                 self._org_id,
@@ -502,7 +775,9 @@ class CorpusIngest:
         # are valid whether or not the version below commits.
         async with self._pool.acquire() as conn:
             await conn.execute(_SET_ORG_SQL, str(self._org_id))
-            stored, vectored = await self._known_content(conn, generation, texts)
+            stored, vectored = await self._known_content(
+                conn, generation, texts, address
+            )
             cached = await self._cache_lookup(
                 conn, policy, generation, [t for t in texts if t not in vectored]
             )
@@ -544,7 +819,7 @@ class CorpusIngest:
                 provenance_id = await self._attribute(conn, version_id, given, uri)
                 await self._update_document(conn, document_id, source, uri)
                 linked = await self._link_chunks(
-                    conn, version_id, chunks, asserted, acl_group_id
+                    conn, version_id, chunks, asserted, address
                 )
                 new_chunks = list(
                     {
@@ -554,7 +829,9 @@ class CorpusIngest:
                     }.items()
                 )
                 distinct = len({chunk_id for chunk_id, _, _ in linked})
-                await self._write_vectors(conn, generation, new_chunks, vectors)
+                stranded = await self._write_vectors(
+                    conn, generation, new_chunks, vectors
+                )
                 # Before the flip, in the order D6 gives: the facts a version
                 # carries have to exist by the time it becomes the current one.
                 propositions = await self._write_propositions(
@@ -572,6 +849,13 @@ class CorpusIngest:
                     await extract_cache.flush(conn)
                 await conn.execute(_PROMOTE_SQL, version_id)
 
+        # Phase 4, and only ever for the rows phase 3 disagreed with phase 2
+        # about.  Outside the transaction because it is a model call, and after
+        # the promotion because a vector is content-addressed: the row is
+        # retrievable by the keyword arm the moment the version flips, and this
+        # is what stops it being retrievable ONLY by the keyword arm, for good.
+        repaired = await self._vector_the_stranded(generation, stranded)
+
         return CorpusIngestResult(
             document_id=document_id,
             version_id=version_id,
@@ -579,7 +863,7 @@ class CorpusIngest:
             chunks_total=len(linked),
             chunks_new=len(new_chunks),
             chunks_carried=distinct - len(new_chunks),
-            embedded=len(fresh),
+            embedded=len(fresh) + len(repaired),
             cache_hits=len(cached),
             propositions=propositions,
         )
@@ -604,21 +888,44 @@ class CorpusIngest:
             " every caller"
         )
 
+    def _chunk_address(self, acl_group_id: UUID | None) -> _ChunkAddress:
+        """The address every passage of this document is stored at."""
+        return _ChunkAddress(
+            org_id=self._org_id,
+            collection_id=self._collection_id,
+            acl_group_id=acl_group_id,
+            visibility=CORPUS_VISIBILITY,
+            owner_user_id=CORPUS_OWNER_USER_ID,
+        )
+
     async def _known_content(
         self,
         conn: asyncpg.Connection,
         generation: _Generation,
         texts: Sequence[str],
+        address: _ChunkAddress,
     ) -> tuple[set[str], set[str]]:
         """Which of these texts are stored already, and which carry a vector.
 
         Two answers from one round trip, because they drive two different
         decisions: a stored text is one this version will carry without
         extracting it again, and a vectored one is a text nobody has to embed.
+
+        Asked at the address the write phase will write at, and at no other.
+        Answering for the org as a whole said "stored and vectored" about a row
+        in another collection, which the write phase then rightly declined to
+        reuse — and the chunk it created instead was never given a vector (#16).
+        The reuse this pipeline is built on is unaffected: the same passage in
+        the same collection is the same address, which is where the saving was.
+        What the narrowing does cost is one extraction of a passage per address
+        it is stored at, and that is the right price: propositions hang off a
+        chunk id, so the second collection's row carries no facts until they are
+        extracted against it.
         """
         by_hash = {content_hash(chunk_text): chunk_text for chunk_text in texts}
+        sql, binder = reuse_lookup(await self._content_address(conn))
         rows = await conn.fetch(
-            _KNOWN_CONTENT_SQL, self._org_id, generation.generation_id, list(by_hash)
+            sql, generation.generation_id, list(by_hash), *binder(address)
         )
         stored = {by_hash[row["content_hash"]] for row in rows}
         vectored = {
@@ -636,6 +943,13 @@ class CorpusIngest:
             public_source=row["public_source"],
             acl_mode=row["acl_mode"],
         )
+
+    async def _content_address(self, conn: asyncpg.Connection) -> _ContentAddress:
+        """The address, read once: the catalogue cannot move under a live
+        process, and a crawl of 100k documents should not ask 100k times."""
+        if self._address is None:
+            self._address = await content_address(conn)
+        return self._address
 
     async def _generation(self, conn: asyncpg.Connection) -> _Generation:
         row = await conn.fetchrow(_PRIMARY_GENERATION_SQL, self._org_id)
@@ -710,7 +1024,7 @@ class CorpusIngest:
         version_id: UUID,
         chunks: Sequence[Chunk],
         asserted_at: datetime | None,
-        acl_group_id: UUID | None,
+        address: _ChunkAddress,
     ) -> list[tuple[UUID, str, bool]]:
         """Link every chunk of the document to the open version, in one call.
 
@@ -723,8 +1037,10 @@ class CorpusIngest:
             version_id,
             [chunk.ordinal for chunk in chunks],
             [chunk.text for chunk in chunks],
-            acl_group_id,
+            address.acl_group_id,
             asserted_at,
+            address.visibility,
+            address.owner_user_id,
         )
         return [
             (row["chunk_id"], chunks[row["n"] - 1].text, row["is_new"])
@@ -737,28 +1053,70 @@ class CorpusIngest:
         generation: _Generation,
         new_chunks: list[tuple[UUID, str]],
         vectors: dict[str, HalfVector],
-    ) -> None:
+    ) -> list[tuple[UUID, str]]:
         """Give a vector to every chunk the database created, and to no other.
 
         A carried-over chunk already holds the vector for its content, and its
-        content cannot have changed — that is what its address means.  A chunk
-        the decide phase expected to be carried and the write phase created is
-        left for the next crawl rather than embedded here, because embedding
-        here would be a model call inside this transaction.
+        content cannot have changed — that is what its address means.
+
+        Returns the chunks the database created that there is no vector in hand
+        for, which is the only case this cannot settle: phase 2 answered that
+        the content was already vectored, and by the time phase 3 asked the
+        database the same question authoritatively the row it had seen was gone.
+        They are named rather than embedded here because embedding here would be
+        a model call inside this transaction, and returned rather than dropped
+        because "left for the next crawl" is not true of them — phase 1
+        short-circuits on the unchanged document hash, so there is no next crawl
+        for this document and the row would keep `embedding IS NULL` for good.
         """
         vectorised = [
             (chunk_id, vectors[chunk_text])
             for chunk_id, chunk_text in new_chunks
             if chunk_text in vectors
         ]
+        stranded = [
+            (chunk_id, chunk_text)
+            for chunk_id, chunk_text in new_chunks
+            if chunk_text not in vectors
+        ]
         if not vectorised:
-            return
+            return stranded
         await conn.execute(
             _WRITE_CHUNK_EMBEDDINGS_SQL,
             generation.generation_id,
             [chunk_id for chunk_id, _ in vectorised],
             [vector for _, vector in vectorised],
         )
+        return stranded
+
+    async def _vector_the_stranded(
+        self, generation: _Generation, stranded: list[tuple[UUID, str]]
+    ) -> list[tuple[UUID, str]]:
+        """Pay for the vectors the write phase turned out to need.
+
+        Empty on every ordinary ingest, which is the point: the reuse the whole
+        pipeline is built on is unaffected and this costs one comparison per new
+        chunk.  It is not a substitute for the reuse lookup being exactly the
+        address — a lookup broader than the address would land every second
+        collection's passage here and pay the embedder for all of it — it is
+        what makes the remaining window cost money instead of costing a vector.
+
+        Its own connection, taken after the embedder has returned: D7's rule is
+        that no pooled connection is held across a model call, and a repair that
+        broke it would be a worse defect than the one it fixes.
+        """
+        if not stranded:
+            return []
+        vectors = self._embed_texts([chunk_text for _, chunk_text in stranded])
+        async with self._pool.acquire() as conn:
+            await conn.execute(_SET_ORG_SQL, str(self._org_id))
+            await conn.execute(
+                _WRITE_CHUNK_EMBEDDINGS_SQL,
+                generation.generation_id,
+                [chunk_id for chunk_id, _ in stranded],
+                [HalfVector(vector) for vector in vectors],
+            )
+        return stranded
 
     async def _cache_lookup(
         self,

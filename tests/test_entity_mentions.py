@@ -443,6 +443,108 @@ async def test_matching_new_entities_reaches_the_corpus_already_stored(
     assert [r["entity_id"] for r in rows] == [entity]
 
 
+async def test_a_name_the_corpus_predates_is_swept_exactly_once(
+    pool: asyncpg.Pool,
+) -> None:
+    """The name side of the sweep, and why it needs a watermark of its own.
+
+    `sweep()` asks which passages have never been matched, so a passage matched
+    while the org knew nothing about Helios is finished forever — and every
+    entity a chat turn creates afterwards has no way back to it.  Names carry
+    the same watermark for the same reason: without one the reverse direction is
+    either never run or run over the whole name list on every tick (issue #19).
+    """
+    from pgkg.gazetteer import Gazetteer
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        chunk = await insert_chunk(
+            conn, org_id=org, collection_id=collection,
+            text="Helios is the internal name for the payments rewrite.",
+        )
+
+    gazetteer = Gazetteer(pool, org_id=org)
+    await gazetteer.sweep()
+
+    async with pool.acquire() as conn:
+        entity = await insert_entity(conn, org_id=org, name="Helios")
+
+    first = await gazetteer.sweep_entities()
+    second = await gazetteer.sweep_entities()
+
+    async with pool.acquire() as conn:
+        rows = await mentions_of(conn, chunk)
+
+    assert first.mentions_added == 1
+    assert [r["entity_id"] for r in rows] == [entity]
+    assert second.chunks_scanned == 0
+    assert second.mentions_added == 0
+
+
+async def test_a_name_sweep_respects_its_batch_limit(pool: asyncpg.Pool) -> None:
+    """One batch of a scheduled sweep, not a whole name list."""
+    from pgkg.gazetteer import Gazetteer
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        await insert_chunk(
+            conn, org_id=org, collection_id=collection,
+            text="Helios and Selene both ship this quarter.",
+        )
+        for name in ("Helios", "Selene", "Artemis"):
+            await insert_entity(conn, org_id=org, name=name)
+
+    gazetteer = Gazetteer(pool, org_id=org)
+    batch = await gazetteer.sweep_entities(limit=2)
+    rest = await gazetteer.sweep_entities(limit=100)
+
+    assert batch.chunks_scanned == 2
+    assert rest.chunks_scanned == 1
+
+
+async def test_an_alias_added_later_puts_the_name_back_in_the_sweep(
+    pool: asyncpg.Pool,
+) -> None:
+    """A watermark that outlives the name it was stamped for is a stale answer.
+
+    Entity resolution keeps adding aliases to rows that already exist, and an
+    alias is a new phrase to match — so the stamp is cleared when either key
+    the matcher probes changes, and the next sweep re-reads that name.
+    """
+    from pgkg.gazetteer import Gazetteer
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        chunk = await insert_chunk(
+            conn, org_id=org, collection_id=collection,
+            text="The ledger rewrite is tracked as Project Sunrise.",
+        )
+        entity = await insert_entity(conn, org_id=org, name="Helios")
+
+    gazetteer = Gazetteer(pool, org_id=org)
+    await gazetteer.sweep()
+    swept = await gazetteer.sweep_entities()
+    assert swept.mentions_added == 0
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE entities SET aliases = ARRAY['Project Sunrise'] WHERE id = $1",
+            entity,
+        )
+
+    after = await gazetteer.sweep_entities()
+
+    async with pool.acquire() as conn:
+        rows = await mentions_of(conn, chunk)
+
+    assert after.chunks_scanned == 1
+    assert after.mentions_added == 1
+    assert [r["match_kind"] for r in rows] == ["alias"]
+
+
 # ---------------------------------------------------------------------------
 # Bidirectional graph expansion, and the re-filter that guards both directions
 # ---------------------------------------------------------------------------

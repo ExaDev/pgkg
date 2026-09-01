@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import uuid
 
 import asyncpg
@@ -332,6 +333,376 @@ async def test_two_documents_sharing_a_passage_share_one_chunk_row(
     ids_one = {row["id"] for row in await chunk_rows(pool, first.document_id)}
     ids_two = {row["id"] for row in await chunk_rows(pool, second.document_id)}
     assert ids_one == ids_two
+
+
+# ---------------------------------------------------------------------------
+# The content address, and the one question asked about it
+# ---------------------------------------------------------------------------
+
+async def address_columns(conn: asyncpg.Connection) -> set[str]:
+    """The columns the chunk content address is keyed on, read from the index.
+
+    Read out of pg_get_indexdef rather than out of corpus.py on purpose: the
+    address is what the database enforces, and #16 is the story of a second
+    statement of it drifting away from that.  A guard that asked corpus.py what
+    the address is would drift with it.
+    """
+    defn = await conn.fetchval(
+        "SELECT pg_get_indexdef(oid) FROM pg_class WHERE relname = $1",
+        "chunks_content_addressed_key",
+    )
+    assert defn is not None, "the chunk content address index is gone"
+    # The key list only: the partial predicate says which rows are
+    # content-addressed rather than where their content lives.
+    keys = defn[defn.index("(") : defn.index(" WHERE ") if " WHERE " in defn else None]
+    columns = await conn.fetch(
+        """
+        SELECT attname FROM pg_attribute
+        WHERE attrelid = 'chunks'::regclass AND attnum > 0 AND NOT attisdropped
+        """
+    )
+    return {
+        row["attname"]
+        for row in columns
+        if re.search(rf"\b{row['attname']}\b", keys)
+    }
+
+
+async def test_a_passage_shared_by_two_collections_is_vectored_in_both(
+    pool: asyncpg.Pool,
+) -> None:
+    """Both rows exist, so both rows need a vector (#16).
+
+    The address stops at the collection boundary, so one org holding the same
+    passage in two collections holds two chunk rows — and the reuse lookup used
+    to answer "already stored and vectored?" for the org as a whole.  It said
+    yes, the write phase correctly created the second row, and the vector write
+    skipped it.  Nothing revisits it: the next crawl short-circuits on the
+    document hash, so the row is invisible to the vector arm for good.
+    """
+    text = document_text(words=("alpha", "bravo"))
+    async with pool.acquire() as conn:
+        dim = await embedding_dim(conn)
+        org = await new_org(conn)
+        one = await new_collection(conn, org_id=org)
+        two = await new_collection(conn, org_id=org)
+
+    first = await ingest_for(pool, org, one, EmbedSpy(dim)).upsert_document(
+        external_id="handbook", text=text
+    )
+    second = await ingest_for(pool, org, two, EmbedSpy(dim)).upsert_document(
+        external_id="handbook", text=text
+    )
+
+    rows_one = await chunk_rows(pool, first.document_id)
+    rows_two = await chunk_rows(pool, second.document_id)
+    assert {row["id"] for row in rows_one}.isdisjoint(
+        {row["id"] for row in rows_two}
+    ), "the two collections shared one chunk row across a scoping boundary"
+    assert rows_two, "the second collection carries no chunks"
+    unvectored = [row["ord"] for row in rows_one + rows_two if row["embedding"] is None]
+    assert not unvectored, (
+        f"chunks {unvectored} were left with embedding IS NULL by an ingest "
+        "that reported success"
+    )
+
+
+async def test_the_reuse_lookup_asks_about_the_whole_content_address(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """The lookup and the address are the same question, or the lookup lies.
+
+    "Is this passage already stored and vectored?" is only answerable at an
+    address, and the address has already moved twice — 042 added three columns
+    and 049 added two — with this lookup left behind both times.  A lookup
+    broader than the address answers yes for a row that does not exist, which
+    is how #16 stranded a chunk with no vector; a lookup narrower than it pays
+    the embedder for a row that does.  So this compares the statement the
+    pipeline actually sends against the index the database actually enforces.
+    """
+    org, collection, spy = tenant
+    recording = RecordingPool(pool)
+    await ingest_for(recording, org, collection, spy).upsert_document(
+        external_id=unique("address"), text=document_text(words=("alpha",))
+    )
+
+    lookups = [query for query in recording.queries if "has_vector" in query]
+    assert len(lookups) == 1, f"expected one reuse lookup, sent {len(lookups)}"
+    async with pool.acquire() as conn:
+        address = await address_columns(conn)
+    assert len(address) >= 6, f"the address query found only {address}"
+
+    unasked = sorted(
+        name for name in address if not re.search(rf"\b{name}\b", lookups[0])
+    )
+    assert not unasked, (
+        f"the reuse lookup does not constrain {unasked}, which the content "
+        "address is keyed on: it answers for rows at other addresses"
+    )
+
+
+@pytest.fixture(scope="module")
+async def loaded_chunk_store(pool: asyncpg.Pool):
+    """One org whose collection holds 30,000 content-addressed passages.
+
+    A plan is only a choice above a certain size: on the few dozen rows the rest
+    of this module writes, a sequential scan of `chunks` IS the right plan and
+    every shape looks the same.  30,000 is where the difference the reuse lookup
+    turns on becomes visible, and it is two orders of magnitude below the 100k
+    document corpus D7 sizes this pipeline for.
+
+    Torn down with a VACUUM ANALYZE, because the row count and its distribution
+    across orgs are inputs to every other module's plan assertions and nothing
+    in those modules says so.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        await conn.execute("SELECT set_config('pgkg.org_id', $1, false)", str(org))
+        await conn.execute(
+            """
+            INSERT INTO chunks (text, org_id, collection_id)
+            SELECT 'filler passage number ' || g, $1, $2
+            FROM generate_series(1, 30000) g
+            """,
+            org,
+            collection,
+        )
+        await conn.execute("VACUUM ANALYZE chunks")
+    yield org, collection
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "DELETE FROM document_version_chunks dvc USING chunks c"
+            " WHERE c.id = dvc.chunk_id AND c.org_id = $1",
+            org,
+        )
+        await conn.execute("DELETE FROM chunks WHERE org_id = $1", org)
+        await conn.execute("VACUUM ANALYZE chunks")
+
+
+async def test_the_reuse_lookup_reaches_the_content_address_index(
+    pool: asyncpg.Pool, loaded_chunk_store
+) -> None:
+    """Asking the whole address is not enough: it has to be askable by index.
+
+    This lookup runs once per changed document of a nightly crawl, so a
+    predicate no index can serve is one full scan of the chunk store per
+    changed document — on a 600k-passage store, the cost of the crawl.
+
+    The trap is that deriving the comparison from the column's NULLABILITY looks
+    right and is not: 042 keys the two nullable axes as COALESCE expressions, so
+    a bare `owner_user_id IS NOT DISTINCT FROM $n` cannot be matched to the key
+    however cheap it looks, and the address stops being usable at the first such
+    column — which is the third of six.  The comparison has to be derived from
+    the key EXPRESSION, which is the only thing that knows.
+
+    The statement explained here is the one an ingest actually sent, captured
+    off the connection, rather than one this test builds out of the same
+    helpers: a plan claim about a statement nobody sends is worth nothing, and
+    that is the whole shape of #16.  Only the hashes are substituted, so the
+    buffer count below is the cost of asking about one passage rather than the
+    cost of whatever this document happened to contain.
+    """
+    org, collection = loaded_chunk_store
+    async with pool.acquire() as conn:
+        dim = await embedding_dim(conn)
+    recording = RecordingPool(pool)
+    await ingest_for(recording, org, collection, EmbedSpy(dim)).upsert_document(
+        external_id=unique("planned"), text=document_text(words=("alpha",))
+    )
+    lookups = [call for call in recording.calls if "has_vector" in call[0]]
+    assert len(lookups) == 1, f"expected one reuse lookup, sent {len(lookups)}"
+    sql, sent = lookups[0]
+    asked = (sent[0], [sha256("a passage nobody stored")], *sent[2:])
+
+    async with pool.acquire() as conn:
+        await conn.execute("SELECT set_config('pgkg.org_id', $1, false)", str(org))
+        plan = "\n".join(
+            row[0]
+            for row in await conn.fetch("EXPLAIN (ANALYZE, BUFFERS) " + sql, *asked)
+        )
+
+    assert "Seq Scan on chunks" not in plan, (
+        "the reuse lookup scans the whole chunk store once per changed "
+        f"document:\n{plan}"
+    )
+    assert "chunks_content_addressed_key" in plan, (
+        f"the lookup reaches no index at all:\n{plan}"
+    )
+    condition = re.search(r"Index Cond: \((.*)\)", plan)
+    assert condition is not None, f"no index condition was formed:\n{plan}"
+    # The hash is the last key of the address, so it is only reachable as an
+    # index condition if every column before it was: a prefix that stops early
+    # reads every row of the collection and filters.
+    assert "content_hash" in condition.group(1), (
+        "the address is usable only as a prefix — the hash, which is what makes "
+        f"it selective, is left to a filter:\n{plan}"
+    )
+    # The plan shape is the claim; the buffer count is what the claim is worth,
+    # and it is the number that made this defect invisible.  Measured: 2096 as a
+    # sequential scan, 30,698 as the prefix with the hash filtered, 6 as one
+    # probe per hash.  The bound is two orders of magnitude clear of both.
+    touched = max(
+        int(count) for count in re.findall(r"shared hit=(\d+)", plan)
+    )
+    assert touched < 200, (
+        f"the lookup read {touched} buffers to answer about one hash — it is "
+        f"reading the collection rather than probing the address:\n{plan}"
+    )
+
+
+async def test_an_address_the_pipeline_cannot_name_stops_the_ingest(
+    pool: asyncpg.Pool, tenant, monkeypatch
+) -> None:
+    """A widened address has to be loud, because the quiet failure is #16.
+
+    042 and 049 each added columns to the address, and both times the lookup
+    that stands in for it kept answering the old, broader question — nothing
+    failed, no test went red, and a passage silently lost its vector for good.
+    The next migration that moves the address should stop this pipeline dead
+    instead, before it spends anything, and name the column it does not know.
+    """
+    from dataclasses import replace
+
+    from pgkg import corpus
+
+    org, collection, spy = tenant
+    stated = corpus.content_address
+
+    async def widened(conn):
+        address = await stated(conn)
+        # A key of the same kind the catalogue handed back, standing in for
+        # whatever the next migration adds.
+        extra = replace(
+            address.keys[0],
+            column="tenant_shard",
+            type_name="text",
+            key="tenant_shard",
+        )
+        return replace(address, keys=(*address.keys, extra))
+
+    monkeypatch.setattr(corpus, "content_address", widened)
+
+    with pytest.raises(ValueError, match="tenant_shard"):
+        await ingest_for(pool, org, collection, spy).upsert_document(
+            external_id=unique("widened"), text=document_text(words=("alpha",))
+        )
+
+    assert spy.texts == [], (
+        "the embedder was paid before the pipeline knew what address it was "
+        "asking about"
+    )
+
+
+async def test_a_row_that_left_the_address_between_the_phases_is_still_vectored(
+    pool: asyncpg.Pool, tenant
+) -> None:
+    """The half of #16 that narrowing the lookup does not close.
+
+    The lookup is now exactly the address, but it is still asked in phase 2 and
+    answered again in phase 3, and D7 requires that gap — the embedder runs with
+    no transaction held.  A concurrent crawl that retires the row in between, or
+    a lifecycle sweep that collects it, makes phase 2's "already vectored" true
+    when it was asked and false when it is used: the write phase correctly
+    creates a fresh row and there is no vector in hand for it.
+
+    `_write_vectors()` said such a chunk was "left for the next crawl".  There
+    is no next crawl for it: the document hash has not moved, so phase 1
+    short-circuits and the row keeps `embedding IS NULL` for good — the same
+    permanent gap #16 was, through a smaller window.  So the pipeline pays for
+    the vector it turned out to need, after the transaction and not inside it.
+    """
+    org, collection, spy = tenant
+    shared = document_text(words=("alpha", "bravo"))
+
+    first = await ingest_for(pool, org, collection, spy).upsert_document(
+        external_id=unique("first"), text=shared
+    )
+    assert all(row["embedding"] is not None for row in await chunk_rows(pool, first.document_id))
+
+    # The race, made deterministic: the row is retired after phase 2 has read
+    # it and before phase 3 asks the database the same question authoritatively.
+    ingest = ingest_for(pool, org, collection, spy)
+    answered = ingest._known_content
+
+    async def retire_between_the_phases(*args, **kwargs):
+        stored, vectored = await answered(*args, **kwargs)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "DELETE FROM document_version_chunks dvc USING chunks c"
+                " WHERE c.id = dvc.chunk_id AND c.org_id = $1",
+                org,
+            )
+            await conn.execute("DELETE FROM chunks WHERE org_id = $1", org)
+        return stored, vectored
+
+    ingest._known_content = retire_between_the_phases
+    second = await ingest.upsert_document(external_id=unique("second"), text=shared)
+
+    rows = await chunk_rows(pool, second.document_id)
+    assert rows, "the second document carries no chunks"
+    stranded = [row["ord"] for row in rows if row["embedding"] is None]
+    assert not stranded, (
+        f"chunks {stranded} were left with embedding IS NULL by an ingest that "
+        "reported success, and no later crawl revisits them: the document hash "
+        "has not moved"
+    )
+
+
+async def test_a_passage_lands_at_the_address_the_lookup_asked_about(
+    pool: asyncpg.Pool, tenant, monkeypatch
+) -> None:
+    """The columns of the address come from the catalogue; the values come from
+    one place too.
+
+    Every corpus passage is shared and ownerless, and pgkg_add_version_chunk()
+    defaults to exactly that — so the write could lean on the defaults and look
+    correct.  It would be the same trap: those two columns joined the address in
+    049, and a default is a second place for their values to be decided.  Move
+    the pipeline off the defaults and both halves have to follow, or the reuse
+    lookup asks about an address nothing is ever written at and the crawl pays
+    the embedder for the same passage every night.
+    """
+    org, collection, spy = tenant
+    from pgkg import corpus
+
+    async with pool.acquire() as conn:
+        owner = await conn.fetchval(
+            "INSERT INTO users (org_id, external_id) VALUES ($1, $2) RETURNING id",
+            org,
+            unique("user"),
+        )
+    monkeypatch.setattr(corpus, "CORPUS_VISIBILITY", "private")
+    monkeypatch.setattr(corpus, "CORPUS_OWNER_USER_ID", owner)
+    shared = document_text(words=("alpha", "bravo"))
+
+    first = await ingest_for(pool, org, collection, spy).upsert_document(
+        external_id=unique("addressed"), text=shared
+    )
+    async with pool.acquire() as conn:
+        stored = await conn.fetch(
+            """
+            SELECT c.visibility, c.owner_user_id
+            FROM document_version_chunks dvc
+            JOIN chunks c ON c.id = dvc.chunk_id
+            WHERE dvc.document_version_id = $1
+            """,
+            first.version_id,
+        )
+    assert stored, "the version carries no chunks"
+    assert {(row["visibility"], row["owner_user_id"]) for row in stored} == {
+        ("private", owner)
+    }, "the write ignored the address the lookup asked about"
+
+    spy.calls.clear()
+    second = await ingest_for(pool, org, collection, spy).upsert_document(
+        external_id=unique("addressed"), text=shared
+    )
+    assert second.chunks_new == 0
+    assert spy.texts == [], (
+        "the same passage at the same address was embedded twice: the lookup "
+        "and the write disagree about where it lives"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1215,6 +1586,10 @@ class RecordingPool:
     def __init__(self, pool: asyncpg.Pool) -> None:
         self._pool = pool
         self.queries: list[str] = []
+        # The arguments as well as the statement, so a test can re-ask the
+        # database exactly what the pipeline asked it rather than a
+        # reconstruction of it.
+        self.calls: list[tuple[str, tuple]] = []
 
     def acquire(self):
         outer = self
@@ -1223,7 +1598,7 @@ class RecordingPool:
             async def __aenter__(self):
                 self._cm = outer._pool.acquire()
                 conn = await self._cm.__aenter__()
-                return _RecordingConn(conn, outer.queries)
+                return _RecordingConn(conn, outer.queries, outer.calls)
 
             async def __aexit__(self, *exc):
                 return await self._cm.__aexit__(*exc)
@@ -1232,15 +1607,22 @@ class RecordingPool:
 
 
 class _RecordingConn:
-    def __init__(self, conn: asyncpg.Connection, log: list[str]) -> None:
+    def __init__(
+        self,
+        conn: asyncpg.Connection,
+        log: list[str],
+        calls: list[tuple[str, tuple]],
+    ) -> None:
         self._conn = conn
         self._log = log
+        self._calls = calls
 
     def __getattr__(self, name):
         attr = getattr(self._conn, name)
         if name in ("execute", "fetch", "fetchrow", "fetchval"):
             async def recorded(query, *args, **kwargs):
                 self._log.append(query)
+                self._calls.append((query, args))
                 return await attr(query, *args, **kwargs)
 
             return recorded

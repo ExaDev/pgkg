@@ -292,12 +292,24 @@ SELECT r.id, $1, $2, $3, r.locator::jsonb, $4, $5, $6, $7, $8, $9, $10, $11,
 FROM unnest($15::uuid[], $16::text[]) AS r(id, locator)
 """
 
+# The extraction path's passages exist as provenance for the facts extracted
+# from them and are not retrievable content (041), so this statement says so.
+#
+# It is stated here rather than left to the parent pointer, which is what said
+# it until 052.  A pointer that decides retrievability is what makes a total
+# content address unrepresentable — two documents sharing a paragraph would have
+# to be one row that can name only one parent (#18) — and the pointer stays only
+# as the record of which document a passage came out of.  052's bridge would
+# derive the same answer from it, but a derived answer is a second place for the
+# value to be decided and the bridge is meant to be retired: this writer states
+# its own, so retiring the bridge cannot change what it stores.
 _INSERT_CHUNKS_SQL = """
 INSERT INTO chunks
     (id, document_id, text, span_start, span_end, asserted_at, org_id,
-     collection_id, visibility, owner_user_id, acl_group_id, provenance_id)
+     collection_id, visibility, owner_user_id, acl_group_id, provenance_id,
+     provenance_only)
 SELECT c.id, $1, c.text, c.span_start, c.span_end, $2, $3, $4, $5, $6, $7,
-       c.provenance_id
+       c.provenance_id, TRUE
 FROM unnest($8::uuid[], $9::text[], $10::int[], $11::int[], $12::uuid[])
      AS c(id, text, span_start, span_end, provenance_id)
 """

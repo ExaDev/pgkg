@@ -429,10 +429,45 @@ the document, content-addresses its chunks so an unchanged crawl is free, embeds
 and promotes the new version atomically. Extraction here is **opt-in per collection**, and off by
 default: extracting a whole handbook is a recurring cost, lossy on exactly the content corpora are
 made of, and the gazetteer mention edge gets most of the graph benefit for nothing. Turn it on for
-the fact-dense minority of collections that earn it.
+the fact-dense minority of collections that earn it — and install the mention sweep below, which is
+what makes that edge exist.
 
 The two paths share the retriever, the rerank and MMR pass, the `Result` shape and the tenancy
 boundary. Mix them freely: a collection can hold either, and a query can name both stores or one.
+
+## Keeping it fresh: `pgkg maintain`
+
+Four jobs are not on the request path and are not supposed to be. Nothing runs them unless you
+schedule them, and one of them — the gazetteer mention sweep — is what joins a passage to the
+entities it names, so without it `entity_mentions` stays empty and graph expansion has nothing to
+expand through.
+
+```bash
+pgkg maintain --org "$ORG"                     # all four jobs, one tenant
+pgkg maintain --org "$ORG" --task mentions     # just the sweep; repeatable flag
+```
+
+| Task | What it does |
+|---|---|
+| `mentions` | Gazetteer matching, both directions: passages this org has never matched, and names it has never matched. Each side has its own watermark, so a settled corpus reports no work rather than repeating it. |
+| `pagerank` | One PageRank pass per namespace the org has entities in. |
+| `contradictions` | Closes the validity interval a supersession left open, at the replacement's own clock, within one claim scope. |
+| `expiries` | Withdraws this org's facts whose `valid_to` has passed. |
+
+It prints one JSON report — `{"org": ..., "tasks": [{"task", "ran", "scanned", "changed"}]}` — and
+is safe to overlap itself: each task takes an advisory lock per (task, org) and reports `ran: false`
+rather than repeating work another run is doing. `ran: false` is a normal outcome, not a failure.
+
+A crontab entry per tenant, with the sweep on a short interval and the rest nightly:
+
+```cron
+*/5 *  * * *  pgkg maintain --org ORG --task mentions
+30  3  * * *  pgkg maintain --org ORG --task pagerank --task contradictions --task expiries
+```
+
+The physical reclamation functions (`pgkg_purge_retired_versions()`, `pgkg_gc_chunks()`,
+`pgkg_erase_provenance()`) are deliberately *not* behind this command: they delete rows where these
+four withdraw them, and that belongs behind a decision rather than behind the same crontab line.
 
 ## Configuration
 
@@ -489,6 +524,20 @@ PGKG_OFFLINE_EXTRACT=1 uv run --python 3.12 pytest -q
 are needed. Note that the suite connects as the container's owning superuser, for whom every RLS
 policy is inert: an isolation test has to `SET LOCAL ROLE pgkg_app` **inside a transaction** to
 exercise the policy rather than just the SQL predicate.
+
+There is also an end-to-end check that drives a real `pgkg mcp` over stdio against a throwaway
+Postgres:
+
+```bash
+PGKG_LLM_PROVIDER=claude_code PGKG_OFFLINE_EXTRACT=0 ./scripts/e2e_mcp.sh
+```
+
+Name every extra you want when syncing the venv — `uv sync` removes what you leave out, and
+dropping `claude_agent` makes the run above fail as a provider error rather than a missing package:
+
+```bash
+uv sync --python 3.12 --extra dev --extra mcp --extra claude_agent
+```
 
 ## Benchmarks
 
@@ -610,7 +659,8 @@ pgkg/
 │   ├── gazetteer.py            # Entity mention matching over new passages
 │   ├── ml.py                   # Embeddings, reranking, MMR, extraction
 │   ├── api.py                  # FastAPI endpoints
-│   └── cli.py                  # migrate, serve, ingest, recall, worker
+│   ├── maintenance.py         # The scheduled jobs behind `pgkg maintain`
+│   └── cli.py                  # migrate, serve, ingest, recall, worker, maintain
 │
 ├── docs/adrs/                  # Architecture decisions
 │   ├── 0001-corpus-embeddings-and-knowledge-graph.md   # the design authority

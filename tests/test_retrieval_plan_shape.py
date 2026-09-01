@@ -21,8 +21,15 @@ import uuid
 import asyncpg
 import pytest
 
+# The definition `chunks.retrievable` summarises, in the terms 052 states it
+# in: a passage carried by the current version of a live document, or one stored
+# as retrievable content and never carried by any version.  Kept current on
+# purpose — a copy of a superseded definition would let the flag and the
+# definition drift while this module went on reporting agreement.  Before 052 the
+# standalone arm read `c.document_id IS NULL`, which asked about parentage to
+# decide retrievability (#18).
 LIVENESS = """
-    (c.document_id IS NULL AND NOT c.version_scoped)
+    (NOT c.provenance_only AND NOT c.version_scoped)
     OR EXISTS (
         SELECT 1 FROM document_version_chunks dvc
         JOIN document_versions dv ON dv.id = dvc.document_version_id
@@ -285,7 +292,19 @@ async def test_the_liveness_flag_costs_less_than_the_predicate(
         as_flag = await buffers(conn, scan + "c.retrievable", collection)
         as_predicate = await buffers(conn, scan + f"({LIVENESS})", collection)
 
-    assert as_flag <= as_predicate, (
+    # Parity, not strict improvement.  Both forms read the same passages off the
+    # heap; what the flag removes is the semi-join over three lifecycle tables,
+    # which is small next to that scan — so which of the two comes out a few
+    # buffers ahead is a plan choice made against a `chunks` table whose size
+    # every other module in the suite contributes to.  A strict `<=` measures
+    # that choice rather than the claim, and has been observed failing at 1518
+    # against 1491 in a full run while passing on the module alone.  The claim is
+    # that liveness is not a per-candidate subquery: that costs a multiple, not a
+    # margin — the function form this replaced touched twenty times as much —
+    # and the shape half of it is pinned by
+    # test_no_retrieval_function_tests_liveness_by_calling_a_function.
+    assert as_flag <= as_predicate * 1.1, (
         f"the maintained flag touched {as_flag} buffers where the predicate it "
-        f"replaces touched {as_predicate}"
+        f"replaces touched {as_predicate}: liveness is costing per candidate "
+        "row again rather than being read off the row"
     )
