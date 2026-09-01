@@ -1,24 +1,34 @@
 # pgkg — Postgres-native knowledge graph engine for agentic memory
 
-**The thesis:** Vanilla Postgres with `pgvector` and `tsvector` can match the retrieval quality of complex agent-memory stacks (Mem0, Zep, MemGPT) and knowledge graph systems that bolt on Kafka, Pinecone, Neo4j, etc. The only non-SQL components are embedding, reranking, and LLM-based proposition extraction — bundled in a single ~310-line file.
+**The thesis:** Vanilla Postgres with `pgvector` and `tsvector` can match the retrieval quality of complex agent-memory stacks (Mem0, Zep, MemGPT) and knowledge graph systems that bolt on Kafka, Pinecone, Neo4j, etc. The only non-SQL components are embedding, reranking, and LLM-based proposition extraction.
 
-```
-Python:          878 lines (config, db, ml, api, memory, cli)
-SQL:             393 lines (schema, search CTEs, PageRank)
-```
-
-**Two containers, one CTE:** Postgres does the work. Everything else is glue.
+**Two containers, one CTE:** Postgres does the work. Everything else is glue — and the ratio shows it. The retrieval pipeline, the tenancy boundary, the document lifecycle and the graph walk are all SQL; the Python is an HTTP surface, a model client and an ingest loop.
 
 ## What it does
 
-- **Hybrid retrieval:** BM25-ish keyword (tsvector) + dense vector (HNSW) fused via Reciprocal Rank Fusion.
-- **Graph expansion:** Retrieved entities seed a one-hop neighbor search; graph neighbors also participate in RRF.
-- **Recency and frequency decay:** Propositions get fresher over time and more valuable as they're accessed; exponential half-life (configurable, default 30 days).
-- **MMR diversity:** Maximal Marginal Relevance to avoid redundant results.
-- **Cross-encoder reranking:** Second-pass relevance scoring on top-k candidates.
-- **Session and namespace scoping:** Isolate memories by user session and logical namespace.
-- **Fact supersession:** Mark propositions as superseded when new facts replace old ones.
-- **Optional PageRank:** Offline (precomputed) link-based importance weighting on the entity graph.
+**Retrieval**
+
+- **Two stores, one surface:** passages and extracted facts are both answers to "what did we agree about the refund policy". `pgkg_retrieve()` runs both and fuses them; deciding between them is the caller's job, not the retriever's.
+- **Hybrid retrieval:** BM25 over `tsvector` with materialised corpus statistics + dense vector (HNSW over `halfvec`), fused via Reciprocal Rank Fusion.
+- **Graph expansion:** retrieved entities seed a one-hop neighbour search in both directions — facts to entities to passages and back — with every hop re-filtered through the seed's own visibility predicate.
+- **Quotas:** a ceiling on how much of a result set the corpus may take, and a floor under personal memory, so a 300-page handbook cannot bury what the user told you yesterday.
+- **Decay profiles per collection:** `conversational` (30-day half-life), `timeless` (flat), `perishable` (multi-year half-life keyed on the publication date, not the crawl date).
+- **MMR diversity** and **cross-encoder reranking** on the final candidate set.
+
+**Tenancy and provenance**
+
+- **Explicit scoping columns on every retrievable row** — org, collection, claim scope, visibility, owner, ACL group — read by one shared, inlinable predicate, and enforced again by row-level security.
+- **A sharing seam:** an operator can publish a collection that every tenant reads and none can write, without pooling anyone's private material into it.
+- **Bitemporal facts:** when a claim was recorded, when it was believed, when it was withdrawn and why. `pgkg_believed_at()` answers as of a past instant.
+- **Provenance as a shared immutable derivation record**, so erasure is an indexed query rather than a crawl.
+
+**Corpus lifecycle**
+
+- **Versioned documents and immutable content-addressed chunks:** an unchanged nightly crawl of 100k documents does no work at all, and a typo fixed in a 300-page handbook is one embedding call rather than 300.
+- **Atomic version flips** with reference-counted reclamation on a separate clock from retirement.
+- **Small-to-big context:** a hit comes back with its neighbouring passages, and never with passages from a document the caller could not have read.
+- **A batch ingest queue** with a worker, so a corpus crawl is not an HTTP request.
+- **Embedder generations:** the model that produced a vector is recorded, cosines from different model spaces are never compared, and a cutover can serve two spaces at once.
 
 ## Quickstart
 
@@ -88,44 +98,113 @@ cp .env.local-claude .env  # or .env.local-chunks
 ┌─────────────────────────────────────────────────────┐
 │ FastAPI app (pgkg/api.py)                           │
 ├─────────────────────────────────────────────────────┤
-│ POST /memorize  → embed + extract propositions      │
-│   body: {text, session_id?, source?, asserted_at?}  │
-│   asserted_at (ISO 8601): when the fact was         │
-│   originally asserted; drives recency decay when    │
-│   set, otherwise falls back to ingest time.         │
-│ POST /recall    → embed + search + rerank           │
-│ GET  /health    → liveness                          │
+│ Chat memory                                         │
+│   POST /memorize  → embed + extract + link          │
+│   POST /recall    → embed + retrieve + rerank + MMR │
+│   POST /forget    → withdraw a fact, with a reason  │
+│   POST /believed  → what was believed as of <t>     │
+│                                                     │
+│ Corpus                                              │
+│   POST /collections      → create, with its policy  │
+│   POST /documents        → upsert; queue=true for   │
+│                            the batch worker         │
+│   POST /documents/delete → soft delete              │
+│   GET  /jobs/{id}?org_id= → queue status            │
+│                                                     │
+│   GET  /health    → liveness                        │
+│                                                     │
+│ Every request carries a scope: org, collection,     │
+│ user, ACL groups, subscribed collections. Reads     │
+│ may widen to the operator's shared org; writes      │
+│ never do.                                           │
 │                                                     │
 │ Models loaded once at startup (lazy singletons):    │
 │ • SentenceTransformer (embeddings)                  │
 │ • CrossEncoder (reranking)                          │
-│ • LLM client (OpenAI / Anthropic / Ollama)          │
+│ • LLM client (OpenAI / Anthropic / Ollama / claude) │
 └─────────────────┬───────────────────────────────────┘
                   │
-                  ▼ (asyncpg)
+                  ▼ (asyncpg, one pooled connection per request,
+                  │  pgkg.org_id set on every one of them)
 ┌─────────────────────────────────────────────────────┐
 │ PostgreSQL (pgkg container, pgvector + tsvector)    │
 ├─────────────────────────────────────────────────────┤
-│ Tables:                                             │
-│   documents       chunks     propositions           │
-│   entities        edges      entity_pagerank        │
-│   corpus_stats    lexeme_df  proposition_cache      │
+│ Tenancy        orgs  users  collections             │
+│                collection_subscriptions             │
+│                tenant_shards                        │
+│ Facts          propositions  entities  edges        │
+│                entity_pagerank                      │
+│ Corpus         documents  document_versions         │
+│                document_version_chunks  chunks      │
+│ Graph bridge   entity_mentions  entity_links        │
+│ Time           provenance  proposition_provenance   │
+│ Ranking        corpus_stats  lexeme_df              │
+│ Embedders      embedder_generations  org_embedders  │
+│ Operational    ingest_jobs  embedding_cache         │
+│                proposition_cache                    │
 │                                                     │
-│ Key functions (everything below the line is SQL):   │
-│   pgkg_search()             → composes the stages   │
-│   pgkg_bm25_candidates()    → keyword arm           │
-│   pgkg_vector_candidates()  → vector arm            │
-│   pgkg_graph_candidates()   → one-hop expansion     │
-│   pgkg_fuse()               → weighted RRF          │
-│   pgkg_apply_profile()      → recency + frequency   │
-│   pgkg_link_entity()        → entity dedup          │
-│   pgkg_recompute_pagerank() → offline scoring       │
+│ Row-level security on every table with an org       │
+│ column; a test enumerates them and fails on a new   │
+│ one that arrives without a policy.                  │
 └─────────────────────────────────────────────────────┘
 ```
 
+### The SQL surface
+
+Everything below is a function a caller or an operator invokes. Each migration's header explains
+why it exists; those headers are the primary documentation for the schema.
+
+**Retrieval**
+
+| Function | What it does |
+|---|---|
+| `pgkg_retrieve()` | The two-store surface: both arms, fusion, quotas, decay, context windows |
+| `pgkg_search()` | The proposition-shaped surface, for callers that want exactly that |
+| `pgkg_bm25_candidates()` | Keyword arm, over either store, against materialised statistics |
+| `pgkg_vector_candidates()` | Vector arm, restricted to the org's primary embedding space |
+| `pgkg_generation_candidates()` | The second live generation's arm during a cutover window |
+| `pgkg_graph_candidates()` | One-hop expansion, in both directions, re-filtered per hop |
+| `pgkg_fuse()` | Weighted reciprocal rank fusion |
+| `pgkg_item_scope()` / `pgkg_apply_quotas()` | The corpus ceiling and the personal-memory floor |
+| `pgkg_apply_profile()` | Recency, frequency and the three decay profiles |
+| `pgkg_chunk_window()` | Small-to-big context, scoped to what the anchor itself carries |
+| `pgkg_visible()` / `pgkg_temporal_visible()` | The one shared read predicate, and its bitemporal half |
+
+**Corpus lifecycle**
+
+| Function | What it does |
+|---|---|
+| `pgkg_open_document_version()` | Opens the next version, or says the content has not moved |
+| `pgkg_add_version_chunk()` | Content-addressed insert; returns `is_new`, which is what says "embed this one" |
+| `pgkg_promote_document_version()` | The atomic flip: retire, promote, withdraw orphaned facts |
+| `pgkg_purge_retired_versions()` / `pgkg_gc_chunks()` | Reclamation, in two grace-period passes |
+| `pgkg_refresh_chunk_stats()` / `pgkg_refresh_corpus_stats()` | Full rebuild and drift repair for the ranking statistics |
+| `pgkg_enqueue_ingest_job()` / `pgkg_claim_ingest_job()` | The batch queue |
+
+**Graph and time**
+
+| Function | What it does |
+|---|---|
+| `pgkg_link_entity()` | Idempotent entity resolution |
+| `pgkg_match_entity_mentions()` | Gazetteer matching over new passages |
+| `pgkg_believed_at()` | What was believed as of a past instant |
+| `pgkg_contradict()` / `pgkg_expire_due()` | Withdrawal by contradiction and by expiry |
+| `pgkg_erase_provenance()` | Erasure as an indexed query |
+| `pgkg_recompute_pagerank()` | Offline centrality, per org |
+
+**Tenancy**
+
+| Function | What it does |
+|---|---|
+| `pgkg_current_org()` | Reads the `pgkg.org_id` GUC; every policy is written against it |
+| `pgkg_subscribed_orgs()` / `pgkg_subscribed_collections()` | Subscription resolution |
+| `pgkg_live_generations()` | Which embedding spaces a query must be embedded into |
+
 ## The hero query: RRF + graph expansion
 
-`pgkg_search()` orchestrates keyword retrieval, vector retrieval, RRF fusion and graph expansion. Each stage is its own set-returning function over a `pgkg_candidate` row type, so an arm can be tested, replaced or weighted on its own; `pgkg_search()` is the composition (see `migrations/010_search_decompose.sql`). Here's the RRF and fusion logic:
+`pgkg_retrieve()` orchestrates keyword retrieval, vector retrieval, RRF fusion, graph expansion, quotas, decay and context windows — over both stores. Each stage is its own set-returning function over a `pgkg_candidate` row type, so an arm can be tested, replaced or weighted on its own; `pgkg_retrieve()` is the composition (see `migrations/010_search_decompose.sql` for the decomposition and `031_corpus_retrieval.sql` for the two-store version). `pgkg_search()` is the same shape restricted to facts, kept for callers that want a proposition-shaped answer.
+
+Simplified to one store and one arm pair, the RRF and fusion logic reads:
 
 ```sql
 -- 1. Keyword retrieval (tsvector + ts_rank_cd)
@@ -134,7 +213,8 @@ WITH kw AS (
     FROM propositions p
     WHERE p.tsv @@ plainto_tsquery('english', q_text)
       AND p.namespace = p_namespace
-      AND p.superseded_by IS NULL
+      AND p.invalidated_at IS NULL
+      AND pgkg_visible(p.org_id, p.collection_id, ...)
     ORDER BY ts_rank_cd(p.tsv, ...) DESC
     LIMIT k_initial
 ),
@@ -145,7 +225,8 @@ vec AS (
     FROM propositions p
     WHERE p.embedding <=> q_embedding IS NOT NULL
       AND p.namespace = p_namespace
-      AND p.superseded_by IS NULL
+      AND p.invalidated_at IS NULL
+      AND pgkg_visible(p.org_id, p.collection_id, ...)
     ORDER BY p.embedding <=> q_embedding
     LIMIT k_initial
 ),
@@ -196,7 +277,10 @@ adjusted_score = rrf_score
                * confidence
 ```
 
-See `migrations/003_search.sql` for the complete function including all window functions and decay logic.
+The real keyword arm scores with BM25 against materialised statistics rather than `ts_rank_cd`, the
+real fusion is weighted and spans four arms over two stores, and every arm carries `pgkg_visible()`
+so that a scoped query prunes before it ranks. See `migrations/031_corpus_retrieval.sql` and
+`041_retrieval_statistics.sql` for the current functions.
 
 ## Quickstart
 
@@ -306,44 +390,90 @@ The app must run on the host (not in the Docker `app` container) because the SDK
 
 For benchmark runs or if you don't have a Claude subscription, use OpenAI / Anthropic / Ollama / OpenRouter. See [Configuration](#configuration) and the `.env.bench-*` presets. Budget ~$50-100 for a full LongMemEval-S + LoCoMo bench pass on the Mem0 stack.
 
-## Two modes: chunks vs propositions
+## Two stores, and the two ways in
 
-pgkg supports two ingest modes:
+There are two *stores* — passages and extracted facts — and two *ingest paths* that fill them.
+These are different axes, and the older "two modes" framing conflated them.
 
-**Propositions mode (default)** — chunks are split into atomic facts via an LLM extractor; entities are linked across documents; edges enable graph expansion. Best retrieval quality, especially on multi-hop QA. Costs ~$X per 1M tokens of input.
+**The stores.** `chunks` holds passages; `propositions` holds atomic facts. `pgkg_retrieve()` runs
+a keyword arm and a vector arm over each, fuses all of it with RRF, and applies quotas so neither
+store can crowd the other out. A result row says which store it came from (`source`), and a
+passage arrives with its neighbouring passages as `context_text`. Retrieving passages is not a
+degraded mode — it is one of the two stores the retriever is built around.
 
-**Chunks mode** (`--chunks-only` / `PGKG_EXTRACT_PROPOSITIONS=0`) — chunks are embedded and stored directly as propositions with no entity structure. Zero LLM cost at ingest. Equivalent to vanilla hybrid RAG (BM25 + vector + rerank + MMR + recency). Graph expansion is a no-op (no edges).
+**Chat ingest** (`POST /memorize`, `Memory.ingest`) is for conversation. It chunks the turn, and by
+default sends each chunk to an LLM extractor, links the entities it names, and writes the edges that
+make graph expansion possible. Its chunks are written as *provenance* — a fact can cite the text it
+came from — and are deliberately not retrievable in their own right, because returning both would
+return the same content twice and would keep returning the passage after the fact had been
+forgotten.
 
-Both modes use the same retrieval pipeline (`pgkg_search()`), the same rerank+MMR, and the same `Result` shape. You can mix them per-namespace by configuring different `Memory` instances.
+Set `PGKG_EXTRACT_PROPOSITIONS=0` (or `pgkg ingest --chunks-only`) and the extractor is skipped: no
+API key, no `claude` CLI, no LLM cost. You still get hybrid retrieval, reranking, MMR and recency
+decay; you lose entity-level recall and multi-hop expansion, which need extracted facts. This is
+the fastest way to try the system, and for a lot of "drop in some files and search" cases it is
+enough. Caveat worth knowing: in this mode each chunk is still written as a proposition row with
+NULL `subject`/`predicate`/`object`, which is a leftover from before the corpus store existed. It
+works, and it is on the list to remove.
 
-The point: chunk RAG is a perfectly fine starting point for a lot of agent-memory use cases (especially in pgkg, since you still get hybrid retrieval and rerank). Add proposition extraction when you need entity-level recall or multi-hop reasoning. The headline benchmark numbers below quantify the gap.
+**Corpus ingest** (`POST /documents`, `CorpusIngest.upsert_document`) is for documents. It versions
+the document, content-addresses its chunks so an unchanged crawl is free, embeds only what is new,
+and promotes the new version atomically. Extraction here is **opt-in per collection**, and off by
+default: extracting a whole handbook is a recurring cost, lossy on exactly the content corpora are
+made of, and the gazetteer mention edge gets most of the graph benefit for nothing. Turn it on for
+the fact-dense minority of collections that earn it.
+
+The two paths share the retriever, the rerank and MMR pass, the `Result` shape and the tenancy
+boundary. Mix them freely: a collection can hold either, and a query can name both stores or one.
 
 ## Configuration
 
 All settings are environment variables. See `.env.example` and `pgkg/config.py` for defaults.
 
+Every variable takes the `PGKG_` prefix — `PGKG_EMBED_MODEL`, not `EMBED_MODEL`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DATABASE_URL` | `postgresql://postgres:postgres@localhost:5432/pgkg` | Postgres connection string |
-| `EMBED_MODEL` | `BAAI/bge-m3` | HuggingFace sentence-transformer model for embeddings |
-| `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace cross-encoder for reranking |
-| `LLM_MODEL` | `gpt-4o-mini` | LLM for proposition extraction |
-| `LLM_PROVIDER` | `openai` | One of: `openai`, `anthropic`, `ollama`, `claude_code` (local dev only — requires `claude` CLI) |
-| `OPENAI_API_KEY` | (unset) | OpenAI API key (required if `LLM_PROVIDER=openai`) |
-| `ANTHROPIC_API_KEY` | (unset) | Anthropic API key (required if `LLM_PROVIDER=anthropic`) |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint (used if `LLM_PROVIDER=ollama`) |
-| `OFFLINE_EXTRACT` | `0` | Set to `1` to skip LLM calls (test mode); uses dummy extraction |
-| `EXTRACT_PROPOSITIONS` | `true` | Set to `0` or `false` to skip LLM extraction entirely; store chunks directly as propositions (NULL subject/predicate/object). Zero LLM cost at ingest. See [Two modes](#two-modes-chunks-vs-propositions). |
-| `DEFAULT_NAMESPACE` | `default` | Default namespace for memories |
+| `PGKG_DATABASE_URL` | (unset) | Postgres connection string. **When unset, pgkg starts an embedded Postgres via `pgserver` — no Docker.** Set it to point at an external instance. |
+| `PGKG_EMBED_MODEL` | `BAAI/bge-m3` | HuggingFace sentence-transformer model for embeddings |
+| `PGKG_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace cross-encoder for reranking |
+| `PGKG_LLM_PROVIDER` | `openai` | One of `openai`, `anthropic`, `ollama`, `claude_code` (local dev only — requires the `claude` CLI) |
+| `PGKG_LLM_MODEL` | `gpt-4o-mini-2024-07-18` | LLM for proposition extraction. Pinned with a dated suffix so benchmark runs are reproducible. |
+| `PGKG_EXTRACTOR_MODEL` | (unset) | Overrides `PGKG_LLM_MODEL` for extraction only — the "extract with one model, answer with another" setup |
+| `PGKG_JUDGE_MODEL` | `gpt-4o-2024-08-06` | Benchmark judge; pinned to match published LongMemEval/LoCoMo setups |
+| `PGKG_JUDGE_PROVIDER` | `openai` | Provider for the judge |
+| `PGKG_OPENAI_API_KEY` | (unset) | Required when the provider is `openai`. The plain `OPENAI_API_KEY` also works, via the SDK's own fallback. |
+| `PGKG_ANTHROPIC_API_KEY` | (unset) | Required when the provider is `anthropic`; `ANTHROPIC_API_KEY` also works |
+| `PGKG_OPENAI_BASE_URL` | (unset) | Point at OpenRouter, Groq, or any OpenAI-compatible endpoint |
+| `PGKG_OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama endpoint |
+| `PGKG_OFFLINE_EXTRACT` | `0` | Set to `1` to skip every LLM call and use deterministic dummy extraction. What the test suite runs with. |
+| `PGKG_EXTRACT_PROPOSITIONS` | `true` | Set to `0` to skip LLM extraction on the chat path. Zero LLM cost at ingest. See [Two stores](#two-stores-and-the-two-ways-in). Corpus extraction is a per-collection property, not this flag. |
+| `PGKG_DEFAULT_NAMESPACE` | `default` | Default namespace for memories |
+| `PGKG_PROMPT_VERSION` | `v1` | Informational; logged into the benchmark report. The source of truth is `PROMPT_VERSION` in `ml.py`. |
+
+The embedding width is deliberately **not** configurable: it is a property of the schema, read with
+`pgkg_embedding_dim('propositions', 'embedding')` and owned by the embedder registry. A settings
+field could only disagree with the column it described.
+
+Scope — org, collection, user, ACL groups — is per request, not per deployment. It arrives on the
+HTTP body or on a `Memory`/`CorpusIngest` instance, and the reserved default org and collection are
+what an unscoped caller lands in.
 
 ### Development mode
 
-To run tests and avoid needing LLM keys:
+The suite runs against a real Postgres — every assertion goes through SQL, because that is where the
+behaviour lives. It picks a backend itself: an embedded `pgserver` if the bundled build has
+`pg_trgm` and `pgcrypto`, otherwise a `pgvector/pgvector:pg16` testcontainer. Force one with
+`PGKG_TEST_BACKEND=embedded|docker`.
 
 ```bash
-export PGKG_OFFLINE_EXTRACT=1
-uv run pytest -q
+PGKG_OFFLINE_EXTRACT=1 uv run --python 3.12 pytest -q
 ```
+
+`PGKG_OFFLINE_EXTRACT=1` replaces every LLM call with deterministic dummy extraction, so no keys
+are needed. Note that the suite connects as the container's owning superuser, for whom every RLS
+policy is inert: an isolation test has to `SET LOCAL ROLE pgkg_app` **inside a transaction** to
+exercise the policy rather than just the SQL predicate.
 
 ## Benchmarks
 
@@ -431,41 +561,73 @@ We get scale, durability, and observability for free. The trade-offs are honest:
 
 ```
 pgkg/
-├── migrations/                # SQL schema and functions
-│   ├── 001_extensions.sql     # Enable pgvector, pg_trgm
-│   ├── 002_schema.sql         # Tables: documents, chunks, propositions, entities, edges
-│   ├── 003_search.sql         # pgkg_link_entity(), pgkg_bump_access()
-│   ├── 004_pagerank.sql       # pgkg_recompute_pagerank()
-│   ├── 005–009                # Extract cache, asserted_at, BM25, OR semantics
-│   ├── 010_search_decompose.sql  # pgkg_search() as composable candidate SRFs
-│   ├── 011_bm25_stats.sql     # Materialised corpus_stats + lexeme_df
-│   ├── 012_halfvec_dims.sql   # halfvec storage, no hardcoded dimension
-│   └── 013_link_entity_idempotent.sql  # Concurrent entity resolution
+├── migrations/                 # SQL schema and functions, applied in order.
+│   │                           # Each file's header explains why it exists;
+│   │                           # those headers are the schema documentation.
+│   ├── 001–013                 # Base schema, search, PageRank, extract cache,
+│   │                           #   asserted_at, BM25 statistics, composable
+│   │                           #   candidate SRFs, halfvec, idempotent linking
+│   ├── 020–026                 # Tenancy: scoping columns, RLS, provenance,
+│   │                           #   bitemporal columns, collections, embedder
+│   │                           #   generations, entity and PageRank scope
+│   ├── 030–033                 # Corpus: document versions, content-addressed
+│   │                           #   chunks, the two-store retriever, the ingest
+│   │                           #   queue, the application surface
+│   ├── 040                     # entity_mentions and the entity_links bridge
+│   └── 041–045                 # The verification fix pass — see
+│                               #   docs/adrs/0001-verification-findings.md
 │
-├── pgkg/                       # Python package (~350 lines)
-│   ├── config.py              # Settings (pydantic)
-│   ├── db.py                  # asyncpg pool + pgvector init
-│   ├── chunking.py            # Content-defined chunk boundaries
-│   ├── memory.py              # Ingest and recall
-│   ├── ml.py                  # Embeddings, reranking, MMR, proposition extraction
-│   └── api.py                 # FastAPI endpoints (created by Phase 2b)
+├── pgkg/                       # Python package
+│   ├── config.py               # Settings (pydantic) + the embedder registry readers
+│   ├── db.py                   # asyncpg pool, pgvector codec, iterative scan
+│   ├── embedded.py             # Embedded Postgres via pgserver (no Docker)
+│   ├── chunking.py             # Content-defined chunk boundaries
+│   ├── memory.py               # Scope, chat ingest, recall, forget, believed_at
+│   ├── corpus.py               # CorpusIngest: versions, chunks, embeddings
+│   ├── ingest_jobs.py          # The batch queue and its worker
+│   ├── gazetteer.py            # Entity mention matching over new passages
+│   ├── ml.py                   # Embeddings, reranking, MMR, extraction
+│   ├── api.py                  # FastAPI endpoints
+│   └── cli.py                  # migrate, serve, ingest, recall, worker
 │
-├── tests/                      # Integration tests
-│   ├── conftest.py            # Fixtures (test Postgres container)
-│   └── test_search_sql.py      # SQL function tests
+├── docs/adrs/                  # Architecture decisions
+│   ├── 0001-corpus-embeddings-and-knowledge-graph.md   # the design authority
+│   ├── 0001-implementation-notes.md                    # what was built, and why it differs
+│   └── 0001-verification-findings.md                   # the audit and its outcome
 │
-├── scripts/                    # Utilities
-│   └── run_migrations.py       # Apply .sql migrations to the database
+├── tests/                      # Integration tests against a real Postgres
+│   ├── conftest.py             # Embedded pgserver, or a testcontainer
+│   └── test_*.py               # One module per subject
 │
+├── bench/                      # LoCoMo and LongMemEval harnesses
+├── scripts/run_migrations.py   # Apply .sql migrations to the database
 ├── Dockerfile                  # Multi-stage build (builder + runtime)
 ├── docker-compose.yml          # Postgres (pgvector) + FastAPI app
 ├── Makefile                    # Common tasks (up, down, test, smoke, psql)
-└── pyproject.toml             # Project metadata and dependencies
+└── pyproject.toml              # Project metadata and dependencies
 ```
+
+## Design decisions
+
+The schema is not obvious, and the reasons are written down rather than implied.
+
+- [**ADR-0001 — Corpus embeddings alongside the proposition knowledge graph**](docs/adrs/0001-corpus-embeddings-and-knowledge-graph.md)
+  is the design authority: two physical stores, tenancy, provenance, the document lifecycle, vector
+  representation, embedder generations, and what deliberately not to build.
+- [**Implementation notes**](docs/adrs/0001-implementation-notes.md) — what phases 0–3 actually
+  built, every conscious deviation from the ADR with its reason, and what is deferred to phase 4.
+  Read this before changing the schema.
+- [**Verification findings**](docs/adrs/0001-verification-findings.md) — 26 defects found by three
+  independent adversarial audits of phases 0–3, each with its reproduction and the commit that
+  closed it, plus a fourth pass that re-audited the fixes.
 
 ## Status
 
-**Alpha, research-grade.** This is a working proof-of-concept. The schema and SQL functions are stable; Python APIs may change.
+**Alpha, research-grade.** This is a working proof-of-concept. The schema and SQL functions are the
+stable part — they are heavily tested and adversarially audited — and the Python APIs may still
+change. Phases 0–3 of ADR-0001 are complete; phase 4 (partitioning, binary quantization,
+consolidation jobs, the predicate vocabulary, summaries) is not started, and the seams for it are
+listed in the [implementation notes](docs/adrs/0001-implementation-notes.md#4-deferred-to-phase-4).
 
 ## License
 
