@@ -74,6 +74,11 @@ class IngestJob:
     source: str | None = None
     asserted_at: datetime | None = None
     provenance: Provenance | None = None
+    # The group the connector says the document belongs to (D3).  It cannot be
+    # recovered from the payload, so a queue that dropped it would make the
+    # ingest-side ACL field work inline and silently not at all through the
+    # queue — which is the default posture for a corpus.
+    acl_group_id: UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -111,17 +116,19 @@ class CorpusPipeline(Protocol):
         source: str | None = ...,
         asserted_at: datetime | None = ...,
         provenance: Provenance | None = ...,
+        acl_group_id: UUID | None = ...,
         on_progress: Callable[[int, int], Awaitable[None]] | None = ...,
     ) -> CorpusIngestResult: ...
 
 
 _ENQUEUE_SQL = (
-    "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)"
+    "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb,"
+    " $10)"
 )
 
 _CLAIM_SQL = """
 SELECT job_id, org_id, collection_id, external_id, uri, payload, content_hash,
-       attempts, source, asserted_at, provenance
+       attempts, source, asserted_at, provenance, acl_group_id
 FROM pgkg_claim_ingest_job($1, make_interval(secs => $2))
 """
 
@@ -156,6 +163,7 @@ async def enqueue_document(
     source: str | None = None,
     asserted_at: datetime | None = None,
     provenance: Provenance | None = None,
+    acl_group_id: UUID | None = None,
 ) -> UUID:
     """Offer one document to the queue, returning the job that holds it.
 
@@ -174,6 +182,7 @@ async def enqueue_document(
             source,
             asserted_at,
             dump_provenance(provenance),
+            acl_group_id,
         )
 
 
@@ -200,6 +209,7 @@ async def claim_job(
         source=row["source"],
         asserted_at=row["asserted_at"],
         provenance=load_provenance(row["provenance"]),
+        acl_group_id=row["acl_group_id"],
     )
 
 
@@ -309,6 +319,7 @@ class IngestWorker:
             source=job.source,
             asserted_at=job.asserted_at,
             provenance=job.provenance,
+            acl_group_id=job.acl_group_id,
             on_progress=self._progress_reporter(job),
         )
 

@@ -497,6 +497,7 @@ class FakeIngest:
         source=None,
         asserted_at=None,
         provenance=None,
+        acl_group_id=None,
         on_progress=None,
     ):
         from pgkg.corpus import CorpusIngestResult

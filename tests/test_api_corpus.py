@@ -90,14 +90,15 @@ async def _collection(
     kind: str = "corpus",
     claim_scope: str = "org",
     extract_propositions: bool = False,
+    acl_mode: str = "none",
 ) -> uuid.UUID:
     async with pool.acquire() as conn:
         return await conn.fetchval(
             """
             INSERT INTO collections
                 (org_id, owner_org_id, name, kind, claim_scope,
-                 extract_propositions)
-            VALUES ($1, $1, $2, $3, $4, $5)
+                 extract_propositions, acl_mode)
+            VALUES ($1, $1, $2, $3, $4, $5, $6)
             RETURNING id
             """,
             org_id,
@@ -105,6 +106,7 @@ async def _collection(
             kind,
             claim_scope,
             extract_propositions,
+            acl_mode,
         )
 
 
@@ -465,6 +467,133 @@ async def test_http_job_status_answers_is_my_corpus_indexed_yet(
     assert done["document_id"] is not None
     assert done["version_id"] is not None
     assert unknown.status_code == 404
+
+
+async def test_http_document_upsert_refuses_untagged_content_when_acl_bounded(
+    pool: asyncpg.Pool, dim: int, monkeypatch
+) -> None:
+    """A collection can declare an ACL mode over HTTP, so the refusal has to
+    arrive over HTTP too: an unenforced acl_mode is D3's permission-laundering
+    machine with a green status code on top."""
+    org = await _org(pool)
+    bounded = await _collection(pool, org, kind="corpus", acl_mode="group")
+    namespace = _unique("http_acl_refused")
+
+    async with _api(pool, namespace, monkeypatch) as client:
+        refused = await client.post(
+            "/documents",
+            json={
+                "org_id": str(org),
+                "collection_id": str(bounded),
+                "external_id": _unique("untagged_doc"),
+                "text": CORPUS_TEXT,
+            },
+        )
+
+    assert refused.status_code == 400
+    assert "acl_group_id" in refused.json()["detail"]
+
+    async with pool.acquire() as conn:
+        landed = await conn.fetchval(
+            "SELECT count(*) FROM documents WHERE collection_id = $1", bounded
+        )
+    assert landed == 0
+
+
+async def test_http_document_upsert_tags_a_document_inline(
+    pool: asyncpg.Pool, dim: int, monkeypatch
+) -> None:
+    """The inline branch, which is what a human uploading one document and
+    watching it hits. Nothing populates the group automatically yet, so being
+    able to state it is the whole of the write half a caller has today."""
+    org = await _org(pool)
+    bounded = await _collection(pool, org, kind="corpus", acl_mode="group")
+    group = uuid.uuid4()
+    namespace = _unique("http_acl_inline")
+
+    async with _api(pool, namespace, monkeypatch) as client:
+        tagged = await client.post(
+            "/documents",
+            json={
+                "org_id": str(org),
+                "collection_id": str(bounded),
+                "external_id": _unique("tagged_inline"),
+                "text": CORPUS_TEXT,
+                "acl_group_id": str(group),
+            },
+        )
+
+    assert tagged.status_code == 200
+    assert tagged.json()["changed"] is True
+
+    async with pool.acquire() as conn:
+        groups = await conn.fetch(
+            "SELECT DISTINCT acl_group_id FROM chunks WHERE collection_id = $1",
+            bounded,
+        )
+    assert [row["acl_group_id"] for row in groups] == [group]
+
+
+async def test_http_document_upsert_carries_the_acl_group_through_the_queue(
+    pool: asyncpg.Pool, dim: int, monkeypatch
+) -> None:
+    """The field has to work on both branches of the endpoint. Batch is the
+    default posture for a corpus (D7), so a group honoured inline and dropped
+    on the queued path is the same silent half-wiring in a new place."""
+    from pgkg.ingest_jobs import IngestWorker
+
+    org = await _org(pool)
+    chat = await _collection(pool, org, kind="chat")
+    bounded = await _collection(pool, org, kind="corpus", acl_mode="group")
+    group = uuid.uuid4()
+    namespace = _unique("http_acl_queued")
+
+    async with _api(pool, namespace, monkeypatch) as client:
+        queued = await client.post(
+            "/documents",
+            json={
+                "org_id": str(org),
+                "collection_id": str(bounded),
+                "external_id": _unique("tagged_doc"),
+                "text": CORPUS_TEXT,
+                "acl_group_id": str(group),
+                "queue": True,
+            },
+        )
+        worker = IngestWorker(
+            pool,
+            ingest=CorpusIngest(
+                pool, org_id=org, collection_id=bounded, embed=_make_embed(dim)
+            ),
+            org_id=org,
+        )
+        await worker.run(max_jobs=1)
+
+        recall_body = {
+            "query": "refund policy",
+            "org_id": str(org),
+            "collection_id": str(chat),
+            "subscribed_collection_ids": [str(bounded)],
+            "with_rerank": False,
+            "with_mmr": False,
+        }
+        granted = (
+            await client.post(
+                "/recall", json={**recall_body, "acl_groups": [str(group)]}
+            )
+        ).json()
+        withheld = (await client.post("/recall", json=recall_body)).json()
+
+    assert queued.status_code == 200
+    async with pool.acquire() as conn:
+        groups = await conn.fetch(
+            "SELECT DISTINCT acl_group_id FROM chunks WHERE collection_id = $1",
+            bounded,
+        )
+    assert [row["acl_group_id"] for row in groups] == [group]
+
+    assert [r for r in granted if r["source"] == "chunks"]
+    assert [r for r in withheld if r["source"] == "chunks"] == []
 
 
 # ---------------------------------------------------------------------------

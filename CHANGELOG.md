@@ -3,7 +3,7 @@
 ## 0.6.0
 
 ADR-0001 phases 0-3: the corpus becomes a first-class retrievable store alongside the proposition
-graph, and the whole schema gains a tenancy boundary. Migrations 010-047. See
+graph, and the whole schema gains a tenancy boundary. Migrations 010-048. See
 [`docs/adrs/0001-implementation-notes.md`](docs/adrs/0001-implementation-notes.md) for what was
 built against what was specified, and every deliberate deviation.
 

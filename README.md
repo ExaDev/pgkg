@@ -462,6 +462,13 @@ Scope — org, collection, user, ACL groups — is per request, not per deployme
 HTTP body or on a `Memory`/`CorpusIngest` instance, and the reserved default org and collection are
 what an unscoped caller lands in.
 
+The ACL group is the one scoping column the *writer* has to state. A row with no group passes the
+read predicate for every caller of the tenant, so a collection created with `acl_mode: "group"`
+refuses content that names none: pass `acl_group_id` on `POST /documents` or to
+`CorpusIngest.upsert_document`. Nothing populates it automatically — mirroring a SharePoint or
+Drive group tree is not built — so today it is the connector's to supply, and an ACL-bounded
+collection fails closed rather than publishing untagged content.
+
 ### Development mode
 
 The suite runs against a real Postgres — every assertion goes through SQL, because that is where the
