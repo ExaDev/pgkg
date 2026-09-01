@@ -153,6 +153,12 @@ class DocumentRequest(ScopedRequest):
     source: str | None = None
     asserted_at: datetime | None = None
     provenance: ProvenanceRequest | None = None
+    # Which group of the source system's permissions this document sits behind
+    # (D3).  Nothing populates it automatically — that needs the group sync
+    # phase 4 owes — so it is the connector's to state, and a collection whose
+    # acl_mode is not 'none' refuses a document that leaves it unset rather
+    # than publishing it to every caller of the tenant.
+    acl_group_id: UUID | None = None
     # Batch ingest is the default posture for a corpus (D7); inline ingest is
     # for the single document a human just uploaded and is watching.
     queue: bool = False
@@ -324,7 +330,8 @@ WHERE p.org_id = $1
 # Enqueued through a connection carrying the org, because ingest_jobs holds the
 # document text and is therefore under RLS like every other tenant table.
 _ENQUEUE_SQL = (
-    "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)"
+    "SELECT pgkg_enqueue_ingest_job($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb,"
+    " $10)"
 )
 
 
@@ -394,6 +401,7 @@ async def upsert_document(req: DocumentRequest) -> dict:
                     if req.provenance
                     else None
                 ),
+                req.acl_group_id,
             )
         return {"job_id": str(job_id)}
 
@@ -408,6 +416,7 @@ async def upsert_document(req: DocumentRequest) -> dict:
             source=req.source,
             asserted_at=req.effective_asserted_at,
             provenance=provenance,
+            acl_group_id=req.acl_group_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

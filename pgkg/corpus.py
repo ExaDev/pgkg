@@ -81,11 +81,12 @@ class CorpusIngestResult:
 
 @dataclass(frozen=True)
 class _CollectionPolicy:
-    """The three collection columns this pipeline obeys."""
+    """The four collection columns this pipeline obeys."""
 
     claim_scope: str
     extract_propositions: bool
     public_source: bool
+    acl_mode: str
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ class _Generation:
 
 
 _COLLECTION_POLICY_SQL = """
-SELECT claim_scope, extract_propositions, public_source
+SELECT claim_scope, extract_propositions, public_source, acl_mode
 FROM collections WHERE id = $1
 """
 
@@ -206,9 +207,9 @@ WITH inserted AS (
     INSERT INTO propositions
         (text, embedding, predicate, object_literal, chunk_id, org_id,
          collection_id, claim_scope, provenance_id, asserted_at,
-         embedder_generation_id)
+         embedder_generation_id, acl_group_id)
     SELECT p.text, p.embedding, p.predicate, p.object_literal, p.chunk_id,
-           $1, $2, $3, $4, $5, $6
+           $1, $2, $3, $4, $5, $6, $12
     FROM unnest($7::text[], $8::halfvec[], $9::text[], $10::text[], $11::uuid[])
          AS p(text, embedding, predicate, object_literal, chunk_id)
     RETURNING id
@@ -450,6 +451,7 @@ class CorpusIngest:
         source: str | None = None,
         asserted_at: datetime | None = None,
         provenance: Provenance | None = None,
+        acl_group_id: UUID | None = None,
         on_progress: ProgressFn | None = None,
     ) -> CorpusIngestResult:
         version_hash = document_hash(text)
@@ -467,6 +469,7 @@ class CorpusIngest:
         async with self._pool.acquire() as conn:
             await conn.execute(_SET_ORG_SQL, str(self._org_id))
             policy = await self._policy(conn)
+            self._require_acl_group(policy, acl_group_id)
             generation = await self._generation(conn)
             unchanged = await conn.fetchrow(
                 _FIND_UNCHANGED_SQL,
@@ -540,7 +543,9 @@ class CorpusIngest:
 
                 provenance_id = await self._attribute(conn, version_id, given, uri)
                 await self._update_document(conn, document_id, source, uri)
-                linked = await self._link_chunks(conn, version_id, chunks, asserted)
+                linked = await self._link_chunks(
+                    conn, version_id, chunks, asserted, acl_group_id
+                )
                 new_chunks = list(
                     {
                         chunk_id: chunk_text
@@ -561,6 +566,7 @@ class CorpusIngest:
                     linked,
                     extracted,
                     proposition_vectors,
+                    acl_group_id,
                 )
                 if extract_cache is not None:
                     await extract_cache.flush(conn)
@@ -576,6 +582,26 @@ class CorpusIngest:
             embedded=len(fresh),
             cache_hits=len(cached),
             propositions=propositions,
+        )
+
+    def _require_acl_group(
+        self, policy: _CollectionPolicy, acl_group_id: UUID | None
+    ) -> None:
+        """Refuse untagged content offered to an ACL-bounded collection (D3).
+
+        Asked before anything is spent, and before the unchanged-hash
+        short-circuit: a connector pointed at an ACL-bounded collection with no
+        group is misconfigured whether or not tonight's crawl moved.  The
+        database refuses the same write — this is the message that says why, and
+        the one that arrives before the embedder bill.
+        """
+        if policy.acl_mode == "none" or acl_group_id is not None:
+            return
+        raise ValueError(
+            f"collection {self._collection_id} has acl_mode"
+            f" {policy.acl_mode!r}, so an ingest into it must name an"
+            " acl_group_id: an untagged row passes the retrieval predicate for"
+            " every caller"
         )
 
     async def _known_content(
@@ -608,6 +634,7 @@ class CorpusIngest:
             claim_scope=row["claim_scope"],
             extract_propositions=row["extract_propositions"],
             public_source=row["public_source"],
+            acl_mode=row["acl_mode"],
         )
 
     async def _generation(self, conn: asyncpg.Connection) -> _Generation:
@@ -683,6 +710,7 @@ class CorpusIngest:
         version_id: UUID,
         chunks: Sequence[Chunk],
         asserted_at: datetime | None,
+        acl_group_id: UUID | None,
     ) -> list[tuple[UUID, str, bool]]:
         """Link every chunk of the document to the open version, in one call.
 
@@ -695,7 +723,7 @@ class CorpusIngest:
             version_id,
             [chunk.ordinal for chunk in chunks],
             [chunk.text for chunk in chunks],
-            None,
+            acl_group_id,
             asserted_at,
         )
         return [
@@ -801,8 +829,14 @@ class CorpusIngest:
         linked: list[tuple[UUID, str, bool]],
         extracted: list[tuple[str, Proposition]],
         vectors: list[HalfVector],
+        acl_group_id: UUID | None,
     ) -> int:
-        """Land the extracted facts, each citing the passage it came from."""
+        """Land the extracted facts, each citing the passage it came from.
+
+        A fact carries the ACL group of the document it was extracted from: a
+        proposition is the passage restated, so one that lost the group would
+        launder the document through the other arm of the same retriever.
+        """
         if not extracted:
             return 0
         chunk_ids = {chunk_text: chunk_id for chunk_id, chunk_text, _ in linked}
@@ -826,5 +860,6 @@ class CorpusIngest:
             [prop.predicate for _, prop, _ in rows],
             [prop.object for _, prop, _ in rows],
             [chunk_id for chunk_id, _, _ in rows],
+            acl_group_id,
         )
         return len(rows)
