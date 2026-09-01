@@ -36,3 +36,6 @@ bench/.cache/
 *.swp
 *.swo
 .omc/
+
+# Agent worktrees created by Claude Code
+.claude/worktrees/
