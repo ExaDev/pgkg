@@ -532,6 +532,13 @@ Postgres:
 PGKG_LLM_PROVIDER=claude_code PGKG_OFFLINE_EXTRACT=0 ./scripts/e2e_mcp.sh
 ```
 
+It stands up its own container, applies every migration to an empty database and then drives the
+product: the MCP handshake and its scope arguments, chat ingest, document upsert and re-offer,
+retrieval over both stores, `forget`, the mention sweep through `pgkg maintain`, entity dedup on a
+near-identical name, `GET /health` against the catalog it reports on, and one passage offered to two
+collections. It prints one KNOWN GAP: the mention edge is wired but a graph-only candidate does not
+survive the corpus quota, so it does not yet change what `recall` returns.
+
 Name every extra you want when syncing the venv — `uv sync` removes what you leave out, and
 dropping `claude_agent` makes the run above fail as a provider error rather than a missing package:
 

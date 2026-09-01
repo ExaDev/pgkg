@@ -42,6 +42,20 @@ deliberate). Full reasoning in
   `chunks.provenance_only`, which the writer states; every existing row keeps the answer it had. The
   pointer survives only as the record of which document a chat-provenance chunk came out of, read by
   one named bridge trigger — which is what makes eventually dropping it mechanical.
+- **The end-to-end harness covers the four fixes, and reports what it could not confirm.**
+  `scripts/e2e_mcp.py` gained four sections past the retrieval walkthrough it had: the mention sweep
+  run the way an operator runs it (`pgkg maintain --task mentions`), with a before/after on whether
+  retrieval carries a document that shares no word with the question, and a second run asserted to
+  be a no-op; entity dedup across `ExaDev` and `ExaDev Ltd`; `GET /health` checked against the
+  catalog it reports on, plus the migration ledger against the migrations directory; and one passage
+  offered to two collections, asserting both addresses carry a vector. What the new sections found
+  is recorded rather than hidden: the mention edge exists and the graph arm emits the document, but a
+  graph-only candidate contributes `w_graph × MIN(seed fused score)` — below every keyword and
+  vector candidate by construction — and the corpus quota (`k_rerank × corpus_fraction`, 38 at the
+  defaults) drops it before the cross-encoder sees it. Measured on 310 passages in one collection,
+  `recall()` returns the same list at k=5, 10 and 20 whether the mention rows are present or
+  deleted. So D2's payoff does not reach an agent yet: the harness asserts the wiring, and prints
+  the gap on every run.
 
 ## 0.6.0
 
