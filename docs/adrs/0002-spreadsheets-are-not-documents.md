@@ -1,4 +1,4 @@
-# ADR-0002: Spreadsheets are not documents
+# ADR-0002: Spreadsheets are a canvas, not a table
 
 **Status:** Proposed
 **Date:** 2026-09-02
@@ -10,20 +10,23 @@
 
 ## Summary
 
-A spreadsheet is not a document. It is **a database with presentation**, and the corpus pipeline
-treats it as prose: flatten to text, chunk at a size cap, embed each chunk. That destroys the only
-thing that made the data useful — a cell's meaning lives in its row label and column header, and
-chunking severs both.
+A spreadsheet is not a document, and it is not reliably a table either. It is **a canvas**: a
+sparse grid on which someone put a table here, a paragraph of commentary there, a couple of
+label/value pairs in the margin, and a stray note in `M42`. Any design that begins by asking
+"what shape is this sheet" has already assumed more structure than the file has.
 
-This ADR proposes treating spreadsheets as a distinct source class, with the **column** rather
-than the sheet as the unit of classification, and it argues for the opposite of the obvious move:
-**a table is already a fact store, so the graph should reference it rather than copy it.**
+The governing principle of this ADR is therefore:
 
-> **Revision note.** An earlier draft of this ADR proposed materialising every
-> `(row label, column header, value)` triple as a proposition, on the grounds that structural
-> extraction is cheap and lossless where ADR-0001 D2 rules out LLM extraction as expensive and
-> lossy. That premise is true and the conclusion did not follow. §"Why the obvious move is wrong"
-> records why, because the reasoning is the useful part of this document.
+> **Classification adds retrieval paths. It never decides what survives.**
+
+Every populated cell is captured losslessly first. Structure recognition then layers *better*
+ways to reach that content on top, and when recognition fails — which it will, often — the
+baseline still answers.
+
+> **Revision note.** Two earlier drafts are recorded in "Alternatives rejected" because their
+> reasoning is the useful part: the first materialised every cell as a graph proposition, the
+> second classified whole sheets and then their columns. The first saturates the graph; the second
+> assumes a tidiness that spreadsheets do not have.
 
 ---
 
@@ -31,265 +34,274 @@ than the sheet as the unit of classification, and it argues for the opposite of 
 
 ### What prompted this
 
-Loading a spreadsheet-heavy corpus through the pipeline. Two document converters disagreed about
-the same workbook by more than an order of magnitude in extracted text, and in opposite
-directions on different sheets — one preserving markdown tables, the other flattening cells and
-emitting no tables at all. That disagreement is not a bug in either: it is two reasonable answers
-to a question nobody has decided, which is *what the text of a spreadsheet even is*.
+Loading a spreadsheet-heavy corpus. Two document converters disagreed about the same workbook by
+more than an order of magnitude in extracted text, and in opposite directions on different sheets.
 
-Then, more damningly: `40%` in a chunk is noise. `Widget A | unit cost | 4.20` is a fact. Current
-chunking produces the former.
+That comparison asked both of them for **markdown**, which was the mistake. Markdown is a 1D
+serialisation of a 2D sparse canvas, and there is no faithful way to do that: any projection must
+choose which spatial relationships to discard, and two reasonable implementations choose
+differently. The disagreement was a property of the output format, not of either library.
+
+So the useful question is not which markdown output is better. It is whether the canvas can be
+had at all — which is a question for the reader, not for this pipeline. See "Where this belongs".
+
+Then, more damningly: `40%` in a chunk is noise, where `Widget A | unit cost | 4.20` is a fact.
+Flatten-and-chunk produces the former, because a cell's meaning lives in the cells around it and
+chunking severs that.
 
 ### The questions people actually ask
 
-Taking a status matrix and a pricing model as the two archetypes:
+| Question | What answers it |
+|---|---|
+| "What discount did we assume?" | A cell, with whatever labels its neighbours give it |
+| "What are the stages?" | A column, coherently |
+| "How is ROI calculated?" | The **formula** — converters strip these entirely |
+| "Which rows are above a threshold?" | A filter over rows: this is SQL, not retrieval |
+| "What did the reviewer note about Q3?" | A paragraph someone typed into a cell |
+| "What's in this workbook?" | A summary — and permission to go look properly |
 
-| Question | What answers it | Current pipeline |
-|---|---|---|
-| "What discount did we assume for this account?" | Cell lookup: label → value, with header context | Fragment without headers |
-| "What are the stages?" | The column, coherently | Many fragments of one table |
-| "How is ROI calculated?" | The **formula** | Formulas are stripped entirely |
-| "Which rows are above a threshold?" | A filter over rows — this is SQL | Cannot answer |
-| "What does the model assume about ramp?" | Label/value prose | Works, by luck |
-| "Show me the definitions" | A coherent table | Fragments |
+Six questions, at least four mechanisms. No single flattening serves them, which is why choosing
+between converters felt arbitrary: both were answering a question nobody had asked.
 
-Those want three different mechanisms. One flattening strategy cannot serve them, which is why
-choosing between converters felt arbitrary — both were answering the wrong question.
+### What real sheets look like
 
-### Why the obvious move is wrong
+The cases the design has to survive, none of them pathological:
 
-The tempting design is to materialise every `(row label, column header, value)` triple as a
-proposition. Structurally extracted, no LLM, exact. It fails three ways, and the third is the one
-that matters.
+- A table in `A1:F20`, with a column of prose commentary in `H3:H10` that is not part of it.
+- A sheet that is entirely narrative, laid out visually with merged cells and no header row.
+- Label/value pairs scattered in margins: `B2: "Owner"`, `C2: "R. Chen"`, twelve rows down another pair.
+- A calculator: inputs, formulas, outputs, no row semantics at all.
+- Cells filled in ad hoc over months, with no organising structure whatsoever.
+- Cell comments and notes — pure prose, dropped by every converter tested.
 
-**It saturates the graph.** A 10,000-row by 20-column sheet is 200,000 triples from one file.
-ADR-0001's own sizing model puts an entire organisation's conversational graph at roughly 3.6M
-propositions, so one mid-size spreadsheet is about 5% of everything that organisation ever said,
-and ten of them are half of it.
+A sheet is frequently **several of these at once**. So the unit of analysis is a *region* of the
+grid, and some content belongs to no region at all.
 
-**It poisons the signals the graph runs on.** Three effects, each worse than the volume:
+### Why structure must not gate capture
 
-- Propositions are the class ADR-0001 D1 protects with a floor in the rerank budget, precisely
-  because rank-by-score starves a class that matters for reasons score cannot see. Bulk triples
-  land *inside* that protected class and starve the personal memory the floor exists to defend.
-  A cap on chunks does not help; these are not chunks.
-- 200,000 propositions share about 20 predicates. Contradiction resolution keys on
-  `(subject, functional predicate)`, and entity dedup is gated by a cosine on short name strings,
-  which is noisy on exactly this input. Two row labels that merge when they should not turn their
-  measures into competing assertions of a functional predicate, and the newer mass-invalidates the
-  older — silently, plausibly, wrongly.
-- BM25 statistics are per collection. Rows of near-identical text make every term in the table
-  common, which strips discriminative power from the *prose* in the same collection. The documents
-  get worse because a spreadsheet arrived.
+Region detection is a heuristic. Header detection is a heuristic. Both will be wrong, and the
+failure mode of a structure-gated design is that unrecognised content is *silently dropped* —
+the worst possible outcome, because nobody can tell the difference between "the sheet does not say
+that" and "the parser did not understand that part of the sheet".
 
-**And it is unnecessary, which is the real objection.** Propositions exist because prose is not
-queryable: structure has to be extracted before anything can be asked. **A table already has
-structure.** Copying it into the proposition store duplicates the data, destroys the statistics,
-and buys nothing that a query over the table could not answer. Cheapness was never the argument
-for extraction, and losslessness is worth nothing when the data was already lossless where it sat.
+Inverting it costs almost nothing: capture everything, then enrich. A wrong classification then
+degrades a retrieval path rather than losing data.
 
-So the rule is **connect, do not copy**: keep the table as a table, and give the graph a reference
-into it. See D6.
+### Where this belongs
 
-### Rich text hides in spreadsheets
+Most of this ADR is not pgkg's work to do, and saying so is part of the decision.
 
-The other half of the error is treating a sheet as homogeneous. Plenty of sheets carry a Notes,
-Description or Comments column holding paragraphs per row; some sheets are documents wearing a
-grid, with merged cells and prose blocks and no header row at all; and cell comments and notes are
-pure prose that every converter drops.
+> **The reader answers "what is on this canvas." pgkg answers "how should this be retrievable."**
 
-Triple extraction turns a 500-word description cell into
-`Widget A | description | <500 words>`. Not atomic, embeds badly as a proposition, and it was a
-**chunk** all along. A design that only sees numbers will silently discard the most document-like
-content in the workbook.
+That seam puts the cell grid, the formulas, the comments, the merged ranges, the region
+segmentation and the neighbour-derived labels on the **document reader's** side —
+[ExaDev/documents.js#823](https://github.com/ExaDev/documents.js/issues/823) requests exactly
+that. Three reasons beyond reuse: the reader already holds the grid in memory, so doing it here
+would mean either re-parsing OOXML or accepting a poorer input; the reader emits *confidence*
+while the consumer sets the *threshold* it trusts, which is a clean split of responsibility; and
+regions generalise past spreadsheets, since a PDF has columns, tables and figures for the same
+reason and by the same mechanism.
 
-**So the unit of classification is the column, not the sheet.** A sheet is a mixture, and the
-mixture is the point.
+`document-schema.js` already carries the vocabulary — `a1.ts` with `CellPosition` and `CellRange`,
+`SheetGroupNode` in the tree, `cellTable` and `merged` in the content schema, and a lossless
+`DocumentTree` round trip through `--dump-package` / `from-package`. What appears to be missing is
+the xlsx reader populating it: dumping the package for one spreadsheet produced a
+`kind: wordprocessing` tree of sections, paragraphs and tables with no sheet nodes, no A1
+references and no formulas.
 
-### Sheet shapes, and the column typology inside them
+**What stays in pgkg** is retrieval policy, and only that: which regions become chunks (D4, D5,
+D9), the row cap against the corpus quota (D4), the mention edges into the graph (D10), the schema
+of the cell store (D1), and `query_table` (D7). Those are decisions about a retrieval budget and a
+graph's health, and they do not belong in a conversion library.
 
-Three shapes, wanting different treatment:
+**Deployment consequence.** Consuming a structured reader means a Node dependency on the ingest
+path. That is acceptable because ADR-0001 D7 already splits ingest in two: corpus ingest is a
+batch worker and chat ingest is online. The dependency lands in the batch worker, not in the
+retrieval API, so the two-container thesis survives. `--dump-package` JSON via the CLI, or
+`document-mcp`, are both adequate contracts.
 
-- A **table sheet** is rows of records: a status matrix, a log, a price list. Header row, repeated
-  row structure, few or no formulas.
-- A **model sheet** is a calculator: inputs feed formulas which produce outputs. No row semantics
-  at all — the interesting content is the *assumptions* and the *formulas*, and nobody wants the
-  intermediate cells.
-- A **document sheet** is prose in a grid: merged cells, no header row, paragraphs laid out
-  visually. It wants ordinary chunking and nothing else.
-
-Formula density, repeated row structure and a detectable header row separate them. Treating them
-alike is why one converter can produce an order of magnitude more text than another for sheets
-from the same workbook, with neither being wrong about the sheet it was built for.
-
-Within a table sheet, every column is one of:
-
-| Column kind | Signal | Treatment |
-|---|---|---|
-| **Key** | high cardinality, identifies the row | Row identity; the anchor for links (D6) |
-| **Dimension** | low cardinality, repeats, categorical | Queryable column. Never a fact, never an entity |
-| **Measure** | numeric, currency, date | Queryable column only |
-| **Prose** | mostly unique, long, sentence punctuation | **Chunk it** (D3a) |
-| **Formula** | same formula down the column | One retrievable unit per column, not per row |
-
-Cardinality, mean length, type-inference success and punctuation density separate these well
-enough to act on, and badly enough to need a confidence gate.
+**Until that lands**, `scripts/ingest_dir.py` routes by format between two markdown converters.
+That routing is a comparison of two lossy projections and is explicitly provisional: it says which
+markdown is less bad per format, and nothing about which reader is better.
 
 ---
 
 ## Decision
 
-### D1 — Classify the sheet, then classify every column
+### D1 — Capture every populated cell, losslessly, before interpreting anything
 
-`table` | `model` | `document` | `unknown` for the sheet; then for a table sheet,
-`key` | `dimension` | `measure` | `prose` | `formula` per column.
+Every non-empty cell lands in a queryable store with its address (workbook, sheet, row, column),
+its literal value, its type as authored, its formula if it has one, its number format, and any
+comment or note attached to it. No interpretation, no classification, no exceptions.
 
-Both classifiers report confidence, and `unknown` falls through to the sheet card alone (D2). No
-structural claim is made about a shape that was not recognised: a wrong header assignment
-produces *confidently wrong* output, which is worse than no output. A misread prose column is
-merely a missed chunk; a misread key column corrupts every link built on it, so the confidence
-bar is higher for keys.
+This is the floor the rest of the design stands on. It alone answers cell lookups and filters via
+D7, and it guarantees that no amount of misclassification can lose content.
 
-### D2 — Every sheet gets a card
+### D2 — Derive a cell's labels from its neighbours, not from a required header row
 
-One summary chunk per sheet: sheet name, dimensions, column headers, column types, ranges of
-numeric columns, and two example rows. Cheap, always correct, and it is what answers "what is in
-this workbook" and "does this model account for ramp".
+A cell's meaning comes from the nearest text cells above it and to its left. That rule covers a
+table (the header row is simply the nearest text above) *and* a scattered label/value pair *and* a
+margin annotation, with no requirement that the sheet be tidy.
 
-Its more important job is *routing*: the card is what lets an agent decide to go and look
-properly, rather than guessing from fragments. This is ADR-0001's deferred summaries-as-a-source-
-class, arriving first for the format that needs it most.
+Store the derived labels with the cell, along with how far away they were found, because distance
+is confidence: an adjacent label is strong, one eleven rows up is weak and should be marked so.
 
-### D3 — Table sheets: chunk by row, with the header prepended to every chunk
+This replaces "detect the header row" as the primitive. Header detection becomes a special case of
+neighbour derivation that happens to be strong and repeated down a column.
 
-The single highest-value change available, and nearly free. Each row becomes a self-contained
-retrievable unit that carries its own column context. Small row-groups are acceptable where rows
-are narrow.
+### D3 — Segment the grid into regions, and treat regions as advisory
 
-**With a cap.** A few hundred rows becoming a few hundred chunks would swamp the 38-slot corpus
-quota
-(`floor(k_rerank × corpus_fraction)`) and starve every other source — the failure ADR-0001 D1
-exists to prevent, arriving from a direction D1 did not anticipate. Beyond the cap, the card plus
-the structured path (D5) is the answer, not more chunks.
+Find connected components of populated cells, tolerating a blank row or column inside a block.
+Classify each region — `table`, `prose`, `model`, `mixed`, `unknown` — with a confidence.
 
-### D3a — Prose columns become chunks, and document sheets are just documents
+Regions are **advisory**: they add retrieval paths under D4–D6. Nothing depends on them being
+right, and a sheet with five regions and no recognisable shape among them still works, via D1 and
+D8.
 
-A column of paragraphs is a column of documents. Each cell becomes a chunk carrying its row
-identity as context — the key columns prepended the way D3 prepends a header — so it is
-retrievable as prose and readable as belonging to its row. These chunks are ordinary corpus
-content: they take the corpus quota, they are eligible for LLM proposition extraction under
-ADR-0001 D2's normal per-collection rule, and nothing about them is spreadsheet-specific once
-they exist.
+### D4 — Confident table regions additionally get row chunks
 
-A `document` sheet is this case generalised: chunk it as prose and make no structural claims.
+Where a region is confidently tabular, each row becomes a chunk carrying its header context, so a
+row is retrievable as a self-contained unit rather than as a fragment.
 
-Cell comments and notes are prose and are dropped by every converter tested. They belong here
-too, attached to the cell's row.
+**Under a cap.** A few hundred rows becoming a few hundred chunks would swamp the 38-slot corpus
+quota (`floor(k_rerank × corpus_fraction)`) and starve every other source — the failure ADR-0001
+D1 exists to prevent, arriving from a direction D1 did not anticipate. Past the cap, the card (D8)
+plus the query tool (D7) is the answer, not more chunks.
 
-This is half the reason the first draft of this ADR was wrong: a design that only sees numbers
-discards the most document-like content in the workbook.
+### D5 — Long-text cells additionally get prose chunks
 
-### D4 — Model sheets: assumptions and formulas, not cells
+A cell holding a paragraph is a document, wherever it sits: inside a table's Notes column, in a
+prose region, in the margin, or alone in `M42`. It becomes a chunk carrying its derived labels
+(D2) as context.
 
-Extract input label → value pairs, and formulas rendered as text: `ROI = (revenue − cost) / cost`.
-A rendered formula is a good embedding target and it is the actual answer to "how does this work".
-Converters strip formulas today, so this is new capability rather than better chunking.
+Participation is **not exclusive**: the same cell is a queryable value under D1 *and* a prose
+chunk under D5. Nothing is served by forcing an either/or, and the earlier drafts' insistence on
+one treatment per cell was a mistake.
 
-### D5 — Land the cells as rows, and expose a query tool
+Cell comments and notes are prose and belong here, attached to their cell's context.
 
-The honest answer to a filter-and-compare question is that retrieval is the wrong mechanism. The
-data is already going into Postgres; land table sheets as actual rows and expose a `query_table`
-tool on the MCP surface beside `search_corpus`.
+### D6 — Formulas become retrievable text, once per distinct formula
 
-This follows the instinct recorded during ADR-0001's design discussion — that two tools beat one
-magic endpoint, and that an agent with conversational context often knows which it wants better
-than a router would. Excel defined names, sheet names and table names come along as free
-human-authored semantic metadata.
+`ROI = (revenue − cost) / cost` is the answer to "how is ROI calculated", and it is the same answer
+for all ten thousand rows that share it. Render each *distinct* formula once, with the labels of
+the cells it reads.
 
-### D6 — Connect the graph to the table; never copy the table into the graph
+### D7 — Expose the captured cells through a query tool
 
-The graph gets **one mention edge per row key**, not one proposition per cell. An entity that
-appears in conversation — a product, an account, a stage — links to the rows that name it, in
-`entity_mentions` alongside the chunk mentions D2-of-ADR-0001 already defines.
+The honest answer to filter-and-compare is that retrieval is the wrong mechanism. The data is
+already in Postgres — which is the whole thesis — so expose `query_table` on the MCP surface
+beside `search_corpus`.
 
-That preserves exactly the path the mention edge exists for: a chat fact seeds an entity, graph
-expansion reaches the row, and the agent reads or queries it. What it does not do is duplicate the
-table into the class ADR-0001 D1 protects.
+Same scope-binding rules as the rest of that surface: the tenant comes from the server, never
+from a tool argument, per `pgkg/mcp_server.py`. A read-only role and a column allowlist besides,
+because this one runs queries shaped by model output.
 
-The properties that follow are the reason for the design:
+### D8 — Every sheet and every region gets a card
 
-- **Bounded by rows, not cells.** One link per row key per entity, against one proposition per
-  cell — three orders of magnitude apart on a wide sheet.
-- **Lands outside the privileged class.** Mentions are a side table. They cannot starve the
-  personal-memory floor, because they are not competing for it.
-- **No predicate collapse, so no spurious contradictions.** There are no bulk functional
-  predicates to mass-invalidate.
-- **No IDF contamination.** Nothing is added to the text corpus statistics.
-- **Nothing is lost.** The values are still there, in the table, exactly as authored, reachable
-  through D5.
+A summary chunk: name, extent, what was recognised and what was not, column labels, types, ranges,
+a couple of example rows. Cheap and always correct, because it describes rather than interprets.
 
-**Materialising triples as propositions is rejected as a default.** It stays available as an
-explicit per-sheet opt-in for a small, human-designated fact table — a glossary, an org chart, a
-code list — under a hard row budget, because for a fifty-row reference table the objections above
-have no force and the convenience is real. That is a deliberate narrow exception, and the default
-is off.
+Its more important job is routing — the card is what lets an agent decide to go and look properly
+instead of guessing from fragments. This is ADR-0001's deferred summaries-as-a-source-class,
+arriving first where it is needed most.
+
+A card must state what it could not classify. "Sheet 3 has 40 populated cells in no recognised
+structure" is useful; silence about them is not.
+
+### D9 — Unrecognised cells are chunked by proximity, in reading order
+
+For the ad-hoc sheet — cells filled in wherever, no structure to find — group nearby populated
+cells into a chunk in reading order, each carrying its address and derived labels.
+
+This is not a fallback so much as an admission that **for an unstructured sheet, spatial proximity
+is the semantics.** Cells near each other are related; that is how the person who typed them
+read them. A chunk reading `B4: Q3 target · B5: 40% · D9: chase the renewal` is retrievable,
+useful, and honest about being unstructured.
+
+### D10 — Connect the graph to the cells; never copy the cells into the graph
+
+The graph gets **mention edges** — one per row key, or per region, for entities that appear in
+conversation — in `entity_mentions`, alongside the chunk mentions ADR-0001 D2 already defines.
+Not one proposition per cell.
+
+That preserves the path the mention edge exists for: a chat fact seeds an entity, graph expansion
+reaches the row or region, and the agent reads or queries it. What it avoids is duplicating a
+table into the class ADR-0001 D1 protects with a floor.
+
+Why copying is wrong, given the earlier draft proposed exactly that:
+
+- **Saturation.** A 10,000 × 20 sheet is 200,000 triples from one file. ADR-0001's sizing model
+  puts an entire organisation's conversational graph at ~3.6M propositions, so one mid-size sheet
+  is about 5% of everything that organisation ever said.
+- **It lands in the privileged class.** Propositions carry the protected floor in the rerank
+  budget. Bulk triples starve the personal memory that floor defends, and a cap on chunks does not
+  help because these are not chunks.
+- **Predicate collapse into spurious contradictions.** 200,000 propositions share ~20 predicates.
+  Contradiction resolution keys on `(subject, functional predicate)`, and entity dedup is gated by
+  a cosine on short name strings that is noisy on exactly this input. Two row labels that merge
+  when they should not turn their measures into competing assertions, and the newer
+  mass-invalidates the older — silently and plausibly.
+- **BM25 contamination.** Rows of near-identical text make every term in the table common, which
+  strips discriminative power from the prose sharing the collection's statistics. The documents get
+  worse because a spreadsheet arrived.
+- **It is unnecessary.** Propositions exist because prose is not queryable: structure must be
+  extracted before anything can be asked of it. A table already has structure. Copying it
+  duplicates the data, degrades the statistics, and buys nothing D7 could not answer.
+
+Materialising triples as propositions survives only as an explicit per-sheet opt-in under a hard
+row budget, for a small human-designated reference table — a glossary, a code list, an org chart —
+where none of the objections above has force. Default off.
 
 ---
 
 ## Consequences
 
-**Positive.** Spreadsheet questions become answerable at all. A spreadsheet-heavy corpus stops
-being mostly header-less fragments, and the prose buried in it stops being discarded. The
-structured path costs nothing extra — the data is already in Postgres, which is the whole thesis.
-Cards give the deferred summary class a first concrete use. The graph gains a bounded route into
-structured data without inheriting its volume.
+**Positive.** Nothing is lost, whatever the classifiers do. Spreadsheet questions become answerable
+at all, and the prose buried in spreadsheets stops being discarded. The structured path costs
+nothing extra because the data is already in Postgres. Cards give the deferred summary class a
+concrete first use. The graph gains a bounded route into structured data without inheriting its
+volume. And a misclassification degrades one retrieval path instead of dropping content.
 
-**Negative.** Two classifiers instead of none, both heuristic, both able to be wrong. Header
-detection is genuinely hard — merged cells, multi-row headers and pivot tables defeat naive
-detection — and the failure mode is confident wrongness, hence the confidence gate and the
-`unknown` class. Prose-column detection has its own edge cases: a mostly-empty Notes column with
-occasional paragraphs, an enum whose labels are long enough to look like prose, and any
-non-Latin-script text where length heuristics do not transfer. `query_table` is new surface area
-with its own injection considerations — a tool that runs SQL from a model's arguments needs the
-same scope-binding treatment `pgkg/mcp_server.py` documents, and probably a read-only role and a
-column allowlist besides.
+**Negative.** More machinery than flatten-and-chunk, and most of it heuristic: region segmentation,
+neighbour-derived labels with confidence, prose detection, formula rendering. The lossless cell
+store costs storage that a text-only pipeline does not pay — bounded by cell count, which for a
+large workbook is millions of rows, so it needs the same partitioning thinking as everything else.
+`query_table` is real new attack surface. And a cell participating in several paths can be
+retrieved several ways, so deduplication at the result level matters more than it did.
 
-**A cost worth naming.** Connecting rather than copying means a question answerable from a cell
-now needs two steps: retrieve, then query. That is slower and it puts a tool call between the
-agent and the answer. The alternative was one step over a graph the copy had degraded, so this is
-a trade rather than a win — but it is a trade made in favour of everything else in the collection
-staying usable.
+**A cost worth naming.** Connect-not-copy means a question answerable from a cell now takes two
+steps: retrieve, then query. That is slower and puts a tool call between the agent and the answer.
+The alternative was one step over a graph the copy had degraded — a trade, not a win, made in
+favour of everything else in the collection staying usable.
 
-**Deferred.** Cross-sheet references and dependency graphs between formulas. Charts. Pivot tables.
-Conditional formatting as signal. Anything requiring formula evaluation rather than rendering.
-Row-level change tracking across versions of a workbook, which is what a crawler re-reading a
-monthly-updated sheet will eventually want.
+**Deferred.** Cross-sheet references and formula dependency graphs. Charts. Pivot tables.
+Conditional formatting as signal. Formula *evaluation* rather than rendering. Row-level change
+tracking across versions, which a crawler re-reading a monthly sheet will eventually want.
 
-**Open.** Whether calculator workbooks belong in a retrieval corpus at all, or whether the useful
-corpus is the prose alone, with models reachable only through `query_table`. This ADR assumes they
-belong and are handled by D4; the alternative is defensible and cheaper.
+**Open.** Whether the lossless cell store belongs in the same database as retrieval or beside it.
+Whether region segmentation is worth building before the D1/D7/D8 floor has been used in anger —
+the floor alone may answer more than expected, and building it first would tell us.
 
 ---
 
 ## Alternatives rejected
 
-**One converter, chosen by benchmark.** What the evidence actually says is that the converters
-disagree because the question is undecided. Picking a winner would freeze one arbitrary answer.
+**Flatten to markdown and chunk normally.** Today's behaviour. Preserves tables *within* a chunk
+and destroys them across boundaries, which for any table longer than a chunk is most of them. Loses
+formulas, comments and all spatial relationship.
 
-**Convert to markdown tables and chunk normally.** This is today's behaviour for `.xlsx`. It
-preserves tables *within* a chunk and destroys them *across* chunk boundaries, which for any
-table longer than a chunk is most of them.
+**Materialise every cell as a graph proposition.** The first draft of this ADR. Rejected on
+saturation, on landing in the protected class, on predicate collapse producing spurious
+contradictions, on BM25 contamination, and above all on being unnecessary — see D10.
 
-**LLM extraction over the whole spreadsheet.** Expensive, recurring, and strictly worse than
-reading the cells for anything tabular: the structure the LLM would infer is already present and
-exact. Note this does *not* rule out LLM extraction over prose columns, which are prose and are
-governed by ADR-0001 D2 like any other prose.
+**Classify the sheet, then its columns.** The second draft. Better, and still too opinionated: it
+assumes a sheet has one shape and that every cell belongs to a column with a consistent role. Real
+sheets carry a table and unrelated prose side by side, or no structure at all. Columns are the
+wrong unit; regions are closer, and even regions must be advisory rather than gating.
 
-**Materialising every cell as a proposition.** The first draft of this ADR. Rejected on
-saturation, on predicate collapse producing spurious contradictions, on BM25 contamination of the
-prose sharing the collection, and above all on being unnecessary: a table is a fact store already.
-Retained only as a narrow per-sheet opt-in under a row budget (D6).
+**Treat spreadsheets as unsupported.** Honest about current quality, and untenable: a spreadsheet
+can be the majority of a corpus by volume and is often the part people ask about most.
 
-**Treat spreadsheets as unsupported.** Tempting, and honest about current quality — but a
-spreadsheet can be the majority of a corpus by volume, and it is often the part people ask about
-most.
+**LLM extraction over the whole sheet.** Expensive, recurring, and worse than reading the cells for
+anything tabular, since the structure it would infer is already present and exact. This does *not*
+rule out LLM extraction over prose cells, which are prose and fall under ADR-0001 D2 like any other.

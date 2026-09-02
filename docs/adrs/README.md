@@ -10,4 +10,4 @@ never editing history.
 |---|---|---|
 | [0001](0001-corpus-embeddings-and-knowledge-graph.md) | Corpus embeddings alongside the proposition knowledge graph | Accepted |
 | [0001-findings](0001-verification-findings.md) | Adversarial verification of the phases 0-3 implementation | Open |
-| [0002](0002-spreadsheets-are-not-documents.md) | Spreadsheets are not documents | Proposed |
+| [0002](0002-spreadsheets-are-not-documents.md) | Spreadsheets are a canvas, not a table | Proposed |

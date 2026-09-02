@@ -5,19 +5,35 @@ pgkg's ingest paths all take text; nothing in the package reads .docx, .xlsx,
 .pptx or .pdf. This is the missing front half, kept out of `pgkg/` because it
 drags in a conversion stack that a server serving retrieval does not need.
 
-TWO CONVERTERS, ROUTED BY FORMAT, because neither wins outright. documents.js
-(ExaDev's own, via npx) extracts substantially more text from PDFs and, more
-importantly, recovers heading structure where markitdown recovers none — the
+MARKDOWN IS THE WRONG INTERCHANGE FORMAT, AND THIS SCRIPT USES IT ANYWAY.
+Markdown is a 1D serialisation of a document, which is lossy for anything with
+a 2D layout: a spreadsheet cell means one thing with its row label and column
+header attached and nothing without them, and any projection to a text stream
+must choose which spatial relationships to discard. ADR-0002 works out what a
+structured reader should provide instead, and
+ExaDev/documents.js#823 requests it. Until that lands, this routes between two
+markdown converters, and the routing is a comparison of two lossy projections
+rather than a verdict on either reader.
+
+ROUTED BY FORMAT, PROVISIONALLY. documents.js extracts substantially more text
+from PDFs and recovers heading structure where markitdown recovers none — the
 chunker keys boundaries on structure, so that is a chunk-quality difference and
 not merely a volume one. It also reads OOXML packages that fail a strict zip
-reader. markitdown wins on spreadsheets, where documents.js flattens cells
-instead of preserving markdown tables.
+reader. markitdown is preferred for spreadsheets because its markdown keeps
+table rows as table rows, where documents.js flattens cells; that is a fact
+about the two markdown emitters and NOT evidence that either reader is
+deficient, which is the mistake the first version of this comment made.
 
 Each falls back to the other, because they fail on different files: a .docx
 that is not a standard package internally may defeat one and not the other.
 
 The per-file winner is reported, so a fidelity regression in either converter
 is visible rather than silent.
+
+--dump-tree writes documents.js's own DocumentTree beside the text, which is
+the lossless form the structured path will consume. Nothing reads it yet; it is
+there so the work in ADR-0002 can be developed against real trees rather than
+against a guess about their shape.
 
     scripts/ingest_dir.py PATH --dry-run          # what would be loaded
     scripts/ingest_dir.py PATH                    # load it, no LLM involved
@@ -52,8 +68,8 @@ DOCUMENTS_JS_VERSION = "6.1.2"
 
 CONVERTIBLE = {".docx", ".xlsx", ".pptx", ".pdf", ".md", ".txt", ".html", ".htm", ".csv"}
 
-# Preference order per format, measured rather than assumed. See the module
-# docstring for the numbers behind each choice.
+# Preference order per format. Provisional: it ranks two markdown projections,
+# not two readers. See the module docstring.
 ROUTING = {
     ".pdf":  ("documents_js", "markitdown"),
     ".pptx": ("documents_js", "markitdown"),
@@ -122,6 +138,35 @@ def _via_markitdown(path: pathlib.Path) -> tuple[str, bool]:
             return md.convert(str(mended)).text_content, True
         finally:
             shutil.rmtree(mended.parent, ignore_errors=True)
+
+
+def dump_tree(path: pathlib.Path, dest_dir: pathlib.Path) -> str | None:
+    """Write documents.js's DocumentTree for one file. Returns an error or None.
+
+    The tree is the lossless form: cells with addresses, formulas, comments and
+    merged ranges, rather than a text stream that had to discard them. Nothing
+    in pgkg consumes it yet (ADR-0002 D1), so this exists to give that work real
+    material instead of an assumption about the shape.
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ext = path.suffix.lower().lstrip(".")
+    tree = dest_dir / f"{path.stem}.tree.json"
+    scratch = pathlib.Path(tempfile.mkdtemp()) / "ignored.md"
+    try:
+        proc = subprocess.run(
+            ["npx", "-y", f"documents.js@{DOCUMENTS_JS_VERSION}",
+             f"{ext}-to-markdown", str(path), str(scratch),
+             "--dump-package", str(tree)],
+            capture_output=True, text=True, timeout=300,
+        )
+        if proc.returncode != 0 or not tree.exists():
+            detail = (proc.stderr or proc.stdout or "no output").strip().splitlines()
+            return detail[-1][:120] if detail else "failed"
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+    finally:
+        shutil.rmtree(scratch.parent, ignore_errors=True)
 
 
 def _via_documents_js(path: pathlib.Path) -> tuple[str, bool]:
@@ -219,6 +264,18 @@ async def run(args: argparse.Namespace) -> int:
                 note.append(f"-{c.deduped} dup lines")
             print(f"{rel:40} {c.converter:13} {len(c.text):>8} "
                   f"{max(1, len(c.text)//1200):>7}  {', '.join(note)}")
+    if args.dump_tree:
+        dest = pathlib.Path(args.dump_tree).expanduser()
+        wrote = 0
+        print()
+        for c in converted:
+            err = dump_tree(c.path, dest)
+            if err:
+                print(f"  tree FAILED {str(c.path.relative_to(root))[:44]}: {err}")
+            else:
+                wrote += 1
+        print(f"  {wrote}/{len(converted)} DocumentTrees written to {dest}")
+
     total = sum(len(c.text) for c in ok)
     print(f"\n  {len(ok)} convertible, {len(bad)} skipped, {total:,} chars "
           f"(~{total//4:,} tokens, ~{total//1200:,} chunks)")
@@ -275,6 +332,9 @@ def main() -> None:
     p.add_argument("--dry-run", action="store_true", help="Convert and report; write nothing")
     p.add_argument("--extract", action="store_true",
                    help="Also extract propositions — sends chunk text to the LLM provider")
+    p.add_argument("--dump-tree", metavar="DIR",
+                   help="Also write documents.js's DocumentTree per file into DIR "
+                        "(the lossless form; nothing consumes it yet — see ADR-0002)")
     p.add_argument("--org", help="Org UUID (default: the reserved default org)")
     p.add_argument("--collection", help="Collection UUID (default: the reserved default)")
     raise SystemExit(asyncio.run(run(p.parse_args())))
