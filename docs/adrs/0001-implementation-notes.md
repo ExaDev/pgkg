@@ -586,6 +586,24 @@ Not defects with a fix pending — things a maintainer should know before being 
   states nothing. It exists because a forward-only migration cannot reach the callers, it only ever
   sets TRUE so it cannot overrule a writer that states its own answer, and it is what makes dropping
   the column mechanical: retire the direct writers, drop the trigger, drop the column.
+- **Entity dedup merges strictly less than either of its thresholds suggests, and the cosine is
+  usually the one that refuses.** `pgkg_link_entity()` stage 2 is an AND of a trigram predicate
+  pinned at 0.6 and a name-embedding cosine above 0.85, so 051's pinned `0.6` is not what "the same
+  entity" means and no test may assert that two entities in one org are never within 0.6 trigrams
+  of each other (#23). Measured with the shipped `BAAI/bge-m3` over the bare names:
+  `'Helios migration'` / `'Helios migration ships'` is trigram 0.739, cosine 0.807, two rows — the
+  cosine refused it; `'William Shakespeare'` / `'William Shakespear'` is trigram 0.857, cosine
+  0.820, two rows, likewise. It also cuts the other way: `'Acme Corp'` / `'Acme Corporation'` is
+  cosine 0.959 and the trigram refuses it at 0.500. On a labelled probe of 40 pairs the AND merges
+  13 of 20 same-entity pairs and 1 of 20 different-entity pairs, where the trigram alone would
+  merge 18 and 5 and the cosine alone 15 and 2. 0.85 is not a well-separating cutoff and no cutoff
+  is — an entity name is two or three words, and the two populations' cosines overlap from 0.679 to
+  0.889 — but it fails toward two rows, which a later pass can still join, rather than toward a
+  fused entity, which nothing can unpick. The change that would make the number meaningful is
+  embedding the name with its type or its mention context rather than bare; that changes how the
+  whole graph merges and is not taken on one observation. Migration 055 carries the measurements
+  and puts them on the function as a `COMMENT`; `tests/test_entity_linking.py` pins the truth
+  table.
 
 ---
 
