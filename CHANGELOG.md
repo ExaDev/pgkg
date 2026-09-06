@@ -56,6 +56,18 @@ deliberate). Full reasoning in
   `recall()` returns the same list at k=5, 10 and 20 whether the mention rows are present or
   deleted. So D2's payoff does not reach an agent yet: the harness asserts the wiring, and prints
   the gap on every run.
+- **What the two thresholds in entity dedup actually decide is written down.** Documentation only,
+  no behaviour change. 051 pinned the trigram threshold at 0.6 and drew a reader's eye to it, but
+  `pgkg_link_entity()` stage 2 is an AND, so 0.6 is not what "the same entity" means. #23's
+  observation reproduces exactly: `'Helios migration'` and `'Helios migration ships'` are 0.739
+  apart on trigrams and stay two rows because their `bge-m3` name embeddings are 0.807 apart and
+  the default cosine threshold is 0.85. The cosine usually refuses first — `'William Shakespeare'`
+  / `'William Shakespear'` is trigram 0.857, cosine 0.820, two rows — but not always:
+  `'Acme Corp'` / `'Acme Corporation'` is cosine 0.959 and the trigram refuses it at 0.500. 0.85 is
+  kept, and the reason is recorded: on a labelled 40-pair probe no cosine cutoff separates the two
+  populations, because an entity name is too short a string to embed, and the AND at least fails
+  toward two rows rather than toward a fused entity. Migration 055 carries the measurements as a
+  `COMMENT` on the function.
 
 ## 0.6.0
 

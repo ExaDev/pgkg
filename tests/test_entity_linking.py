@@ -656,3 +656,165 @@ async def test_the_confirmation_holds_the_line_at_0_6_without_the_pin(
     assert repinned == ["pg_trgm.similarity_threshold=0.6"], (
         f"re-applying migration 051 did not restore the pin: {repinned}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Which predicate decides (issue #23, migration 055).
+#
+# Stage 2 is an AND, so 051's pinned 0.6 is not what "the same entity" means.
+# #23 recorded two entities coexisting at trigram similarity 0.739 and asked
+# which predicate had actually rejected the merge.  It was the cosine.
+#
+# The pairs below are real names, and both numbers against each are measured
+# rather than invented: the trigram similarity is pg_trgm's own, asserted here
+# so the table breaks if it ever moves, and the cosine is what BAAI/bge-m3 —
+# the shipped `embed_model` — returns for the two bare names.  The embeddings
+# the tests pass are synthetic vectors built to those measured cosines, so the
+# suite pins the decision without loading a 2 GB model to re-derive a constant.
+# ---------------------------------------------------------------------------
+
+# name held in the graph, name arriving, measured trigram, measured bge-m3
+# cosine, and whether stage 2 resolves onto the held row.
+DECISIONS = [
+    # #23's pair.  The trigram predicate offers it; the cosine rejects it.
+    ("Helios migration", "Helios migration ships", 0.7391, 0.8069, False),
+    # The canonical misspelling this function exists for — also rejected, by
+    # the cosine, on a pair whose spelling is nearer than #23's.
+    ("William Shakespeare", "William Shakespear", 0.8571, 0.8198, False),
+    # The other direction: the cosine is emphatic and the trigram rejects.
+    ("Acme Corp", "Acme Corporation", 0.5000, 0.9589, False),
+    # Both hold, so it merges — the only way anything merges at stage 2.
+    ("Postgres", "PostgreSQL", 0.6667, 0.8933, True),
+]
+
+HELD_NAMES = [held for held, _, _, _, _ in DECISIONS]
+
+
+@pytest.fixture
+async def decision_namespace(pool: asyncpg.Pool, embed_dim: int):
+    """The four held names, each carrying the same embedding.
+
+    One vector for all of them, so a probe's cosine is identical against every
+    row and the trigram is the only thing that distinguishes them.  The names
+    are mutually below 0.6 trigrams, so no probe can be offered two candidates
+    and no case depends on the ORDER BY.
+    """
+    namespace = _ns("decides")
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """
+            INSERT INTO entities (name, type, embedding, namespace)
+            VALUES ($1, 'concept', $2, $3)
+            """,
+            [(name, one_hot(embed_dim), namespace) for name in HELD_NAMES],
+        )
+        held = {
+            row["name"]: row["id"]
+            for row in await conn.fetch(
+                "SELECT id, name FROM entities WHERE namespace = $1", namespace
+            )
+        }
+    assert set(held) == set(HELD_NAMES), f"the fixture seeded {held}"
+
+    yield namespace, held
+
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM entities WHERE namespace = $1", namespace)
+
+
+async def _link(
+    conn: asyncpg.Connection,
+    namespace: str,
+    name: str,
+    embedding: HalfVector,
+) -> uuid.UUID:
+    """Resolve a name, then undo whatever row it may have created."""
+    tx = conn.transaction()
+    await tx.start()
+    try:
+        return await conn.fetchval(
+            "SELECT pgkg_link_entity($1, $2, 'concept', $3)",
+            namespace,
+            name,
+            embedding,
+        )
+    finally:
+        await tx.rollback()
+
+
+async def test_stage_two_is_an_and_so_the_trigram_threshold_is_not_the_dedup_gate(
+    pool: asyncpg.Pool, decision_namespace, embed_dim: int
+) -> None:
+    """Both predicates must hold, and either one alone can refuse the merge.
+
+    This is the table #23 asked for.  It is also the reason no test may assert
+    that two entities in one org are never within 0.6 trigrams of each other:
+    the first two rows below are 0.739 and 0.857 apart on trigrams and are two
+    rows, because their name embeddings are 0.807 and 0.820 and the default
+    threshold is 0.85.
+    """
+    namespace, held = decision_namespace
+    outcomes = []
+    trigrams = []
+    async with pool.acquire() as conn:
+        for name, arriving, trgm, cosine, _ in DECISIONS:
+            trigrams.append(
+                await conn.fetchval(
+                    "SELECT similarity($1, $2)", name, arriving
+                )
+            )
+            linked = await _link(
+                conn,
+                namespace,
+                arriving,
+                mixed(embed_dim, primary=0, secondary=1, weight=cosine),
+            )
+            outcomes.append(linked == held[name])
+
+    assert trigrams == [
+        pytest.approx(trgm, abs=5e-5) for _, _, trgm, _, _ in DECISIONS
+    ], (
+        f"pg_trgm no longer scores these pairs where the table says it does: "
+        f"{trigrams}"
+    )
+    assert outcomes == [merged for _, _, _, _, merged in DECISIONS], (
+        f"stage 2 decided these differently: {list(zip(HELD_NAMES, outcomes))}"
+    )
+
+
+async def test_the_cosine_is_what_refused_the_merges_the_trigram_would_have_made(
+    pool: asyncpg.Pool, decision_namespace, embed_dim: int
+) -> None:
+    """The probe that makes the table above say something.
+
+    Dropping p_threshold to zero disarms the cosine and leaves the trigram
+    predicate standing alone — the shape #23 assumed was already in force.
+    Every pair the cosine rejected then merges, and the pair the trigram
+    rejected still does not, which is what identifies the rejecter in each
+    case without touching the function.
+    """
+    namespace, held = decision_namespace
+    refused = [row for row in DECISIONS if not row[4]]
+    assert refused, "nothing was refused, so there is nothing to attribute"
+
+    merged_without_the_cosine = []
+    async with pool.acquire() as conn:
+        for name, arriving, _, cosine, _ in refused:
+            tx = conn.transaction()
+            await tx.start()
+            linked = await conn.fetchval(
+                "SELECT pgkg_link_entity($1, $2, 'concept', $3, 0.0)",
+                namespace,
+                arriving,
+                mixed(embed_dim, primary=0, secondary=1, weight=cosine),
+            )
+            await tx.rollback()
+            merged_without_the_cosine.append(linked == held[name])
+
+    assert merged_without_the_cosine == [
+        trgm > 0.6 for _, _, trgm, _, _ in refused
+    ], (
+        "with the embedding threshold disarmed, stage 2 no longer merges "
+        "exactly the pairs its trigram predicate accepts: "
+        f"{list(zip([r[1] for r in refused], merged_without_the_cosine))}"
+    )
