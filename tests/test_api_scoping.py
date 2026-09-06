@@ -391,9 +391,8 @@ async def test_ingest_writes_the_scope_columns(pool: asyncpg.Pool) -> None:
         )
         chunk = await conn.fetchrow(
             "SELECT c.org_id, c.collection_id, c.visibility, c.owner_user_id,"
-            " c.acl_group_id FROM chunks c JOIN documents d ON d.id = c.document_id"
-            " WHERE d.namespace = $1",
-            ns,
+            " c.acl_group_id FROM chunks c WHERE c.org_id = $1",
+            org,
         )
         doc = await conn.fetchrow(
             "SELECT org_id, collection_id FROM documents WHERE namespace = $1", ns
@@ -528,10 +527,9 @@ async def test_ingest_records_provenance(pool: asyncpg.Pool) -> None:
             ns,
         )
         chunk_prov = await conn.fetchval(
-            "SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id"
-            " WHERE d.namespace = $1"
+            "SELECT COUNT(*) FROM chunks c WHERE c.org_id = $1"
             "   AND c.provenance_id = pgkg_unattributed_provenance()",
-            ns,
+            org,
         )
 
     assert len(rows) == result.chunks

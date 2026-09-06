@@ -298,19 +298,28 @@ FROM unnest($15::uuid[], $16::text[]) AS r(id, locator)
 # It is stated here rather than left to the parent pointer, which is what said
 # it until 052.  A pointer that decides retrievability is what makes a total
 # content address unrepresentable — two documents sharing a paragraph would have
-# to be one row that can name only one parent (#18) — and the pointer stays only
-# as the record of which document a passage came out of.  052's bridge would
-# derive the same answer from it, but a derived answer is a second place for the
-# value to be decided and the bridge is meant to be retired: this writer states
-# its own, so retiring the bridge cannot change what it stores.
+# to be one row that can name only one parent (#18) — so 056 dropped the column
+# and 052's bridge with it, and this statement is why nothing had to change when
+# it went: the writer already stated its own answer rather than leaning on a
+# derivation from the pointer.
+#
+# WHAT THE POINTER RECORDED, AND WHERE IT IS NOW.  It named the document a
+# passage came out of, and on this path that document is the turn this ingest
+# just wrote.  The record survives as the row's own derivation record: one
+# provenance row per chunk, written by the statement above, carrying the ingest
+# run and the span a citation names — which is strictly more than the pointer
+# held.  It is NOT moved to document_version_chunks: a chunk carried by any
+# version buckets every fact extracted from it as 'corpus' in
+# pgkg_item_scope(), which is D1's drowning failure mode (041, and 052's
+# measurement).
 _INSERT_CHUNKS_SQL = """
 INSERT INTO chunks
-    (id, document_id, text, span_start, span_end, asserted_at, org_id,
+    (id, text, span_start, span_end, asserted_at, org_id,
      collection_id, visibility, owner_user_id, acl_group_id, provenance_id,
      provenance_only)
-SELECT c.id, $1, c.text, c.span_start, c.span_end, $2, $3, $4, $5, $6, $7,
+SELECT c.id, c.text, c.span_start, c.span_end, $1, $2, $3, $4, $5, $6,
        c.provenance_id, TRUE
-FROM unnest($8::uuid[], $9::text[], $10::int[], $11::int[], $12::uuid[])
+FROM unnest($7::uuid[], $8::text[], $9::int[], $10::int[], $11::uuid[])
      AS c(id, text, span_start, span_end, provenance_id)
 """
 
@@ -803,7 +812,7 @@ class Memory:
                     conn, plan.chunks, provenance_ids, provenance, source
                 )
                 await self._write_chunks(
-                    conn, doc_id, plan.chunks, asserted_at, provenance_ids
+                    conn, plan.chunks, asserted_at, provenance_ids
                 )
                 entity_ids = await self._link_entities(conn, plan.entities)
                 await self._write_propositions(
@@ -1088,7 +1097,6 @@ class Memory:
     async def _write_chunks(
         self,
         conn: asyncpg.Connection,
-        doc_id: UUID,
         chunks: tuple[_PendingChunk, ...],
         asserted_at: datetime | None,
         provenance_ids: dict[UUID, UUID],
@@ -1097,7 +1105,6 @@ class Memory:
             return
         await conn.execute(
             _INSERT_CHUNKS_SQL,
-            doc_id,
             asserted_at,
             self._scope.write_org_id,
             self._scope.write_collection_id,

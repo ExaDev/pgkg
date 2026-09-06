@@ -200,17 +200,13 @@ async def test_chat_provenance_chunks_never_enter_the_chunk_statistics(
     async with pool.acquire() as conn:
         org = await new_org(conn)
         collection = await new_collection(conn, org_id=org, kind="mixed")
-        chat_document = await new_document(
-            conn, org_id=org, collection_id=collection
-        )
-
         await conn.execute(
             """
-            INSERT INTO chunks (text, org_id, collection_id, document_id)
-            SELECT 'zorblatt came up in turn ' || g, $1, $2, $3
+            INSERT INTO chunks (text, org_id, collection_id, provenance_only)
+            SELECT 'zorblatt came up in turn ' || g, $1, $2, TRUE
             FROM generate_series(1, 5) g
             """,
-            org, collection, chat_document,
+            org, collection,
         )
 
         n_total, _ = await chunk_stats(conn, collection)
@@ -218,6 +214,57 @@ async def test_chat_provenance_chunks_never_enter_the_chunk_statistics(
 
     assert n_total == 0, f"{n_total} chat turns entered the chunk statistics"
     assert df == 0
+
+
+async def test_a_fact_extracted_from_a_chat_turn_stays_in_the_memory_bucket(
+    pool: asyncpg.Pool,
+) -> None:
+    """Why 056 dropped the parent pointer instead of re-homing it.
+
+    #18 as filed asks for the extraction path's passages to get their parentage
+    through document_version_chunks, which is the only shape left that can
+    express it.  041 keys the quota bucket on structure rather than on
+    collections.kind, and the structure it reads for a proposition is whether
+    any document version carries the chunk it cites — so linking chat
+    provenance under a version would reclassify every chat-derived fact as
+    corpus material, and D1's corpus ceiling and per-scope split would stop
+    applying to personal facts.  That is D1's drowning failure mode, which is
+    the one 041 rewrote the bucket to escape.  The pointer had no readers, so it
+    was dropped rather than moved.
+    """
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org, kind="mixed")
+        chunk = await conn.fetchval(
+            """
+            INSERT INTO chunks (text, org_id, collection_id, provenance_only)
+            VALUES ($1, $2, $3, TRUE) RETURNING id
+            """,
+            "zorblatt is what the operator calls the ledger", org, collection,
+        )
+        fact = await conn.fetchval(
+            """
+            INSERT INTO propositions
+                (text, namespace, org_id, collection_id, chunk_id)
+            VALUES ($1, 'default', $2, $3, $4) RETURNING id
+            """,
+            "the operator calls the ledger zorblatt", org, collection, chunk,
+        )
+        carried = await conn.fetchval(
+            "SELECT COUNT(*) FROM document_version_chunks WHERE chunk_id = $1",
+            chunk,
+        )
+        buckets = {
+            row["item_id"]: row["bucket"]
+            for row in await conn.fetch(
+                "SELECT item_id, bucket FROM pgkg_item_scope($1::uuid[])",
+                [fact, chunk],
+            )
+        }
+
+    assert carried == 0, "chat provenance is carried by no document version"
+    assert buckets[fact] == "memory"
+    assert buckets[chunk] == "corpus"
 
 
 # ---------------------------------------------------------------------------
@@ -448,23 +495,16 @@ async def test_chat_provenance_chunks_do_not_skew_a_passages_score(
         assert before is not None, "the passage was not retrieved at all"
 
         # Chat ingest writes one chunk per turn so a fact can cite its text.
-        # Those chunks belong to a document and to no version of it, which is
-        # what makes them provenance rather than passages.
-        chat_doc = await conn.fetchval(
-            """
-            INSERT INTO documents (source, org_id, collection_id)
-            VALUES ('chat', $1, $2) RETURNING id
-            """,
-            org, coll,
-        )
+        # The writer says those chunks are provenance rather than passages
+        # (052), which is what makes them not retrievable.
         for turn in range(20):
             await conn.execute(
                 """
-                INSERT INTO chunks (text, org_id, collection_id, document_id)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO chunks (text, org_id, collection_id, provenance_only)
+                VALUES ($1, $2, $3, TRUE)
                 """,
                 f"zorblatt came up in turn {turn} of the conversation",
-                org, coll, chat_doc,
+                org, coll,
             )
 
         retrievable = [

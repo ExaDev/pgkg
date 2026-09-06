@@ -80,8 +80,8 @@ async def test_ingest_creates_rows(pool: asyncpg.Pool, monkeypatch):
             "SELECT COUNT(*) FROM documents WHERE namespace = $1", ns
         )
         chunk_count = await conn.fetchval(
-            "SELECT COUNT(*) FROM chunks c JOIN documents d ON d.id = c.document_id WHERE d.namespace = $1",
-            ns,
+            "SELECT COUNT(*) FROM chunks c WHERE c.provenance_id = ANY($1::uuid[])",
+            list(result.provenance_ids),
         )
         prop_count = await conn.fetchval(
             "SELECT COUNT(*) FROM propositions WHERE namespace = $1", ns
@@ -283,7 +283,7 @@ async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
     ns = f"assertedat_ingest_{uuid.uuid4().hex[:8]}"
     mem = Memory(pool, namespace=ns)
 
-    await mem.ingest(
+    result = await mem.ingest(
         "The sky is blue and the grass is green.",
         asserted_at=expected_ts,
     )
@@ -295,11 +295,10 @@ async def test_ingest_propagates_asserted_at(pool: asyncpg.Pool, monkeypatch):
         chunk_row = await conn.fetchrow(
             """
             SELECT c.asserted_at FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE d.namespace = $1
+            WHERE c.provenance_id = ANY($1::uuid[])
             LIMIT 1
             """,
-            ns,
+            list(result.provenance_ids),
         )
 
     assert prop_row is not None

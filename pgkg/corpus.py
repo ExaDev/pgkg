@@ -295,10 +295,14 @@ async def content_address(conn: asyncpg.Connection) -> _ContentAddress:
         # A total address is a WHERE TRUE.  052 keeps it partial on
         # `NOT provenance_only`: content addressing governs retrievable content,
         # and a passage stored as provenance for the facts extracted from it
-        # must never be reused by another writer.  Which rows the address covers
-        # is read from the index for the same reason its keys are — this
-        # pipeline writes retrievable content, so it satisfies the predicate,
-        # but it does not get to decide what the predicate is.
+        # must never be reused by another writer.  056 dropped the parent
+        # pointer the predicate used to be written in terms of and did NOT
+        # widen the index — the predicate was re-founded on a column the drop
+        # does not touch, so the address is partial permanently rather than
+        # until some later migration (#18).  Which rows the address covers is
+        # read from the index for the same reason its keys are — this pipeline
+        # writes retrievable content, so it satisfies the predicate, but it does
+        # not get to decide what the predicate is.
         row_condition=rows[0]["row_condition"] or "TRUE",
     )
 

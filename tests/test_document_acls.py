@@ -382,7 +382,7 @@ async def test_chat_ingest_into_an_acl_bounded_collection_needs_a_group(
     async with pool.acquire() as conn:
         written = await conn.fetch(
             """
-            SELECT c.acl_group_id, c.document_id
+            SELECT c.acl_group_id, c.provenance_only
             FROM chunks c
             JOIN document_version_chunks dvc ON dvc.chunk_id = c.id
             JOIN document_versions dv ON dv.id = dvc.document_version_id
@@ -394,10 +394,10 @@ async def test_chat_ingest_into_an_acl_bounded_collection_needs_a_group(
     assert written, "chunks-only chat ingest wrote no chunk under the version"
     assert {row["acl_group_id"] for row in written} == {group}
     # 049 routed chunks-only chat ingest through pgkg_add_version_chunk(), which
-    # leaves document_id NULL so the row falls under the content address.  A
-    # chunk's parentage is the link table now, which is why this reads through
-    # it rather than through the single-parent pointer.
-    assert all(row["document_id"] is None for row in written)
+    # states nothing about provenance, so the row falls under the content
+    # address.  A chunk's parentage is the link table and nothing else since 056
+    # dropped the single-parent pointer, which is why this reads through it.
+    assert all(row["provenance_only"] is False for row in written)
 
 
 # ---------------------------------------------------------------------------

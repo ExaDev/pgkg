@@ -409,14 +409,14 @@ async def test_a_chunk_inherits_its_tenancy_from_its_document(
             acl_group,
         )
         row = await conn.fetchrow(
-            "SELECT org_id, collection_id, document_id, provenance_id,"
+            "SELECT org_id, collection_id, provenance_only, provenance_id,"
             " acl_group_id FROM chunks WHERE id = $1",
             added["chunk_id"],
         )
 
     assert row["org_id"] == org
     assert row["collection_id"] == collection
-    assert row["document_id"] is None
+    assert row["provenance_only"] is False
     assert row["provenance_id"] == provenance
     assert row["acl_group_id"] == acl_group
 
@@ -486,48 +486,6 @@ async def test_documents_without_an_external_id_still_ingest(
     assert row["deleted_at"] is None
 
 
-async def test_a_pre_lifecycle_chunk_is_not_content_addressed(
-    pool: asyncpg.Pool,
-) -> None:
-    """The content address governs retrievable content, and the pre-lifecycle
-    path writes provenance: a whole document's chunks go in one statement with
-    no conflict handling, so a repeated paragraph there is still two rows.
-
-    052 moved the index off the parent pointer and onto the statement that
-    replaced it, and the bridge is what keeps this writer — which states the
-    pointer and nothing else — outside the address."""
-    async with pool.acquire() as conn:
-        org = await new_org(conn)
-        collection = await new_collection(conn, org_id=org)
-        document = await new_document(
-            conn, org_id=org, collection_id=collection
-        )
-        repeated = "the same paragraph twice"
-
-        await conn.execute(
-            """
-            INSERT INTO chunks (document_id, text, org_id, collection_id)
-            SELECT $1, $2, $3, $4 FROM generate_series(1, 2)
-            """,
-            document,
-            repeated,
-            org,
-            collection,
-        )
-        legacy = await conn.fetchval(
-            "SELECT count(*) FROM chunks"
-            " WHERE org_id = $1 AND document_id IS NOT NULL",
-            org,
-        )
-
-        other = await new_document(conn, org_id=org, collection_id=collection)
-        _, _, first = await ingest_version(conn, other, [repeated])
-        _, _, second = await ingest_version(conn, other, [repeated, "and more"])
-
-    assert legacy == 2
-    assert second[0][0] == first[0][0]
-
-
 # ---------------------------------------------------------------------------
 # Provenance is stated, not inferred from parentage (052, issue #18)
 # ---------------------------------------------------------------------------
@@ -539,20 +497,18 @@ async def insert_chunk(
     org_id: uuid.UUID,
     collection_id: uuid.UUID,
     text: str,
-    document_id: uuid.UUID | None = None,
     provenance_only: bool = False,
 ) -> uuid.UUID:
     return await conn.fetchval(
         """
         INSERT INTO chunks
-            (text, org_id, collection_id, document_id, provenance_only)
-        VALUES ($1, $2, $3, $4, $5)
+            (text, org_id, collection_id, provenance_only)
+        VALUES ($1, $2, $3, $4)
         RETURNING id
         """,
         text,
         org_id,
         collection_id,
-        document_id,
         provenance_only,
     )
 
@@ -576,8 +532,8 @@ async def test_a_withheld_passage_needs_no_parent_pointer_to_be_withheld(
     A passage that exists as provenance for the facts extracted from it is not
     retrievable content (041), and until now the only way to say so was to point
     it at one document — which is what makes a total content address
-    unrepresentable (#18).  The writer says so instead, and the row names no
-    document at all."""
+    unrepresentable (#18).  The writer says so instead, and 056 dropped the
+    pointer it replaced."""
     async with pool.acquire() as conn:
         org = await new_org(conn)
         collection = await new_collection(conn, org_id=org)
@@ -594,9 +550,6 @@ async def test_a_withheld_passage_needs_no_parent_pointer_to_be_withheld(
             collection_id=collection,
             text="the handbook says the ledger reconciles nightly",
         )
-        document_id = await conn.fetchval(
-            "SELECT document_id FROM chunks WHERE id = $1", withheld
-        )
         withheld_flags = await chunk_flags(conn, withheld)
         content_flags = await chunk_flags(conn, content)
         counted = await conn.fetchval(
@@ -606,7 +559,6 @@ async def test_a_withheld_passage_needs_no_parent_pointer_to_be_withheld(
             collection,
         )
 
-    assert document_id is None
     assert withheld_flags == (False, True, False)
     assert content_flags == (True, False, False)
     assert counted == 1
@@ -691,44 +643,6 @@ async def test_a_carried_passage_stays_retrievable_when_it_states_provenance(
 
     assert before == (False, True, False)
     assert after == (True, True, True)
-
-
-async def test_naming_one_document_is_translated_into_the_statement(
-    pool: asyncpg.Pool,
-) -> None:
-    """The bridge, which is why 052 needs no writer to change at the same time.
-
-    A migration is forward-only and cannot reach the callers, so a row that
-    still states the pointer and nothing else has to keep the answer the pointer
-    used to give it.  The bridge only ever sets TRUE, so it cannot make a
-    withheld row retrievable, and its WHEN clause keeps every writer that has
-    moved off the pointer out of the function."""
-    async with pool.acquire() as conn:
-        org = await new_org(conn)
-        collection = await new_collection(conn, org_id=org)
-        document = await new_document(conn, org_id=org, collection_id=collection)
-
-        legacy = await insert_chunk(
-            conn, org_id=org, collection_id=collection,
-            text="a chat turn about the ledger", document_id=document,
-        )
-        translated = await chunk_flags(conn, legacy)
-
-        acquired = await insert_chunk(
-            conn, org_id=org, collection_id=collection,
-            text="a standalone note about the ledger",
-        )
-        stood_alone = await chunk_flags(conn, acquired)
-        await conn.execute(
-            "UPDATE chunks SET document_id = $1 WHERE id = $2",
-            document,
-            acquired,
-        )
-        withdrawn = await chunk_flags(conn, acquired)
-
-    assert translated == (False, True, False)
-    assert stood_alone == (True, False, False)
-    assert withdrawn == (False, True, False)
 
 
 async def test_changing_the_statement_moves_the_derived_flag_and_the_statistics(
@@ -825,29 +739,52 @@ async def test_liveness_takes_the_statement_and_not_the_pointer(
     deliberately unchanged.
 
     Read from the catalogue rather than from a copy of the definition: the
-    argument list of the liveness function is where the pointer used to be, and
-    the bridge trigger is meant to be the only schema object left that depends
-    on chunks.document_id at all."""
+    argument list of the liveness function is where the pointer used to be."""
     async with pool.acquire() as conn:
         arguments = await conn.fetchval(
             "SELECT pg_get_function_arguments(p.oid) FROM pg_proc p"
             " WHERE p.proname = 'pgkg_chunk_retrievable'"
         )
-        dependants = await conn.fetch(
-            """
-            SELECT DISTINCT
-                   COALESCE(t.tgname, ic.relname, co.conname) AS name
-            FROM pg_depend d
-            LEFT JOIN pg_trigger t ON t.oid = d.objid
-            LEFT JOIN pg_class ic ON ic.oid = d.objid
-            LEFT JOIN pg_constraint co ON co.oid = d.objid
-            WHERE d.refobjid = 'chunks'::regclass
-              AND d.refobjsubid = (
-                  SELECT a.attnum FROM pg_attribute a
-                  WHERE a.attrelid = 'chunks'::regclass
-                    AND a.attname = 'document_id'
-              )
-            """
+
+    assert "p_provenance_only" in arguments
+    assert "document_id" not in arguments
+
+
+async def test_chunks_carries_no_parent_pointer_at_all(
+    pool: asyncpg.Pool,
+) -> None:
+    """056 drops the column 052 emptied of meaning (#18).
+
+    052 moved every semantic use of chunks.document_id onto provenance_only and
+    left the pointer as the record of which document a chat-provenance chunk
+    came out of, translated into that statement by one named bridge trigger.
+    Nothing in the schema and nothing in this package reads it as parentage, so
+    the record it held is the derivation record on the row — one provenance row
+    per extraction-path chunk, carrying the span a citation names — and the
+    column and its bridge go together.
+
+    Three catalogue questions rather than one, because pg_depend does not see
+    inside a function body and a trigger's WHEN clause is neither: the column,
+    the objects that depended on it, and the bodies that spell it."""
+    async with pool.acquire() as conn:
+        columns = {
+            row["attname"]
+            for row in await conn.fetch(
+                "SELECT a.attname FROM pg_attribute a"
+                " WHERE a.attrelid = 'chunks'::regclass"
+                "   AND a.attnum > 0 AND NOT a.attisdropped"
+            )
+        }
+        triggers = {
+            row["tgname"]
+            for row in await conn.fetch(
+                "SELECT t.tgname FROM pg_trigger t"
+                " WHERE t.tgrelid = 'chunks'::regclass AND NOT t.tgisinternal"
+            )
+        }
+        bridge = await conn.fetchval(
+            "SELECT count(*) FROM pg_proc p"
+            " WHERE p.proname = 'pgkg_chunks_provenance_bridge'"
         )
         bodies = await conn.fetch(
             "SELECT p.proname, pg_get_functiondef(p.oid) AS src FROM pg_proc p"
@@ -862,16 +799,11 @@ async def test_liveness_takes_the_statement_and_not_the_pointer(
         row["proname"] for row in bodies if chunk_alias.search(row["src"])
     )
 
-    assert "p_provenance_only" in arguments
-    assert "document_id" not in arguments
-    assert {row["name"] for row in dependants} <= {
-        "chunks_document_id_fkey",
-        "pgkg_chunks_provenance_bridge",
-    }
-    # pg_depend does not see inside a function body, and the trigger that does
-    # read the pointer reads it from its WHEN clause rather than its body — so
-    # the bodies are checked separately, by the aliases this schema gives the
-    # chunks table.  Every surviving `document_id` in a pgkg function belongs to
+    assert "document_id" not in columns
+    assert "provenance_only" in columns
+    assert "pgkg_chunks_provenance_bridge" not in triggers
+    assert bridge == 0
+    # Every surviving `document_id` in a pgkg function belongs to
     # document_versions or to ingest_jobs.
     assert bodies_reading_the_pointer == []
 

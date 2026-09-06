@@ -3,8 +3,8 @@
 ## Unreleased
 
 Five defects found by re-reading the tree after phase 3, fixed on disjoint file ownership and
-integrated together. Migrations 051-054 (050 was reserved for a fix that needed no DDL; the gap is
-deliberate). Full reasoning in
+integrated together, plus the parent pointer's removal. Migrations 051-056 (050 was reserved for a
+fix that needed no DDL; the gap is deliberate). Full reasoning in
 [`docs/adrs/0001-implementation-notes.md`](docs/adrs/0001-implementation-notes.md) §1.
 
 - **A passage no crawl comes back for is now vectored on a timer.** The repair a corpus ingest
@@ -53,8 +53,16 @@ deliberate). Full reasoning in
   extracted facts, not retrievable content". That is not a fact about parentage, and it is what made
   the content address unable to cover two documents sharing a paragraph. Both now read the new
   `chunks.provenance_only`, which the writer states; every existing row keeps the answer it had. The
-  pointer survives only as the record of which document a chat-provenance chunk came out of, read by
-  one named bridge trigger — which is what makes eventually dropping it mechanical.
+  pointer then held nothing but the record of which document a chat-provenance chunk came out of,
+  and 056 removes it along with the bridge trigger that read it. What it recorded survives as the
+  chunk's provenance row, which carries the ingest run, the actor and the span — strictly more than
+  the pointer did.
+- **The content address stays partial, and that is now measured rather than assumed.** Dropping the
+  pointer was expected to let the unique index widen to every row. It does not: 052 had already
+  re-founded the index predicate on `NOT provenance_only`, a column the drop does not touch, so
+  removing the pointer moves the index not at all. A genuinely total index still fails 21 tests, 19
+  of them the extraction path colliding with itself on repeated text with no conflict handling —
+  which is the real blocker, and always was.
 - **The end-to-end harness covers the four fixes, and reports what it could not confirm.**
   `scripts/e2e_mcp.py` gained four sections past the retrieval walkthrough it had: the mention sweep
   run the way an operator runs it (`pgkg maintain --task mentions`), with a before/after on whether

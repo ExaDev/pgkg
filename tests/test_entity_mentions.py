@@ -101,15 +101,18 @@ async def insert_chunk(
     embedding: HalfVector | None = None,
     visibility: str = "shared",
     owner_user_id: uuid.UUID | None = None,
+    provenance_only: bool = False,
 ) -> uuid.UUID:
     return await conn.fetchval(
         """
         INSERT INTO chunks
-            (text, org_id, collection_id, embedding, visibility, owner_user_id)
-        VALUES ($1, $2, $3, $4::halfvec, $5, $6)
+            (text, org_id, collection_id, embedding, visibility, owner_user_id,
+             provenance_only)
+        VALUES ($1, $2, $3, $4::halfvec, $5, $6, $7)
         RETURNING id
         """,
         text, org_id, collection_id, embedding, visibility, owner_user_id,
+        provenance_only,
     )
 
 
@@ -752,17 +755,10 @@ async def test_a_passage_that_is_not_retrievable_is_not_reachable_either(
             org_id=org, collection_id=collection, namespace=namespace,
             subject_id=entity,
         )
-        document = await conn.fetchval(
-            "INSERT INTO documents (source, org_id, collection_id) "
-            "VALUES ($1, $2, $3) RETURNING id",
-            unique("doc"), org, collection,
-        )
         provenance = await insert_chunk(
             conn, org_id=org, collection_id=collection,
             text="Helios is the event-sourced ledger behind settlement.",
-        )
-        await conn.execute(
-            "UPDATE chunks SET document_id = $1 WHERE id = $2", document, provenance
+            provenance_only=True,
         )
         await match(conn, provenance)
 

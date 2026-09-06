@@ -243,9 +243,10 @@ async def test_a_chat_chunk_is_provenance_not_a_passage(
         chunk_ids = {
             r["id"]
             for r in await conn.fetch(
-                "SELECT c.id FROM chunks c JOIN documents d ON d.id = c.document_id"
-                " WHERE d.namespace = $1",
-                namespace,
+                "SELECT c.id FROM chunks c"
+                " WHERE c.org_id = $1 AND c.collection_id = $2",
+                org,
+                chat,
             )
         }
     assert chunk_ids, "chat ingest still has to write the chunk it cites"

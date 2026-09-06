@@ -15,10 +15,11 @@ Companion documents:
   adversarial verifiers found in phases 0–3, each with its reproduction and the commit that closed
   it, plus the re-verification pass that audited the fixes.
 
-**State at the time of writing.** Phases 0–3 complete, migrations 001–054, 641 tests green.
+**State at the time of writing.** Phases 0–3 complete, migrations 001–056, 643 tests green.
 Phase 2's last outstanding item — chunks-only ingest writing into the chunk store rather than
 faking proposition rows — landed in 049; see §3. Five defects found after phase 3 are closed in
-051–054 and `pgkg/corpus.py`; see the second fix-pass table in §1. **Migration 050 does not
+051–054 and `pgkg/corpus.py`, and the single-parent pointer came out in 056; see the second
+fix-pass table in §1. **Migration 050 does not
 exist**: the number was assigned to the fix that turned out to need no DDL, and the gap is
 deliberate rather than a lost file.
 Run them with:
@@ -106,7 +107,7 @@ file ownership like the first pass. Each entry is one issue.
 |---|---|---|
 | **#16 — a passage in two collections lost its vector** | `pgkg/corpus.py` | The reuse lookup restated the content address instead of reading it, and had drifted from it twice (042 added three columns, 049 added two). It answered "already stored and vectored" about a row at another address; the write phase then correctly created a new row and the vector write skipped it, and no later crawl revisits it because the document hash short-circuits first. The lookup is now generated from the unique index that enforces the address, and the residual race — phase 2 saw a row phase 3 did not — is paid for after the transaction instead of stranding the chunk. No DDL was needed. |
 | **#17 — entity dedup read every name** | `051_entity_dedup_reaches_the_trigram_index.sql` | `pgkg_link_entity()` stage 2 generated its candidates with `similarity(name, p_name) > 0.6`, a function call over a column that no index can serve, so every near-duplicate check was a sequential scan of `entities` — for the owner as well as for `pgkg_app`, which is what makes it a different defect from the one 047 fixed. It now generates with `name % p_name` against `entities_name_trgm_idx`. Measured on 40,001 names in one org: 78.4 ms and 949 buffers becomes 0.65 ms and 70. |
-| **#18 — retrievability was inferred from parentage** | `052_retrievability_stops_being_a_property_of_parentage.sql` | Liveness and the content address's partial predicate both read `chunks.document_id` to mean "this row is not retrievable content", which is not a fact about parentage at all. Both now read `chunks.provenance_only`, which the writer states. The column itself survives as the record of which document a chat-provenance chunk came out of, and 052 records what removing it still costs; see §3. |
+| **#18 — retrievability was inferred from parentage** | `052_retrievability_stops_being_a_property_of_parentage.sql` | Liveness and the content address's partial predicate both read `chunks.document_id` to mean "this row is not retrievable content", which is not a fact about parentage at all. Both now read `chunks.provenance_only`, which the writer states. The column itself survived 052 as the record of which document a chat-provenance chunk came out of, and `056_the_parent_pointer_leaves_the_chunk_store.sql` drops it, its bridge trigger and its foreign key — the record it held is the per-chunk derivation record, which carries the span as well. The address does not widen: see §3. |
 | **#19 — nothing ran the gazetteer** | `053_scheduling_what_was_already_built.sql`, `pgkg/maintenance.py`, `pgkg maintain` | Four jobs existed in the schema, were tested, and were reachable only from a test or an operator's psql session. `entity_mentions` was therefore empty in every deployment, which is D2's corpus-to-graph edge missing entirely. One entry point now runs all four, each selectable and each guarded by an advisory lock per (task, org). 053 adds the name-side mention watermark, without which the reverse direction — a name created after the corpus was swept — could never meet the passages that predate it. |
 | **#22 — a stranded passage was never revisited** | `054_the_passages_no_crawl_comes_back_for.sql`, `pgkg/maintenance.py`, `pgkg maintain --task vectors` | The repair #16 added runs after the transaction that promoted the version, so a killed process, a dropped connection or an embedder that refuses leaves the row committed with `embedding IS NULL` — and the next crawl of that document short-circuits on the unchanged hash before it reaches a chunk, so nothing ever revisits it. Retrievable by the keyword arm, invisible to the vector arm and to MMR, permanently and silently. The fifth maintenance task sweeps `embedding IS NULL AND refcount > 0` in batches, each its own transaction so an interrupted run keeps what it finished, and only in the row's own generation: D8 makes two generations incomparable, so the rows a cutover-window backlog is made of are counted and left rather than filled from the space this process happens to run. |
 
@@ -379,8 +380,9 @@ path, to content-address rows no read predicate will ever reach is the pipeline 
 separates the two ingests to avoid. So the extraction path keeps `chunks.document_id`, the
 pre-lifecycle single-parent pointer, and keeps its per-chunk provenance locators — the span a
 citation names. (052 keeps the decision and removes the reason it needed the pointer: the path now
-states `provenance_only` itself, and the pointer is only the record of which document a passage came
-out of. See below.)
+states `provenance_only` itself. 056 then drops the pointer altogether — what it recorded is the
+per-chunk provenance locator this paragraph already names, which carries the ingest and the span as
+well as the turn. See below.)
 
 ### The content address gains `visibility` and `owner_user_id` (049), and stays partial
 
@@ -404,7 +406,9 @@ partial index on purpose. While `chunks.document_id` remains a single-parent poi
 address is unrepresentable anyway: two pre-lifecycle documents in one collection sharing a
 paragraph would have to be one row, and that row can name only one parent. Widening it is
 therefore not a DROP and CREATE but the removal of `chunks.document_id`, which is a separate piece
-of work.
+of work. *(That last sentence is wrong on both halves, and 052 and 056 correct it below: widening
+it is not a DROP and CREATE and it is not the removal of the column either — the address is
+permanently partial, and 056 removed the column without widening anything.)*
 
 ### The claim above is wrong twice, and 052 corrects both halves
 
@@ -450,6 +454,46 @@ that states its own answer, and its `WHEN` clause keeps every writer that has mo
 out of the function. Retiring the direct writers, dropping the trigger and dropping the column is
 one mechanical change; it is also the prerequisite for making `provenance_only` an absolute veto,
 which is the stronger property the extraction path would need if it ever did move onto versions.
+
+### 056 drops the pointer, and the address stays partial
+
+`chunks.document_id` is gone. 052 had already emptied it of meaning; what was left was the record
+of which document a chat-provenance chunk came out of, one bridge trigger translating a write of it
+into `provenance_only`, and eleven test modules reading it as a join. All three are retired
+together.
+
+**What the record is now.** Removing the only record of something is the mistake 045 exists to
+document, so the pointer's readers were traced before it went. Nothing in the schema reads it (052
+verified that against `pg_get_functiondef()` for every `pgkg_` function, and
+`test_chunks_carries_no_parent_pointer_at_all` now pins it); nothing in the package reads it, the
+extraction path being its only writer; and the surfaces that might have needed it do not use it —
+a document soft delete matches on `external_id` and withdraws its claims through
+`document_version_chunks`, and the extraction path's documents carry no `external_id`, so that
+surface never reached them. What the pointer recorded is on the row anyway, in a better shape: on
+that path the document *is* the turn the ingest wrote, and every chunk of it carries a provenance
+row of its own naming the ingest run, the actor and the span a citation needs. The pointer named a
+document and nothing else.
+
+**The parentage is not moved to `document_version_chunks`, which is what #18 asked for as filed.**
+`pgkg_item_scope()` buckets a proposition `corpus` when `EXISTS (document_version_chunks ...)` holds
+for the chunk it cites, so linking chat provenance under a version reclassifies every chat-derived
+fact as corpus material and restores D1's drowning failure mode — the one 041 rewrote the bucket on
+structure to escape. Measured, not assumed: linking the chunk in
+`test_a_fact_extracted_from_a_chat_turn_stays_in_the_memory_bucket` flips its fact from `memory` to
+`corpus`. A pointer with no readers is dropped; it is not re-homed into a shape that changes
+retrieval.
+
+**The address did not widen, and the reason is not the one #18 gives.** #18 says a total index
+follows once the column is gone. It does not, because 052 re-founded the predicate on a column 056
+does not touch: the address is partial on `NOT provenance_only`. Re-measured against the schema 056
+leaves, a genuinely total index turns **21 tests red**, every one a unique violation on
+`chunks_content_addressed_key` — 19 the extraction path colliding with itself on repeated text, and
+two pinning the partial predicate on purpose
+(`test_a_passage_and_the_provenance_of_a_fact_are_never_one_row` and
+`test_the_content_address_covers_retrievable_content_only`). The 22nd from the measurement above was
+a test of the bridge, deleted with it, not a collision that stopped happening. So the address is
+partial for the reason 052 gives and for no other, and the phrase "one DROP and CREATE" describes
+nothing that is ever going to happen.
 
 **The bench harness now scopes each item to its own collection**, both arms. A namespace isolates
 propositions and nothing else — chunks carry no namespace, because D3 replaced stringly-typed

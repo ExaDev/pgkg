@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import random
 import uuid
+from collections.abc import Sequence
 
 import asyncpg
 import pytest
@@ -65,23 +66,33 @@ def _document(seed: int = 11, sections: int = 24) -> str:
 
 
 async def _chunk_rows(
-    pool: asyncpg.Pool, namespace: str
+    pool: asyncpg.Pool, provenance_ids: Sequence[uuid.UUID]
 ) -> list[tuple[str, int, int]]:
+    """One ingest's passages, found by the derivation record on each of them.
+
+    Not by a parent document: 056 dropped chunks.document_id, and the extraction
+    path's passages carry no namespace either — a chunk is scoped by org and
+    collection (D3), and every ingest here shares the default pair.  What is one
+    per chunk on this path is its provenance row, which is also what carries the
+    span a citation names, so it is the honest handle on "the rows this ingest
+    wrote".
+    """
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT c.text, c.span_start, c.span_end
             FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE d.namespace = $1
+            WHERE c.provenance_id = ANY($1::uuid[])
             ORDER BY c.span_start
             """,
-            namespace,
+            list(provenance_ids),
         )
     return [(r["text"], r["span_start"], r["span_end"]) for r in rows]
 
 
-async def _ingest(pool: asyncpg.Pool, namespace: str, text: str) -> None:
+async def _ingest(
+    pool: asyncpg.Pool, namespace: str, text: str
+) -> Sequence[uuid.UUID]:
     """Through the extraction path, because that is the one that keeps spans.
 
     The subject here is the chunker, and either ingest mode reaches it — but a
@@ -91,7 +102,8 @@ async def _ingest(pool: asyncpg.Pool, namespace: str, text: str) -> None:
     """
     from pgkg.memory import Memory
 
-    await Memory(pool, namespace=namespace).ingest(text)
+    result = await Memory(pool, namespace=namespace).ingest(text)
+    return result.provenance_ids
 
 
 async def test_stored_spans_locate_the_chunk_in_the_source_document(
@@ -107,9 +119,9 @@ async def test_stored_spans_locate_the_chunk_in_the_source_document(
 
     document = _document()
     namespace = _ns("spans")
-    await _ingest(pool, namespace, document)
+    written = await _ingest(pool, namespace, document)
 
-    rows = await _chunk_rows(pool, namespace)
+    rows = await _chunk_rows(pool, written)
 
     assert len(rows) > 1
     for text, start, end in rows:
@@ -150,8 +162,8 @@ async def test_inserting_a_paragraph_near_the_top_preserves_later_chunks(
     original = "\n\n".join(paragraphs) + "\n"
 
     ns_before = _ns("stable_before")
-    await _ingest(pool, ns_before, original)
-    before = [text for text, _, _ in await _chunk_rows(pool, ns_before)]
+    written = await _ingest(pool, ns_before, original)
+    before = [text for text, _, _ in await _chunk_rows(pool, written)]
     assert len(before) >= 10
 
     inserted = "- An inserted line about zymurgy fermentation kinetics."
@@ -163,8 +175,8 @@ async def test_inserting_a_paragraph_near_the_top_preserves_later_chunks(
             + "\n"
         )
         namespace = _ns(f"stable_after_{position}")
-        await _ingest(pool, namespace, edited)
-        after = {text for text, _, _ in await _chunk_rows(pool, namespace)}
+        rewritten = await _ingest(pool, namespace, edited)
+        after = {text for text, _, _ in await _chunk_rows(pool, rewritten)}
 
         survivors = [text for text in before if text in after]
         fraction = len(survivors) / len(before)
@@ -186,9 +198,9 @@ async def test_a_heading_starts_a_new_chunk(
         "## Gamma\n\nA short paragraph about telomeres.\n"
     )
     namespace = _ns("headings")
-    await _ingest(pool, namespace, document)
+    written = await _ingest(pool, namespace, document)
 
-    texts = [text for text, _, _ in await _chunk_rows(pool, namespace)]
+    texts = [text for text, _, _ in await _chunk_rows(pool, written)]
 
     assert len(texts) == 3
     assert [text.splitlines()[0] for text in texts] == [
@@ -206,11 +218,11 @@ async def test_no_chunk_exceeds_the_requested_size(
     from pgkg.memory import Memory
 
     namespace = _ns("cap")
-    await Memory(pool, namespace=namespace).ingest(
+    result = await Memory(pool, namespace=namespace).ingest(
         _document(), chunk_size=400
     )
 
-    rows = await _chunk_rows(pool, namespace)
+    rows = await _chunk_rows(pool, result.provenance_ids)
 
     assert len(rows) > 1
     assert all(len(text) <= 400 for text, _, _ in rows)
@@ -225,42 +237,37 @@ async def test_the_extraction_path_says_its_passages_are_provenance(
     Until 052 the only way to say that was to point each one at one document,
     which is what makes a total content address unrepresentable — two documents
     sharing a paragraph would have to be one row that can name only one parent
-    (#18).  The writer says it now, and it says it in its own statement rather
-    than leaving 052's bridge to derive it from the pointer: the bridge is meant
-    to be retired, and a writer that leans on it stores a different row the day
-    it goes.
+    (#18).  The writer says it now, in its own statement, which is what let 056
+    drop the pointer and 052's bridge together.
+
+    The derivation record is what the pointer's removal leaves behind, and it is
+    the better record: one provenance row per chunk, carrying the span a
+    citation names, where the pointer named only a document.
     """
     monkeypatch.setattr(ml, "embed", _make_embed(embed_dim))
 
     namespace = _ns("provenance")
-    # With 052's bridge switched off, nothing derives the answer from the parent
-    # pointer, so what the rows say is what this writer said.  That is the
-    # difference the test is about: the bridge exists for writers a forward-only
-    # migration could not reach and is meant to be retired, and a writer leaning
-    # on it stores a different row the day it goes.
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "ALTER TABLE chunks DISABLE TRIGGER pgkg_chunks_provenance_bridge"
-        )
-    try:
-        await _ingest(pool, namespace, _document())
-    finally:
-        async with pool.acquire() as conn:
-            await conn.execute(
-                "ALTER TABLE chunks ENABLE TRIGGER pgkg_chunks_provenance_bridge"
-            )
+    written = await _ingest(pool, namespace, _document())
 
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """
-            SELECT c.provenance_only, c.retrievable
+            SELECT c.provenance_only, c.retrievable, c.provenance_id,
+                   c.span_start, c.span_end,
+                   p.source_locator, p.ingest_run_id
             FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE d.namespace = $1
+            JOIN provenance p ON p.id = c.provenance_id
+            WHERE c.provenance_id = ANY($1::uuid[])
             """,
-            namespace,
+            list(written),
         )
 
     assert len(rows) > 1
     assert all(row["provenance_only"] for row in rows)
     assert not any(row["retrievable"] for row in rows)
+    # One derivation record per chunk, not one per ingest: the span is what a
+    # citation names, and a row shared by two writers could not carry it.
+    assert len({row["provenance_id"] for row in rows}) == len(rows)
+    assert len({row["ingest_run_id"] for row in rows}) == 1
+    assert all(row["span_end"] > row["span_start"] for row in rows)
+    assert all(row["source_locator"] is not None for row in rows)
