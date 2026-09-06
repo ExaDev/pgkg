@@ -8,8 +8,19 @@ table was empty in every deployment (issue #19).  `pgkg_recompute_pagerank()`,
 `pgkg_contradict()` and `pgkg_expire_due()` are recorded as built-and-unscheduled
 in docs/adrs/0001-implementation-notes.md §4 for the same reason.
 
-One entry point rather than four, because the thing an operator actually
-installs is a crontab line, and four of them is three chances to forget one.
+The fifth job is here for the other half of the same reason.  A corpus ingest
+can leave a live passage with `embedding IS NULL` — the window between phase 2
+deciding a vector already existed at an address and phase 3 creating a new row
+there, and the promoted-then-repaired ordering that a killed process interrupts
+— and the next crawl of that document short-circuits on the unchanged hash
+before it reaches a chunk.  So nothing revisits the row: it stays retrievable by
+the keyword arm, invisible to the vector arm and to MMR, silently and for good
+(issue #22).  Unlike the other four this one spends money, which is why it is
+scoped to the rows a version still links and to the generation this process can
+actually embed for.
+
+One entry point rather than five, because the thing an operator actually
+installs is a crontab line, and five of them is four chances to forget one.
 Three properties make it safe to install:
 
 *Selectable.*  A pagerank pass and a mention sweep have nothing to do with each
@@ -26,9 +37,10 @@ anything on a timer, and it is the one this module is built against: each task
 takes an advisory lock per (task, org) and reports `ran=False` rather than
 repeating work someone else is doing.  Nothing here needs the lock to be
 correct — the mention insert is ON CONFLICT DO NOTHING, both watermarks are set
-under an IS NULL predicate, and the contradiction candidate query takes its rows
-FOR UPDATE SKIP LOCKED — the lock is there so that the numbers a scheduler reads
-mean what they say.
+under an IS NULL predicate, the contradiction candidate query takes its rows
+FOR UPDATE SKIP LOCKED, and the vector write is guarded by the same IS NULL it
+selected on — the lock is there so that the numbers a scheduler reads mean what
+they say, and so that two ticks do not pay an embedder for the same batch.
 
 Why the sweep and not an inline call.  D7 rules out both online placements: a
 corpus ingest must not hold a pooled connection across a cross-product against
@@ -55,14 +67,19 @@ from dataclasses import dataclass
 from uuid import UUID
 
 import asyncpg
+from pgvector import HalfVector
 
+from pgkg import ml
 from pgkg.config import DEFAULT_ORG_ID, ORG_GUC
+from pgkg.corpus import EmbedFn
 from pgkg.gazetteer import Gazetteer
 
-# The four jobs, in the order a run performs them.  Mentions first because it is
-# the one with a customer-visible consequence; pagerank after it, since a sweep
-# writes no entity and no edge, so the ordering costs nothing either way.
-TASKS = ("mentions", "pagerank", "contradictions", "expiries")
+# The five jobs, in the order a run performs them.  Mentions first because it is
+# the one with a customer-visible consequence, and vectors second because it is
+# the other one: a passage with no vector is retrievable by half the retriever.
+# Pagerank after both, since neither writes an entity or an edge, so the
+# ordering costs nothing either way.
+TASKS = ("mentions", "vectors", "pagerank", "contradictions", "expiries")
 
 # One batch of a sweep, not a whole corpus.  Matches the gazetteer's own default
 # so an operator who changes neither gets the same unit of work everywhere.
@@ -97,6 +114,45 @@ WHERE e.org_id = $1 AND e.namespace = ANY($2::text[])
 _CONTRADICT_SQL = "SELECT considered, closed FROM pgkg_contradict_superseded($1, $2)"
 _EXPIRE_SQL = "SELECT pgkg_expire_due($1, $2)"
 
+# How many passages this org has that a crawl left without a vector — all of
+# them, not only the ones this run can serve, because a row this process cannot
+# embed for is still a row the operator has to be told about.  Served by
+# chunks_unvectored_idx (054), so a settled org pays an index probe per tick.
+_STRANDED_SQL = """
+SELECT COUNT(*) FROM chunks
+WHERE org_id = $1 AND embedding IS NULL AND refcount > 0
+"""
+
+# Which generation this process embeds in.  Read to decide which stranded rows
+# the run may serve, never to stamp one: the row states its own generation and a
+# vector computed by another model is not comparable with it (D8).
+_PRIMARY_GENERATION_SQL = """
+SELECT oe.generation_id FROM org_embedders oe
+WHERE oe.org_id = $1 AND oe.role = 'primary'
+"""
+
+_UNVECTORED_SQL = (
+    "SELECT chunk_id, chunk_text FROM pgkg_unvectored_chunks($1, $2, $3)"
+)
+
+# The write, guarded by both facts that made the vector the right one for the
+# row.  `embedding IS NULL` so a vector another writer computed in the meantime
+# is never overwritten by this one — the reason the task is safe to run twice —
+# and the generation so a row cut over between the select and the write is left
+# for the model that now owns it rather than filled from the space it just left.
+_WRITE_VECTORS_SQL = """
+WITH written AS (
+    UPDATE chunks c
+    SET embedding = e.embedding
+    FROM unnest($2::uuid[], $3::halfvec[]) AS e(id, embedding)
+    WHERE c.id = e.id
+      AND c.embedding IS NULL
+      AND c.embedder_generation_id = $1
+    RETURNING 1
+)
+SELECT COUNT(*) FROM written
+"""
+
 
 @dataclass(frozen=True)
 class TaskReport:
@@ -104,9 +160,10 @@ class TaskReport:
 
     `ran` is False only when another run held the lock, which is a normal
     outcome and not a failure.  `scanned` is the work in the unit the task works
-    in — passages and names for the sweep, subgraphs for pagerank, candidate
-    claims for contradictions — and None where the job cannot honestly report
-    one: `pgkg_expire_due()` knows what it withdrew and not what it looked at.
+    in — passages and names for the sweep, unvectored passages for the vector
+    repair, subgraphs for pagerank, candidate claims for contradictions — and
+    None where the job cannot honestly report one: `pgkg_expire_due()` knows
+    what it withdrew and not what it looked at.
     `changed` is the yield, and it is the number worth alerting on when it stays
     non-zero for a job that is supposed to settle.
     """
@@ -174,6 +231,7 @@ class Maintenance:
         damping: float = DEFAULT_DAMPING,
         max_batches: int = DEFAULT_MAX_BATCHES,
         gazetteer: Gazetteer | None = None,
+        embed: EmbedFn | None = None,
     ) -> None:
         if batch < 1:
             raise ValueError("a batch of no rows would never make progress")
@@ -186,6 +244,7 @@ class Maintenance:
         self._iterations = iterations
         self._damping = damping
         self._max_batches = max_batches
+        self._embed = embed
         # An injected gazetteer already pointed at this org is used as it is;
         # one pointed elsewhere is re-pointed, which is what for_org is for.
         # Re-pointing unconditionally would quietly replace a caller's own
@@ -211,6 +270,7 @@ class Maintenance:
             damping=self._damping,
             max_batches=self._max_batches,
             gazetteer=self._gazetteer,
+            embed=self._embed,
         )
 
     async def run(self, tasks: Iterable[str] | None = None) -> MaintenanceReport:
@@ -248,6 +308,7 @@ class Maintenance:
         """
         return {
             "mentions": self._mentions,
+            "vectors": self._vectors,
             "pagerank": self._pagerank,
             "contradictions": self._contradictions,
             "expiries": self._expiries,
@@ -322,6 +383,103 @@ class Maintenance:
         return await self._gazetteer.sweep_entities(
             limit=self._batch, max_chunks=self._batch, conn=conn
         )
+
+    async def _vectors(self, conn: asyncpg.Connection) -> tuple[int, int]:
+        """Passages a crawl left without a vector, embedded a batch at a time.
+
+        The ingest path pays for its own stranded rows immediately after the
+        transaction that created them (#16), which covers every run that gets
+        that far.  This is the backstop for the ones that do not: the version is
+        promoted and committed first, so an embedder that fails, a process that
+        is killed or a connection that drops in between leaves the row committed
+        with `embedding IS NULL` — and the next crawl of that document
+        short-circuits on the unchanged hash before it ever reaches a chunk.
+        Nothing else ever revisits it, which is what makes a small window a
+        permanent one (#22).
+
+        `scanned` is every stranded row this org has, not only the ones this run
+        can serve, because a row this process cannot embed for is exactly the
+        row that must not go unmentioned again — an operator reading
+        `scanned: 3, changed: 0` every tick is reading the backlog this task
+        exists to make visible.
+
+        One generation, this org's primary, and never a restamp.  D8 makes
+        vectors from two generations incomparable, and `chunks.embedding` is the
+        single inline column the primary owns, so the rows a stranded backlog is
+        made of during a cutover — the outgoing generation's — are rows this
+        process has no model for.  Filling them from the incoming space, or
+        relabelling them so that it fits, would restate the defect being fixed
+        in a form nothing can detect afterwards.  They are counted and left.
+        """
+        stranded = await conn.fetchval(_STRANDED_SQL, self._org_id)
+        generation = await conn.fetchval(_PRIMARY_GENERATION_SQL, self._org_id)
+        if not stranded or generation is None:
+            return stranded, 0
+
+        changed = 0
+        # No "made no progress" failure here, unlike the mention sweep: progress
+        # is proved by the write itself rather than by a watermark that could
+        # stall, so a batch that writes nothing means another writer got there
+        # first and there is nothing to raise about.  The cap bounds one run,
+        # not the backlog — what is left is still there for the next tick.
+        for _ in range(self._max_batches):
+            rows = await self._unvectored(conn, generation)
+            if not rows:
+                break
+            written = await self._vectorise(conn, generation, rows)
+            changed += written
+            if written == 0 or len(rows) < self._batch:
+                break
+        return stranded, changed
+
+    async def _unvectored(
+        self, conn: asyncpg.Connection, generation_id: UUID
+    ) -> list[asyncpg.Record]:
+        return await conn.fetch(
+            _UNVECTORED_SQL, self._org_id, generation_id, self._batch
+        )
+
+    async def _vectorise(
+        self,
+        conn: asyncpg.Connection,
+        generation_id: UUID,
+        rows: Sequence[asyncpg.Record],
+    ) -> int:
+        """Embed one batch and write it, as one statement of its own.
+
+        A batch is the unit of work AND the unit of durability: no transaction
+        spans two of them, so a run that dies on the third batch leaves the
+        first two vectored rather than rolling back an hour of embedder spend.
+
+        The pooled connection is held across the model call, which the ingest
+        path may not do (D7).  It is not the same trade: the connection carries
+        the advisory lock this task runs under, so releasing it for the duration
+        of the embedder would release the lock and let the next tick embed the
+        same batch.  A background job holding one slot per tenant is the price
+        of the lock meaning anything, and the batch bounds how long it is held.
+        """
+        texts = [row["chunk_text"] for row in rows]
+        vectors = self._embed_texts(texts)
+        if len(vectors) != len(texts):
+            raise RuntimeError(
+                f"the embedder returned {len(vectors)} vectors for "
+                f"{len(texts)} passages: a vector is only ever written against "
+                "the content it was computed from"
+            )
+        return await conn.fetchval(
+            _WRITE_VECTORS_SQL,
+            generation_id,
+            [row["chunk_id"] for row in rows],
+            [HalfVector(vector) for vector in vectors],
+        )
+
+    def _embed_texts(self, texts: Sequence[str]) -> list[list[float]]:
+        """Resolved at call time so a spy on ml.embed is a spy on this path."""
+        if not texts:
+            return []
+        if self._embed is not None:
+            return self._embed(list(texts))
+        return ml.embed(list(texts))
 
     async def _pagerank(self, conn: asyncpg.Connection) -> tuple[int, int]:
         """One PageRank pass per subgraph this org has entities in.
