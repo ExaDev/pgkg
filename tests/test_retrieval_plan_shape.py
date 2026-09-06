@@ -87,30 +87,30 @@ async def corpus(pool: asyncpg.Pool):
             version,
             document,
         )
+        # One statement, so the links are built from the rows the INSERT
+        # actually created: 056 dropped chunks.document_id, and a passage's
+        # parentage is the link table (D6).
         await conn.execute(
             """
-            INSERT INTO chunks (document_id, text, span_start, span_end,
-                                org_id, collection_id)
-            SELECT $1,
-                   'the reimbursement policy for lodging and equipment states '
-                   || 'that expense claim ' || g || ' needs approval from the '
-                   || 'finance team before the operator reconciles the ledger '
-                   || repeat('filler phrase ' || (g % 91) || ' ', 12),
-                   0, 400, $2, $3
-            FROM generate_series(1, 4000) g
-            """,
-            document,
-            org,
-            collection,
-        )
-        await conn.execute(
-            """
+            WITH written AS (
+                INSERT INTO chunks (text, span_start, span_end,
+                                    org_id, collection_id)
+                SELECT 'the reimbursement policy for lodging and equipment '
+                       || 'states that expense claim ' || g || ' needs approval '
+                       || 'from the finance team before the operator '
+                       || 'reconciles the ledger '
+                       || repeat('filler phrase ' || (g % 91) || ' ', 12),
+                       0, 400, $2, $3
+                FROM generate_series(1, 4000) g
+                RETURNING id
+            )
             INSERT INTO document_version_chunks (document_version_id, chunk_id, ord)
-            SELECT $1, c.id, (row_number() OVER (ORDER BY c.id))::int - 1
-            FROM chunks c WHERE c.document_id = $2
+            SELECT $1, w.id, (row_number() OVER (ORDER BY w.id))::int - 1
+            FROM written w
             """,
             version,
-            document,
+            org,
+            collection,
         )
         await conn.execute(
             """

@@ -205,15 +205,12 @@ async def test_stats_track_cascading_deletes(pool: asyncpg.Pool) -> None:
     nothing in the maintenance path assumes the delete was explicit."""
     ns = _ns("stats_cascade")
     async with pool.acquire() as conn:
-        doc_id = await conn.fetchval(
-            "INSERT INTO documents (namespace) VALUES ($1) RETURNING id", ns,
-        )
         chunk_id = await conn.fetchval(
             """
-            INSERT INTO chunks (document_id, text) VALUES ($1, 'chunk body')
+            INSERT INTO chunks (text, provenance_only) VALUES ($1, TRUE)
             RETURNING id
             """,
-            doc_id,
+            f"chunk body for {ns}",
         )
         await insert_proposition(
             conn, text="cascaded claim", namespace=ns, chunk_id=chunk_id,

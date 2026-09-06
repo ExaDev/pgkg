@@ -199,8 +199,8 @@ async def _ingest_per_row(
     chunks = chunk_document(text)
 
     async with pool.acquire() as conn:
-        doc_id = await conn.fetchval(
-            "INSERT INTO documents (source, namespace) VALUES ($1, $2) RETURNING id",
+        await conn.execute(
+            "INSERT INTO documents (source, namespace) VALUES ($1, $2)",
             None,
             namespace,
         )
@@ -209,10 +209,10 @@ async def _ingest_per_row(
             chunk_ids.append(
                 await conn.fetchval(
                     """
-                    INSERT INTO chunks (document_id, text, span_start, span_end, asserted_at)
-                    VALUES ($1, $2, $3, $4, $5) RETURNING id
+                    INSERT INTO chunks
+                        (text, span_start, span_end, asserted_at, provenance_only)
+                    VALUES ($1, $2, $3, $4, TRUE) RETURNING id
                     """,
-                    doc_id,
                     chunk.text,
                     chunk.span_start,
                     chunk.span_end,
@@ -301,12 +301,11 @@ async def _proposition_snapshot(pool: asyncpg.Pool, namespace: str) -> list[tupl
             SELECT p.text, p.predicate, p.object_literal, p.session_id,
                    p.asserted_at, p.metadata, p.embedding::text AS emb,
                    s.name AS subject_name, o.name AS object_name,
-                   c.text AS chunk_text, d.source AS doc_source
+                   c.text AS chunk_text
             FROM propositions p
             LEFT JOIN entities s ON s.id = p.subject_id
             LEFT JOIN entities o ON o.id = p.object_id
             LEFT JOIN chunks c ON c.id = p.chunk_id
-            LEFT JOIN documents d ON d.id = c.document_id
             WHERE p.namespace = $1
             ORDER BY p.text, p.predicate
             """,
@@ -353,6 +352,9 @@ async def test_ingest_rolls_back_every_row_when_a_later_write_fails(
     ns = _ns("rollback")
     mem = Memory(pool, namespace=ns, extract_propositions=False)
 
+    async with pool.acquire() as conn:
+        before = await conn.fetchval("SELECT COUNT(*) FROM chunks")
+
     with pytest.raises(Exception):
         await mem.ingest(_DOC)
 
@@ -360,14 +362,10 @@ async def test_ingest_rolls_back_every_row_when_a_later_write_fails(
         docs = await conn.fetchval(
             "SELECT COUNT(*) FROM documents WHERE namespace = $1", ns
         )
-        chunks = await conn.fetchval(
-            """
-            SELECT COUNT(*) FROM chunks c
-            JOIN documents d ON d.id = c.document_id
-            WHERE d.namespace = $1
-            """,
-            ns,
-        )
+        # Counted over the whole table rather than through a parent document:
+        # 056 dropped chunks.document_id, and a chunk carries no namespace of
+        # its own (D3).  "Left nothing behind" is a statement about the table.
+        chunks = await conn.fetchval("SELECT COUNT(*) FROM chunks") - before
         props = await conn.fetchval(
             "SELECT COUNT(*) FROM propositions WHERE namespace = $1", ns
         )
