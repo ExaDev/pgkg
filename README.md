@@ -437,19 +437,20 @@ boundary. Mix them freely: a collection can hold either, and a query can name bo
 
 ## Keeping it fresh: `pgkg maintain`
 
-Four jobs are not on the request path and are not supposed to be. Nothing runs them unless you
+Five jobs are not on the request path and are not supposed to be. Nothing runs them unless you
 schedule them, and one of them — the gazetteer mention sweep — is what joins a passage to the
 entities it names, so without it `entity_mentions` stays empty and graph expansion has nothing to
 expand through.
 
 ```bash
-pgkg maintain --org "$ORG"                     # all four jobs, one tenant
+pgkg maintain --org "$ORG"                     # all five jobs, one tenant
 pgkg maintain --org "$ORG" --task mentions     # just the sweep; repeatable flag
 ```
 
 | Task | What it does |
 |---|---|
 | `mentions` | Gazetteer matching, both directions: passages this org has never matched, and names it has never matched. Each side has its own watermark, so a settled corpus reports no work rather than repeating it. |
+| `vectors` | Embeds the passages an interrupted crawl left with no vector, in each row's own embedding generation. A stranded row is retrievable by the keyword arm and invisible to the vector arm, and no later crawl revisits it — the document hash short-circuits first. `scanned` counts every stranded row, including any this process has no model for. |
 | `pagerank` | One PageRank pass per namespace the org has entities in. |
 | `contradictions` | Closes the validity interval a supersession left open, at the replacement's own clock, within one claim scope. |
 | `expiries` | Withdraws this org's facts whose `valid_to` has passed. |
@@ -462,12 +463,12 @@ A crontab entry per tenant, with the sweep on a short interval and the rest nigh
 
 ```cron
 */5 *  * * *  pgkg maintain --org ORG --task mentions
-30  3  * * *  pgkg maintain --org ORG --task pagerank --task contradictions --task expiries
+30  3  * * *  pgkg maintain --org ORG --task vectors --task pagerank --task contradictions --task expiries
 ```
 
 The physical reclamation functions (`pgkg_purge_retired_versions()`, `pgkg_gc_chunks()`,
 `pgkg_erase_provenance()`) are deliberately *not* behind this command: they delete rows where these
-four withdraw them, and that belongs behind a decision rather than behind the same crontab line.
+five withdraw them, and that belongs behind a decision rather than behind the same crontab line.
 
 ## Configuration
 

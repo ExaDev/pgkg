@@ -853,7 +853,10 @@ class CorpusIngest:
         # about.  Outside the transaction because it is a model call, and after
         # the promotion because a vector is content-addressed: the row is
         # retrievable by the keyword arm the moment the version flips, and this
-        # is what stops it being retrievable ONLY by the keyword arm, for good.
+        # is what stops it being retrievable ONLY by the keyword arm.  Being
+        # after the commit is also why it cannot be the guarantee — a run that
+        # dies here leaves the row stranded and the crawl finished, which is
+        # what the `vectors` maintenance task exists to sweep up (#22).
         repaired = await self._vector_the_stranded(generation, stranded)
 
         return CorpusIngestResult(
@@ -1068,6 +1071,15 @@ class CorpusIngest:
         because "left for the next crawl" is not true of them — phase 1
         short-circuits on the unchanged document hash, so there is no next crawl
         for this document and the row would keep `embedding IS NULL` for good.
+
+        Naming them is not the same as settling them.  The caller's repair runs
+        after this transaction has committed and the version has been promoted,
+        so a killed process, a dropped connection or an embedder that refuses
+        leaves the row exactly as this method left it and the ingest is over.
+        What ends that permanently is not here: it is the `vectors` task of
+        `pgkg maintain`, which sweeps `embedding IS NULL AND refcount > 0` in
+        the row's own generation on a timer (#22).  This path is the fast one,
+        not the guarantee.
         """
         vectorised = [
             (chunk_id, vectors[chunk_text])
@@ -1104,6 +1116,14 @@ class CorpusIngest:
         Its own connection, taken after the embedder has returned: D7's rule is
         that no pooled connection is held across a model call, and a repair that
         broke it would be a worse defect than the one it fixes.
+
+        Best effort, and deliberately so.  It runs after the promotion, because
+        it must not hold the flip open behind a model call, which means the row
+        it is repairing is already committed and already retrievable by the
+        keyword arm.  If this raises, that is the state the ingest ends in, and
+        nothing in this pipeline will see the row again.  The `vectors` task of
+        `pgkg maintain` is what does (#22): the same repair on a timer, over
+        whatever any run left behind, in each row's own generation.
         """
         if not stranded:
             return []

@@ -308,12 +308,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     maintain_parser = subparsers.add_parser(
         "maintain",
-        help="Run the scheduled jobs: mention sweep, pagerank, contradictions, "
-             "expiries",
+        help="Run the scheduled jobs: mention sweep, missing vectors, pagerank, "
+             "contradictions, expiries",
         description=(
             "Safe to run on a timer and safe to overlap itself: a task another "
             "run is already doing is declined rather than repeated, and the "
-            "report says which."
+            "report says which.  One of them spends money — `vectors` embeds "
+            "the passages an interrupted crawl left without one — so it is "
+            "bounded by --batch and reports every row it could not serve."
         ),
     )
     maintain_parser.add_argument(

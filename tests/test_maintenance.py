@@ -17,6 +17,11 @@ normal failure mode of anything on a timer, so an overlapping run must decline
 its task rather than repeat it; and each task is selectable on its own, because
 a pagerank pass and a mention sweep have nothing to do with each other and an
 operator debugging one should not have to run the other.
+
+The fifth task is issue #22's, and it is tested for two more (last section).  It
+spends money, so it must not embed a row it cannot write; and it is the only one
+that can be interrupted halfway through something worth keeping, so a batch is
+its own transaction and a run that dies leaves what it finished behind it.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ import uuid
 
 import asyncpg
 import pytest
+from pgvector import HalfVector
 
 from pgkg.ml import Proposition
 
@@ -120,7 +126,8 @@ async def ingest_corpus(
     org_id: uuid.UUID,
     collection_id: uuid.UUID,
     text: str,
-) -> None:
+    external_id: str | None = None,
+):
     from pgkg.corpus import CorpusIngest
 
     corpus = CorpusIngest(
@@ -129,7 +136,9 @@ async def ingest_corpus(
         collection_id=collection_id,
         embed=lambda texts: [raw_vec(2) for _ in texts],
     )
-    await corpus.upsert_document(external_id=unique("doc"), text=text)
+    return await corpus.upsert_document(
+        external_id=external_id or unique("doc"), text=text
+    )
 
 
 async def ingest_chat(
@@ -790,6 +799,516 @@ async def test_a_contradiction_never_crosses_a_claim_scope(
 
     assert valid_to is None
     assert report.task("contradictions").changed == 0
+
+
+# ---------------------------------------------------------------------------
+# The fifth job: passages that reached the store without a vector (issue #22)
+# ---------------------------------------------------------------------------
+
+
+async def stranded_passages(
+    pool: asyncpg.Pool,
+    *,
+    org_id: uuid.UUID,
+    collection_id: uuid.UUID,
+    text: str,
+    external_id: str | None = None,
+) -> list[uuid.UUID]:
+    """A live passage carrying no vector: the row issue #22 is about.
+
+    Written by the real pipeline and then emptied, because the window that
+    produces it is a race between two crawls — phase 2 saw a vectored row at an
+    address and phase 3 created a new one anyway — and a test cannot schedule
+    that.  What a test can do is assert about the state it leaves, which is the
+    state the repair is defined over: `embedding IS NULL` on a chunk a current
+    version still links.
+    """
+    result = await ingest_corpus(
+        pool, org_id=org_id, collection_id=collection_id, text=text,
+        external_id=external_id,
+    )
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            UPDATE chunks SET embedding = NULL
+            WHERE id IN (
+                SELECT chunk_id FROM document_version_chunks
+                WHERE document_version_id = $1
+            )
+            RETURNING id
+            """,
+            result.version_id,
+        )
+    return [row["id"] for row in rows]
+
+
+async def vectors_of(
+    pool: asyncpg.Pool, chunk_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, object]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, embedding, embedder_generation_id FROM chunks "
+            "WHERE id = ANY($1::uuid[])",
+            chunk_ids,
+        )
+    return {row["id"]: row for row in rows}
+
+
+async def new_generation(conn: asyncpg.Connection) -> uuid.UUID:
+    """A second embedding space, at the same width as the first.
+
+    Same width deliberately: a wrong-space vector that does not fit the column
+    fails loudly on its own, and the case D8 is about is the one that does fit.
+    """
+    return await conn.fetchval(
+        """
+        INSERT INTO embedder_generations
+            (name, dim, storage_type, normalize, status)
+        VALUES ($1, (SELECT dim FROM embedder_generations WHERE id = $2),
+                'halfvec', TRUE, 'retiring')
+        RETURNING id
+        """,
+        unique("bge-m3@"), await conn.fetchval("SELECT pgkg_generation_1()"),
+    )
+
+
+async def test_the_scheduled_path_vectors_a_passage_ingest_left_stranded(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """The acceptance case from issue #22, including why nothing else fixes it.
+
+    The docstring the defect was found under said such a chunk is left for the
+    next crawl.  It is not: the next crawl short-circuits on the unchanged
+    document hash and never reaches the chunk, so the row keeps
+    `embedding IS NULL` for good — invisible to the vector arm and to MMR, and
+    silently.  The re-crawl here is what makes that half an assertion rather
+    than a claim.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    external = unique("doc")
+    text = "Draining the queue is what opens the Helios cutover window."
+    stranded = await stranded_passages(
+        pool, org_id=org, collection_id=collection, text=text,
+        external_id=external,
+    )
+    assert len(stranded) == 1
+
+    await ingest_corpus(
+        pool, org_id=org, collection_id=collection, text=text,
+        external_id=external,
+    )
+    before = await vectors_of(pool, stranded)
+    assert before[stranded[0]]["embedding"] is None
+
+    report = await Maintenance(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    after = await vectors_of(pool, stranded)
+    assert after[stranded[0]]["embedding"] is not None
+    assert report.task("vectors").scanned == 1
+    assert report.task("vectors").changed == 1
+
+
+async def test_a_repaired_passage_keeps_the_generation_it_was_written_in(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """D8's rule, on the job most able to break it.
+
+    Vectors from two generations are incomparable, so the repair may only fill
+    a row it can embed for — the generation the row itself declares — and may
+    never restamp a row into the generation this process happens to run.  A
+    cutover window is exactly when a stranded row from the outgoing generation
+    is sitting there, and vectorising it into the incoming space would be the
+    silent wrong answer this issue is already about.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        outgoing = await new_generation(conn)
+        primary = await conn.fetchval(
+            "SELECT generation_id FROM org_embedders WHERE org_id = $1 "
+            "AND role = 'primary'",
+            org,
+        )
+
+    mine = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+    theirs = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="The queue drains before the cutover window opens.",
+    )
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE chunks SET embedder_generation_id = $1 WHERE id = ANY($2::uuid[])",
+            outgoing, theirs,
+        )
+
+    asked: list[str] = []
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        asked.extend(texts)
+        return [raw_vec(3) for _ in texts]
+
+    report = await Maintenance(pool, org_id=org, embed=embed).run(
+        tasks=["vectors"]
+    )
+
+    rows = await vectors_of(pool, mine + theirs)
+    assert rows[mine[0]]["embedding"] is not None
+    assert rows[mine[0]]["embedder_generation_id"] == primary
+    assert rows[theirs[0]]["embedding"] is None
+    assert rows[theirs[0]]["embedder_generation_id"] == outgoing
+    # And it is not embedded either: a row this process has no model for is a
+    # row it must not send to the model it does have.  The write guard would
+    # discard the vector, and the embedder would still have charged for it.
+    assert any("Helios" in text for text in asked)
+    assert not any("cutover window" in text for text in asked)
+    # The one it cannot serve is counted, because a row left unvectored and
+    # unmentioned is the defect this task exists to end.
+    assert report.task("vectors").scanned == 2
+    assert report.task("vectors").changed == 1
+
+
+async def test_a_row_cut_over_mid_batch_is_not_given_the_old_space_s_vector(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """The same rule, at the only instant it can be broken by accident.
+
+    The batch is chosen, the embedder is called, and the write lands after —
+    so between the two the row's generation can move.  The write is guarded by
+    the generation it was embedded for, which is why the answer here is "wrote
+    nothing" rather than "wrote a vector from the space the row just left".
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        incoming = await new_generation(conn)
+
+    stranded = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+
+    class CutOverMidBatch(Maintenance):
+        async def _unvectored(self, conn, generation_id):
+            rows = await super()._unvectored(conn, generation_id)
+            await conn.execute(
+                "UPDATE chunks SET embedder_generation_id = $1 "
+                "WHERE id = ANY($2::uuid[])",
+                incoming, [row["chunk_id"] for row in rows],
+            )
+            return rows
+
+    report = await CutOverMidBatch(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, stranded)
+    assert rows[stranded[0]]["embedding"] is None
+    assert rows[stranded[0]]["embedder_generation_id"] == incoming
+    assert report.task("vectors").changed == 0
+
+
+async def test_a_run_that_dies_halfway_keeps_the_rows_it_finished(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """Interruptibility, which is what makes this safe to run at all.
+
+    An embedder that fails on the third of five batches is the ordinary
+    outcome of a rate limit, and the run that retries an hour later must not
+    have to pay for the batches that already succeeded.  So a batch is its own
+    unit of work and its own transaction: what it wrote stays written.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    stranded = []
+    for i in range(3):
+        stranded += await stranded_passages(
+            pool, org_id=org, collection_id=collection,
+            text=f"Passage {i} explains why Helios exists at all.",
+        )
+
+    calls: list[int] = []
+
+    def failing(texts: list[str]) -> list[list[float]]:
+        calls.append(len(texts))
+        if len(calls) == 2:
+            raise RuntimeError("the embedder is rate limited")
+        return [raw_vec(3) for _ in texts]
+
+    maintenance = Maintenance(pool, org_id=org, batch=1, embed=failing)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        await maintenance.run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, stranded)
+    vectored = [row for row in rows.values() if row["embedding"] is not None]
+    assert len(vectored) == 1
+
+    # And the retry finishes the job rather than starting it again.
+    resumed = await Maintenance(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, stranded)
+    assert all(row["embedding"] is not None for row in rows.values())
+    assert resumed.task("vectors").changed == 2
+
+
+async def test_the_repair_drains_a_backlog_larger_than_one_batch(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """A batch is the unit of work; the run is responsible for the backlog."""
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    stranded = []
+    for i in range(5):
+        stranded += await stranded_passages(
+            pool, org_id=org, collection_id=collection,
+            text=f"Passage {i} explains why Helios exists at all.",
+        )
+
+    report = await Maintenance(
+        pool, org_id=org, batch=2,
+        embed=lambda texts: [raw_vec(3) for _ in texts],
+    ).run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, stranded)
+    assert all(row["embedding"] is not None for row in rows.values())
+    assert report.task("vectors").changed == 5
+
+
+async def test_a_second_run_neither_repeats_the_work_nor_overwrites_it(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """Idempotence, in the form a crontab produces it: the tick after.
+
+    A vectored row is not a candidate, so the second run neither pays the
+    embedder again nor reports work it did not do.  The second run embeds to a
+    different coordinate, so a repair that re-embedded what it found would move
+    the first vector and say nothing.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    stranded = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+
+    first = await Maintenance(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+    written = (await vectors_of(pool, stranded))[stranded[0]]["embedding"]
+
+    second = await Maintenance(
+        pool, org_id=org, embed=lambda texts: [raw_vec(7) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    unchanged = (await vectors_of(pool, stranded))[stranded[0]]["embedding"]
+    assert unchanged.to_list() == written.to_list()
+    assert first.task("vectors").changed == 1
+    assert second.task("vectors").scanned == 0
+    assert second.task("vectors").changed == 0
+
+
+async def test_a_vector_written_mid_batch_by_another_writer_survives(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """The overlap the advisory lock does not cover, and the silent one.
+
+    The lock keeps two maintenance runs apart; it says nothing about the ingest
+    path, which vectors its own stranded rows after the transaction that
+    promoted them.  If that lands between this run's select and its write, the
+    row already carries the vector computed from its content — and this run's
+    is computed from the same content, so overwriting it is not wrong so much
+    as unaccountable: `changed` would count a row nothing changed.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    stranded = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+
+    class VectoredMidBatch(Maintenance):
+        async def _unvectored(self, conn, generation_id):
+            rows = await super()._unvectored(conn, generation_id)
+            await conn.execute(
+                "UPDATE chunks SET embedding = $1::halfvec "
+                "WHERE id = ANY($2::uuid[])",
+                HalfVector(raw_vec(9)),
+                [row["chunk_id"] for row in rows],
+            )
+            return rows
+
+    report = await VectoredMidBatch(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, stranded)
+    assert rows[stranded[0]]["embedding"].to_list() == raw_vec(9)
+    assert report.task("vectors").changed == 0
+
+
+async def test_an_embedder_that_returns_the_wrong_count_stops_the_run(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """The one way this task could write a wrong vector rather than none.
+
+    Chunks and vectors are matched by position, so an embedder that drops one
+    would shift every vector after it onto the wrong passage — content-addressed
+    rows carrying vectors computed from someone else's content, which no later
+    run would ever look at again because they are no longer NULL.  Failing the
+    run is the only honest answer.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    stranded = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+
+    maintenance = Maintenance(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts[:-1]]
+    )
+
+    with pytest.raises(RuntimeError, match="0 vectors for 1 passages"):
+        await maintenance.run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, stranded)
+    assert rows[stranded[0]]["embedding"] is None
+
+
+async def test_a_repair_that_overlaps_another_declines_rather_than_re_embedding(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """The cron-overlap case on the one task that spends money per row."""
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+
+    stranded = await stranded_passages(
+        pool, org_id=org, collection_id=collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+
+    def never(texts: list[str]) -> list[list[float]]:
+        raise AssertionError("a declined task must not call the embedder")
+
+    holder = await pool.acquire()
+    try:
+        assert await holder.fetchval(
+            "SELECT pgkg_try_maintenance_lock('vectors', $1)", org
+        )
+        blocked = await Maintenance(pool, org_id=org, embed=never).run(
+            tasks=["vectors"]
+        )
+    finally:
+        await holder.execute(
+            "SELECT pgkg_release_maintenance_lock('vectors', $1)", org
+        )
+        await pool.release(holder)
+
+    assert blocked.task("vectors").ran is False
+    assert blocked.task("vectors").changed == 0
+    rows = await vectors_of(pool, stranded)
+    assert rows[stranded[0]]["embedding"] is None
+
+
+async def test_the_repair_leaves_another_tenants_stranded_rows_alone(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """A maintenance run belongs to a tenant, and so does its embedder bill."""
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        mine = await new_org(conn)
+        theirs = await new_org(conn)
+        my_collection = await new_collection(conn, org_id=mine)
+        their_collection = await new_collection(conn, org_id=theirs)
+
+    ours = await stranded_passages(
+        pool, org_id=mine, collection_id=my_collection,
+        text="Helios is the ledger behind interbank settlement.",
+    )
+    others = await stranded_passages(
+        pool, org_id=theirs, collection_id=their_collection,
+        text="Selene is the ledger behind interbank settlement.",
+    )
+
+    report = await Maintenance(
+        pool, org_id=mine, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, ours + others)
+    assert rows[ours[0]]["embedding"] is not None
+    assert rows[others[0]]["embedding"] is None
+    assert report.task("vectors").changed == 1
+
+
+async def test_an_unreferenced_chunk_is_not_embedded_at_this_orgs_expense(
+    pool: asyncpg.Pool, offline: pytest.MonkeyPatch
+) -> None:
+    """`refcount > 0` is the scope, and it is a scope about money.
+
+    A chunk no version links is either provenance — a chat turn, which is not
+    a passage (D1) — or content a purge is about to collect.  Neither is
+    reachable by the vector arm, so embedding either is a bill for a row
+    nothing will ever retrieve.
+    """
+    from pgkg.maintenance import Maintenance
+
+    async with pool.acquire() as conn:
+        org = await new_org(conn)
+        collection = await new_collection(conn, org_id=org)
+        orphan = await conn.fetchval(
+            "INSERT INTO chunks (text, org_id, collection_id) "
+            "VALUES ($1, $2, $3) RETURNING id",
+            "Nothing links this passage.", org, collection,
+        )
+
+    report = await Maintenance(
+        pool, org_id=org, embed=lambda texts: [raw_vec(3) for _ in texts]
+    ).run(tasks=["vectors"])
+
+    rows = await vectors_of(pool, [orphan])
+    assert rows[orphan]["embedding"] is None
+    assert report.task("vectors").scanned == 0
+    assert report.task("vectors").changed == 0
 
 
 # ---------------------------------------------------------------------------

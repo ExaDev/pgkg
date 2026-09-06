@@ -2,10 +2,23 @@
 
 ## Unreleased
 
-Four defects found by re-reading the tree after phase 3, fixed on disjoint file ownership and
-integrated together. Migrations 051-053 (050 was reserved for a fix that needed no DDL; the gap is
+Five defects found by re-reading the tree after phase 3, fixed on disjoint file ownership and
+integrated together. Migrations 051-054 (050 was reserved for a fix that needed no DDL; the gap is
 deliberate). Full reasoning in
 [`docs/adrs/0001-implementation-notes.md`](docs/adrs/0001-implementation-notes.md) §1.
+
+- **A passage no crawl comes back for is now vectored on a timer.** The repair a corpus ingest
+  performs for its own stranded rows runs after the transaction that promoted the version, so an
+  embedder that refuses, a dropped connection or a killed process leaves the row committed with
+  `embedding IS NULL` — and the next crawl of that document short-circuits on the unchanged hash
+  before it reaches a chunk. Nothing revisited it: retrievable by the keyword arm, invisible to the
+  vector arm and to MMR, permanently and silently. `pgkg maintain --task vectors` is the fifth
+  scheduled job and sweeps `embedding IS NULL AND refcount > 0` in batches, each batch its own
+  transaction so an interrupted run keeps the rows it finished. It embeds only in a row's own
+  generation: D8 makes two generations incomparable, so the rows a cutover-window backlog is made
+  of are counted in `scanned` and left alone rather than filled from the space this process happens
+  to run. Migration 054 adds the partial index that finds them and the batch query that asks for
+  one generation at a time.
 
 - **A passage held in two collections is now vectored in both.** The corpus reuse lookup restated
   the content address in Python instead of reading it, and had drifted from it twice — so it
