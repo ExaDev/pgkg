@@ -30,6 +30,7 @@ import pytest
 from pgvector import HalfVector
 from pgvector.asyncpg import register_vector
 
+from body_lint import Names, unqualified_references
 from pgkg.db import make_pool
 from pgkg.migrate import MIGRATIONS_DIR, UntrackedInstallError, apply_migrations
 
@@ -520,89 +521,125 @@ class _RolledBack(Exception):
     """Raised inside a transaction only to roll it back."""
 
 
-# The names a plpgsql body could reach without a schema, and cannot be checked
-# by re-creating it: plpgsql resolves names when a statement first runs, not
-# when the function is created.  So the bodies are read instead.  Relations and
-# functions come from the catalog; the extension objects are the ones the
-# migrations use.
-_EXTENSION_OPERATORS = re.compile(r"(?<![A-Za-z0-9_.(])(<=>|<#>|<\+>|<~>|<%>|<->)(?![)])")
-_TRIGRAM_OPERATOR = re.compile(r"\w\s+%\s+\w")
-_EXTENSION_TYPES = re.compile(r"(?<![.\w])(halfvec|vector|sparsevec)\b(?!\s*\.)")
-# Columns and INSERT targets that share a relation's name.
-_ALSO_COLUMNS = {"propositions", "provenance"}
-_RELATION_POSITION = re.compile(
-    r"\b(FROM|JOIN|INTO|UPDATE|TABLE|ONLY|REFERENCES)\s+$", re.IGNORECASE
+# The names a body could reach without a schema, read rather than executed: a
+# plpgsql body is resolved statement by statement as it runs, so re-creating it
+# proves nothing.  tests/body_lint.py reads it the way the server would, with
+# the strings handed to EXECUTE and format() read as the SQL they are.
+#
+# Before trusting it over the catalog, it is shown each kind of miss it exists
+# to catch, on a fixed set of names shaped like the real ones.
+LINT_NAMES = Names(
+    relations=frozenset({"chunks", "orgs", "propositions", "provenance", "pgkg_candidate"}),
+    also_columns=frozenset({"propositions", "provenance"}),
+    functions=frozenset({"pgkg_current_org", "similarity", "vector_dims", "digest"}),
+    types=frozenset({"vector", "halfvec", "sparsevec"}),
+    opclasses=frozenset({"halfvec_cosine_ops"}),
+    extension_operators=frozenset({"<=>", "<#>", "<%", "%>", "<<%", "%>>"}),
+    shared_operators=frozenset({"%", "<->"}),
 )
 
 
-def _code_of(body: str) -> str:
-    """The body with comments and quoted strings blanked out, dynamic SQL kept."""
-    body = re.sub(r"--[^\n]*", " ", body)
-    body = re.sub(r"/\*.*?\*/", " ", body, flags=re.S)
-    body = re.sub(r"\$([A-Za-z_]\w*)\$", " ", body)
-    body = re.sub(r"'(?:[^']|'')*'", lambda m: _dynamic_sql_or_blank(m.group(0)), body)
-    return body
+@pytest.mark.parametrize(
+    "body, expected",
+    [
+        ("SELECT a%b FROM s.chunks", "operator %"),
+        ("SELECT 1 WHERE lower(a) % lower(b)", "operator %"),
+        ("SELECT 1 WHERE name <% p_name", "operator <%"),
+        ("SELECT 1 WHERE name %> p_name", "operator %>"),
+        ("SELECT a <=> b", "operator <=>"),
+        ("SELECT similarity(a, b)", "function similarity()"),
+        ("IF vector_dims(q) <> 3 THEN RETURN; END IF;", "function vector_dims()"),
+        ("SELECT digest(t, 'sha256')", "function digest()"),
+        ("SELECT s.pgkg_x() WHERE org = pgkg_current_org()", "function pgkg_current_org()"),
+        ("SELECT '[1,2]'::halfvec", "type halfvec"),
+        (
+            "EXECUTE format('CREATE INDEX %I ON s.%I USING hnsw "
+            "(vec halfvec_cosine_ops)', a, b);",
+            "operator class halfvec_cosine_ops",
+        ),
+        (
+            "EXECUTE format('CREATE TABLE s.%I (vec halfvec(%s))', t, d);",
+            "type halfvec",
+        ),
+        ("PERFORM 'chunks'::regclass;", "name resolved at run time: 'chunks'"),
+        (
+            "IF to_regclass('orgs') IS NULL THEN RETURN; END IF;",
+            "name resolved at run time: 'orgs'",
+        ),
+        ("EXECUTE 'ANALYZE chunks';", "relation chunks"),
+        ("EXECUTE 'VACUUM ' || 'orgs';", "relation orgs"),
+        ("DECLARE v chunks.id%TYPE; BEGIN END;", "relation chunks in %TYPE"),
+        ("DECLARE r orgs%ROWTYPE; BEGIN END;", "relation orgs in %ROWTYPE"),
+        ("SELECT (a, b)::pgkg_candidate", "relation pgkg_candidate"),
+        ("INSERT INTO propositions (text) VALUES ('x')", "relation propositions"),
+        ("RETURN QUERY EXECUTE format($q$ SELECT 1 FROM chunks $q$);", "relation chunks"),
+    ],
+)
+def test_the_body_lint_finds_each_kind_of_unqualified_name(
+    body: str, expected: str
+) -> None:
+    assert expected in unqualified_references(body, LINT_NAMES)
 
 
-def _dynamic_sql_or_blank(literal: str) -> str:
-    """A string passed to EXECUTE or format() is SQL and is checked too."""
-    inner = literal[1:-1].replace("''", "'")
-    if re.search(r"\b(SELECT|INSERT|UPDATE|DELETE|CREATE|ALTER|GRANT|DROP)\b", inner):
-        return " " + inner + " "
-    return " '' "
+def test_the_body_lint_accepts_the_qualified_forms() -> None:
+    body = """
+    DECLARE
+        v s.chunks.id%TYPE;
+        r s.orgs%ROWTYPE;
+    BEGIN
+        WITH orgs AS (SELECT 1) SELECT * FROM orgs;
+        SELECT e.similarity(a, b), x OPERATOR(e.<=>) y, x OPERATOR(e.%) y,
+               '[1]'::e.halfvec, n % 64, 's.chunks'::regclass,
+               to_regclass('s.' || v_table), c.propositions
+        FROM s.chunks c JOIN s.propositions AS p ON TRUE;
+        INSERT INTO s.provenance (propositions) VALUES (1);
+        EXECUTE format('CREATE INDEX %I ON s.%I USING hnsw (vec e.halfvec_cosine_ops)', a, b);
+        RAISE NOTICE 'chunks % and orgs %% gone: similarity(x)', v;
+        -- a comment naming chunks, similarity() and <=>
+        PERFORM s.pgkg_current_org();
+    END;
+    """
+
+    assert unqualified_references(body, LINT_NAMES) == []
 
 
-async def test_no_plpgsql_body_names_a_pgkg_object_without_its_schema(
+async def test_the_catalog_supplies_every_kind_of_name(caller: asyncpg.Connection) -> None:
+    names = await Names.from_catalog(
+        caller, schema=SCHEMA, extension_schemas=[EXTENSION_SCHEMA]
+    )
+
+    assert {"chunks", "orgs", "pgkg_candidate"} <= names.relations
+    assert {"pgkg_current_org", "similarity", "vector_dims", "digest"} <= names.functions
+    assert not {"avg", "sum", "gen_random_uuid"} & names.functions
+    assert {"vector", "halfvec"} <= names.types
+    assert "halfvec_cosine_ops" in names.opclasses
+    assert {"<=>", "<%", "%>"} <= names.extension_operators
+    assert "%" in names.shared_operators
+    assert "=" not in names.shared_operators
+
+
+async def test_no_function_body_names_a_pgkg_or_extension_object_without_its_schema(
     caller: asyncpg.Connection,
 ) -> None:
-    relations = {
-        row[0]
-        for row in await caller.fetch(
-            """
-            SELECT c.relname FROM pg_catalog.pg_class c
-            WHERE c.relnamespace = $1::pg_catalog.regnamespace
-              AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'c', 'f')
-            """,
-            SCHEMA,
-        )
-    }
-    function_names = {
-        row[0]
-        for row in await caller.fetch(
-            "SELECT DISTINCT proname FROM pg_catalog.pg_proc"
-            " WHERE pronamespace = $1::pg_catalog.regnamespace",
-            SCHEMA,
-        )
-    }
+    names = await Names.from_catalog(
+        caller, schema=SCHEMA, extension_schemas=[EXTENSION_SCHEMA]
+    )
     bodies = await caller.fetch(
         """
-        SELECT p.proname, p.prosrc
+        SELECT p.oid::pg_catalog.regprocedure::TEXT AS signature, p.prosrc
         FROM pg_catalog.pg_proc p
         JOIN pg_catalog.pg_language l ON l.oid = p.prolang
         WHERE p.pronamespace = $1::pg_catalog.regnamespace
-          AND l.lanname = 'plpgsql'
+          AND l.lanname IN ('plpgsql', 'sql')
         """,
         SCHEMA,
     )
 
-    unqualified: list[str] = []
-    for row in bodies:
-        code = _code_of(row["prosrc"])
-        for match in re.finditer(r"(?<![.\w])([a-z_][a-z0-9_]*)\b(?!\s*\.)", code):
-            word = match.group(1)
-            before = code[: match.start()]
-            after = code[match.end():].lstrip()
-            if word in function_names and after.startswith("("):
-                unqualified.append(f"{row['proname']}: {word}()")
-            elif word in relations and (
-                word not in _ALSO_COLUMNS or _RELATION_POSITION.search(before)
-            ):
-                unqualified.append(f"{row['proname']}: {word}")
-        for pattern in (_EXTENSION_OPERATORS, _TRIGRAM_OPERATOR):
-            for match in pattern.finditer(code):
-                unqualified.append(f"{row['proname']}: operator {match.group(0)!r}")
-        for match in _EXTENSION_TYPES.finditer(code):
-            unqualified.append(f"{row['proname']}: type {match.group(1)}")
+    unqualified = {
+        row["signature"]: found
+        for row in bodies
+        if (found := unqualified_references(row["prosrc"], names))
+    }
 
-    assert bodies, "no plpgsql functions found, so nothing was checked"
-    assert unqualified == []
+    assert bodies, "no functions found, so nothing was checked"
+    assert unqualified == {}
