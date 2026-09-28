@@ -41,6 +41,28 @@ REQUIRED_EXTENSIONS = ("vector", "pg_trgm", "pgcrypto")
 # quoting in neither: lower case, no punctuation, at most NAMEDATALEN - 1.
 _PLAIN_IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]{0,62}")
 
+# The words PostgreSQL reserves outright or allows only as a function or type
+# name (pg_get_keywords() catcode R and T, as of 18): each is a syntax error as
+# an unquoted schema name.  test_migration_rendering checks the list against
+# the server it runs on.
+_RESERVED_WORDS = frozenset({
+    "all", "analyse", "analyze", "and", "any", "array", "as", "asc",
+    "asymmetric", "authorization", "binary", "both", "case", "cast", "check",
+    "collate", "collation", "column", "concurrently", "constraint", "create",
+    "cross", "current_catalog", "current_date", "current_role",
+    "current_schema", "current_time", "current_timestamp", "current_user",
+    "default", "deferrable", "desc", "distinct", "do", "else", "end", "except",
+    "false", "fetch", "for", "foreign", "freeze", "from", "full", "grant",
+    "group", "having", "ilike", "in", "initially", "inner", "intersect",
+    "into", "is", "isnull", "join", "lateral", "leading", "left", "like",
+    "limit", "localtime", "localtimestamp", "natural", "not", "notnull",
+    "null", "offset", "on", "only", "or", "order", "outer", "overlaps",
+    "placing", "primary", "references", "returning", "right", "select",
+    "session_user", "similar", "some", "symmetric", "system_user", "table",
+    "tablesample", "then", "to", "trailing", "true", "union", "unique", "user",
+    "using", "variadic", "verbose", "when", "where", "window", "with",
+})
+
 _PLACEHOLDER = re.compile(r"@(pgkg_schema|extschema:([a-z_][a-z0-9_]*))@")
 
 
@@ -54,6 +76,16 @@ def plain_identifier(name: str, what: str) -> str:
         raise MigrationRenderError(
             f"{what} {name!r} is not a plain lower-case identifier; pgkg "
             "substitutes it unquoted into identifiers and string literals"
+        )
+    if name in _RESERVED_WORDS:
+        raise MigrationRenderError(
+            f"{what} {name!r} is a reserved word in PostgreSQL, and pgkg writes "
+            "schema names unquoted; choose another name"
+        )
+    if name.startswith("pg_") and name != "pg_catalog":
+        raise MigrationRenderError(
+            f"{what} {name!r} starts with pg_, which PostgreSQL reserves for "
+            "system schemas; choose another name"
         )
     return name
 

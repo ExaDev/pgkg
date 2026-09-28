@@ -7,16 +7,17 @@ pgkg's own objects and `@extschema:vector@` for an extension's, and the runner
 substitutes both before the file reaches the server — the spelling PostgreSQL
 itself uses in extension scripts.
 
-These are pure: the rendering is text in, text out, and is tested without a
-server.
+These are pure but for one: the rendering is text in, text out, and is tested
+without a server, while the reserved-word list is checked against the server's.
 """
 from __future__ import annotations
 
+import asyncpg
 import pytest
 from pydantic import ValidationError
 
 from pgkg.config import Settings
-from pgkg.migrate import MigrationRenderError, render_migration
+from pgkg.migrate import MigrationRenderError, plain_identifier, render_migration
 
 EXTENSIONS = {"vector": "pgkg_ext", "pg_trgm": "extensions", "pgcrypto": "public"}
 
@@ -69,6 +70,46 @@ def test_a_schema_name_that_is_not_a_plain_identifier_is_refused(schema: str) ->
     for a name that needs no quoting in either."""
     with pytest.raises(MigrationRenderError, match="schema"):
         render_migration("SELECT 1", schema=schema, extension_schemas=EXTENSIONS)
+
+
+@pytest.mark.parametrize("schema", ["user", "select", "table", "order", "left", "join"])
+def test_a_reserved_word_is_refused_as_a_schema_name(schema: str) -> None:
+    """Lower case and unpunctuated, but still not writable unquoted:
+    `CREATE SCHEMA user` is a syntax error, and so is `left.orgs`."""
+    with pytest.raises(MigrationRenderError, match="reserved"):
+        render_migration("SELECT 1", schema=schema, extension_schemas=EXTENSIONS)
+
+
+def test_the_catalog_prefix_is_refused_as_a_schema_name() -> None:
+    """`CREATE SCHEMA pg_...` is refused by the server; say so before it is."""
+    with pytest.raises(MigrationRenderError, match="pg_"):
+        render_migration("SELECT 1", schema="pg_kg", extension_schemas=EXTENSIONS)
+
+
+async def test_every_keyword_the_server_reserves_is_refused(
+    pool: asyncpg.Pool,
+) -> None:
+    """The list is pgkg's own copy, so it is checked against the server's:
+    a keyword a new major version reserves has to be added here."""
+    async with pool.acquire() as conn:
+        reserved = {
+            row["word"]
+            for row in await conn.fetch(
+                "SELECT word FROM pg_get_keywords() WHERE catcode IN ('R', 'T')"
+            )
+        }
+
+    accepted = sorted(word for word in reserved if _accepted_as_schema(word))
+
+    assert accepted == []
+
+
+def _accepted_as_schema(word: str) -> bool:
+    try:
+        plain_identifier(word, "schema")
+    except MigrationRenderError:
+        return False
+    return True
 
 
 def test_an_extension_schema_that_is_not_a_plain_identifier_is_refused() -> None:
