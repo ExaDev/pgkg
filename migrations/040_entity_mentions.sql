@@ -58,6 +58,12 @@
 -- name is written differently in prose and in an entity row, and none of them
 -- carries meaning here.  IMMUTABLE so it can be indexed, which is the whole
 -- reason the equality arm below is an index probe rather than a scan.
+--
+-- The call from pgkg_gazetteer_keys to pgkg_gazetteer_key is schema-qualified
+-- because an index expression is evaluated under PostgreSQL 17's maintenance
+-- search_path (pg_catalog, pg_temp), where an unqualified pgkg function does not
+-- exist (issue #28).  Not SET search_path: a SQL function carrying one is no
+-- longer inlined.
 CREATE FUNCTION pgkg_gazetteer_key(p_text TEXT) RETURNS TEXT
 LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
 AS $$
@@ -68,9 +74,9 @@ CREATE FUNCTION pgkg_gazetteer_keys(p_texts TEXT[]) RETURNS TEXT[]
 LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
 AS $$
     SELECT ARRAY(
-        SELECT pgkg_gazetteer_key(t)
+        SELECT public.pgkg_gazetteer_key(t)
         FROM unnest(p_texts) AS t
-        WHERE length(pgkg_gazetteer_key(t)) >= 3
+        WHERE length(public.pgkg_gazetteer_key(t)) >= 3
     )
 $$;
 

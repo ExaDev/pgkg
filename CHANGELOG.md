@@ -89,6 +89,19 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   populations, because an entity name is too short a string to embed, and the AND at least fails
   toward two rows rather than toward a fused entity. Migration 055 carries the measurements as a
   `COMMENT` on the function.
+- **pgkg installs on PostgreSQL 17 and 18.** 17 builds indexes (and runs REINDEX, VACUUM, ANALYZE,
+  CLUSTER) with `search_path` pinned to `pg_catalog, pg_temp`, and `pgkg_gazetteer_keys` called
+  `pgkg_gazetteer_key` without a schema, so migration 040 failed building its alias index with
+  `function pgkg_gazetteer_key(text) does not exist` (#28). 16 uses the caller's path and hid it.
+  The call is now schema-qualified — not `SET search_path`, which would stop the function being
+  inlined. 040 is fixed in place for fresh installs; migration 057 replaces the body on installs
+  that already ran it, because the stored gazetteer keys 047 added call it on every write, and
+  pg_restore writes with `search_path = ''` — so the old body was also a dump of `entities` that
+  would not restore, on any version. The test fixture takes its server image from
+  `PGKG_TEST_PG_IMAGE`, and CI (new: `.github/workflows/test.yml`) runs the suite on 16, 17 and 18.
+  Four assertions that read 16's behaviour literally now hold on 18 too: 18 reports an
+  `ON DELETE RESTRICT` refusal as `restrict_violation`, and can answer an arm that lost its index
+  with a filtered scan of `entities_org_idx` rather than a sequential scan.
 
 ## 0.6.0
 
