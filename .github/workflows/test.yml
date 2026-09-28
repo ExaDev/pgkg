@@ -9,6 +9,7 @@ jobs:
   pytest:
     name: pytest (${{ matrix.pg }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -33,5 +34,5 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: huggingface-bge-m3-bge-reranker-v2-m3
-      - run: uv sync --extra dev --extra mcp
+      - run: uv sync --locked --extra dev --extra mcp
       - run: uv run pytest -q

@@ -27,6 +27,7 @@ references, and this guard cannot see it.
 """
 from __future__ import annotations
 
+import re
 import uuid
 
 import asyncpg
@@ -671,6 +672,9 @@ ARM_OPERATOR = {
 }
 
 
+GAZETTEER_FILLER = 40000
+
+
 @pytest.fixture(scope="module")
 async def gazetteer_corpus(pool: asyncpg.Pool):
     """Enough entities that the index is the cheaper plan.
@@ -689,10 +693,11 @@ async def gazetteer_corpus(pool: asyncpg.Pool):
             SELECT 'filler entity number ' || g, 'thing',
                    ARRAY['filler alias alpha ' || g, 'filler alias beta ' || g],
                    $1, $2
-            FROM generate_series(1, 40000) g
+            FROM generate_series(1, $3) g
             """,
             namespace,
             org,
+            GAZETTEER_FILLER,
         )
         await conn.execute(
             """
@@ -724,9 +729,13 @@ def _reads_every_entity(plan: str) -> bool:
     the policy's `org_id = ANY(...)` and apply the arm's qual as a filter on
     what comes back, which reads every entity of the org just the same — so
     the filter, and not the scan node's name, is what says the arm lost its
-    index.
+    index.  The filter must have discarded the fixture's whole filler, not a
+    handful of rows left over after a gazetteer index did the work.
     """
-    return "Seq Scan on entities" in plan or "Rows Removed by Filter" in plan
+    if "Seq Scan on entities" in plan:
+        return True
+    removed = [int(n) for n in re.findall(r"Rows Removed by Filter: (\d+)", plan)]
+    return "entities_org_idx" in plan and max(removed, default=0) >= GAZETTEER_FILLER
 
 
 async def _plan_as_app(
@@ -779,7 +788,7 @@ async def test_the_policy_does_not_cost_the_gazetteer_its_indexes(
 
 
 @pytest.mark.parametrize("arm", sorted(ARM_OPERATOR))
-async def test_unmarking_the_operator_returns_the_arm_to_a_sequential_scan(
+async def test_unmarking_the_operator_makes_the_arm_read_every_entity(
     pool: asyncpg.Pool, gazetteer_corpus, arm: str
 ) -> None:
     """The marking is what buys the plan, and this is the probe that proves it:
