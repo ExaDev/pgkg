@@ -45,6 +45,7 @@ jobs:
     # tests/test_vendored_schema.py checks from a caller whose path is ''.
     name: pytest (pg18, installed in pgkg_host)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       PGKG_TEST_BACKEND: docker
       PGKG_TEST_PG_IMAGE: pgvector/pgvector:pg18
@@ -60,5 +61,5 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: huggingface-bge-m3-bge-reranker-v2-m3
-      - run: uv sync --extra dev --extra mcp
+      - run: uv sync --locked --extra dev --extra mcp
       - run: uv run pytest -q
