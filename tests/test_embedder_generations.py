@@ -665,7 +665,7 @@ async def test_generation_queries_are_the_last_search_parameter(
             SELECT pg_get_function_identity_arguments(p.oid) AS args
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
-            WHERE p.proname = 'pgkg_search' AND n.nspname = 'public'
+            WHERE p.proname = 'pgkg_search' AND n.nspname = current_schema()
             """
         )
 

@@ -88,8 +88,8 @@ AS $$
 DECLARE
     delta_sign INT := TG_ARGV[0]::INT;
 BEGIN
-    INSERT INTO corpus_stats AS cs (namespace, kind, n_total, total_len)
-    SELECT pgkg_stats_domain(d.collection_id),
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs (namespace, kind, n_total, total_len)
+    SELECT @pgkg_schema@.pgkg_stats_domain(d.collection_id),
            'chunk',
            delta_sign * COUNT(*),
            delta_sign * COALESCE(SUM(d.doc_len), 0)
@@ -100,8 +100,8 @@ BEGIN
             total_len  = GREATEST(cs.total_len + EXCLUDED.total_len, 0),
             updated_at = now();
 
-    INSERT INTO lexeme_df AS ld (namespace, kind, lexeme, df)
-    SELECT pgkg_stats_domain(d.collection_id), 'chunk', u.lexeme,
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld (namespace, kind, lexeme, df)
+    SELECT @pgkg_schema@.pgkg_stats_domain(d.collection_id), 'chunk', u.lexeme,
            delta_sign * COUNT(*)
     FROM delta_rows d, unnest(d.tsv) AS u(lexeme, positions, weights)
     GROUP BY d.collection_id, u.lexeme
@@ -133,26 +133,26 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL
-           OR namespace = pgkg_stats_domain(p_collection_id));
+           OR namespace = @pgkg_schema@.pgkg_stats_domain(p_collection_id));
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL
-           OR namespace = pgkg_stats_domain(p_collection_id));
+           OR namespace = @pgkg_schema@.pgkg_stats_domain(p_collection_id));
 
-    INSERT INTO corpus_stats (namespace, kind, n_total, total_len)
-    SELECT pgkg_stats_domain(c.collection_id), 'chunk',
+    INSERT INTO @pgkg_schema@.corpus_stats (namespace, kind, n_total, total_len)
+    SELECT @pgkg_schema@.pgkg_stats_domain(c.collection_id), 'chunk',
            COUNT(*), COALESCE(SUM(c.doc_len), 0)
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE p_collection_id IS NULL OR c.collection_id = p_collection_id
     GROUP BY c.collection_id;
 
-    INSERT INTO lexeme_df (namespace, kind, lexeme, df)
-    SELECT pgkg_stats_domain(c.collection_id), 'chunk', u.lexeme, COUNT(*)
-    FROM chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
+    INSERT INTO @pgkg_schema@.lexeme_df (namespace, kind, lexeme, df)
+    SELECT @pgkg_schema@.pgkg_stats_domain(c.collection_id), 'chunk', u.lexeme, COUNT(*)
+    FROM @pgkg_schema@.chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
     WHERE p_collection_id IS NULL OR c.collection_id = p_collection_id
     GROUP BY c.collection_id, u.lexeme;
 END;
@@ -173,9 +173,9 @@ AS $$
     SELECT p_refcount = 0
         OR EXISTS (
             SELECT 1
-            FROM document_version_chunks dvc
-            JOIN document_versions dv ON dv.id = dvc.document_version_id
-            JOIN documents d ON d.id = dv.document_id
+            FROM @pgkg_schema@.document_version_chunks dvc
+            JOIN @pgkg_schema@.document_versions dv ON dv.id = dvc.document_version_id
+            JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
             WHERE dvc.chunk_id = p_chunk_id
               AND dv.status = 'current'
               AND d.deleted_at IS NULL
@@ -246,7 +246,7 @@ query_or AS (
 -- The collection domains a chunk query reads its statistics from.  NULL means
 -- unrestricted, matching pgkg_visible().
 chunk_domains AS (
-    SELECT pgkg_stats_domain(c) AS domain
+    SELECT @pgkg_schema@.pgkg_stats_domain(c) AS domain
     FROM unnest(p_collection_ids) AS c
 ),
 
@@ -259,7 +259,7 @@ stats AS (
         GREATEST(COALESCE(cs.n_total, 1), 1)::FLOAT8 AS n_total,
         COALESCE(cs.avgdl, 1.0)                      AS avgdl
     FROM (VALUES (1)) AS present(x)
-    LEFT JOIN corpus_stats cs
+    LEFT JOIN @pgkg_schema@.corpus_stats cs
         ON cs.namespace = p_namespace
        AND cs.kind = 'proposition'
     WHERE p_source = 'propositions'
@@ -276,7 +276,7 @@ stats AS (
             / GREATEST(COALESCE(SUM(cs.n_total), 1), 1)::FLOAT8,
             1.0
         )
-    FROM corpus_stats cs
+    FROM @pgkg_schema@.corpus_stats cs
     WHERE p_source = 'chunks'
       AND cs.kind = 'chunk'
       AND (
@@ -293,7 +293,7 @@ stats AS (
 -- Document frequency for the source's domain, summed for the same reason.
 term_df AS (
     SELECT ld.lexeme, SUM(ld.df)::FLOAT8 AS df
-    FROM lexeme_df ld
+    FROM @pgkg_schema@.lexeme_df ld
     WHERE (
             p_source = 'propositions'
             AND ld.kind = 'proposition'
@@ -344,13 +344,13 @@ FROM (
             JOIN idf i ON i.lexeme = u.lexeme
             CROSS JOIN stats s
         ) AS bm25_score
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN query_or
     WHERE p_source = 'propositions'
       AND q_text IS NOT NULL
       AND q_text <> ''
       AND p.namespace = p_namespace
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             p.invalidated_at, p.valid_from, p.valid_to,
             COALESCE(p_valid_at, now())
           )
@@ -361,7 +361,7 @@ FROM (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             p.org_id, p.collection_id, p.visibility,
             p.owner_user_id, p.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -386,15 +386,15 @@ FROM (
             JOIN idf i ON i.lexeme = u.lexeme
             CROSS JOIN stats s
         )
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     CROSS JOIN query_or
     WHERE p_source = 'chunks'
       AND q_text IS NOT NULL
       AND q_text <> ''
       AND query_or.q IS NOT NULL
       AND c.tsv @@ query_or.q
-      AND pgkg_chunk_live(c.id, c.refcount)
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_chunk_live(c.id, c.refcount)
+      AND @pgkg_schema@.pgkg_visible(
             c.org_id, c.collection_id, c.visibility,
             c.owner_user_id, c.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -437,13 +437,13 @@ SELECT
     (1.0 - sub.distance)::REAL
 FROM (
     (
-    SELECT p.id AS cand_id, (p.embedding <=> q_embedding) AS distance
-    FROM propositions p
+    SELECT p.id AS cand_id, (p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding) AS distance
+    FROM @pgkg_schema@.propositions p
     WHERE p_source = 'propositions'
       AND q_embedding IS NOT NULL
       AND p.embedding IS NOT NULL
       AND p.namespace = p_namespace
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             p.invalidated_at, p.valid_from, p.valid_to,
             COALESCE(p_valid_at, now())
           )
@@ -452,30 +452,30 @@ FROM (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             p.org_id, p.collection_id, p.visibility,
             p.owner_user_id, p.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
           )
-    ORDER BY p.embedding <=> q_embedding
+    ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
     LIMIT k_initial
     )
 
     UNION ALL
 
     (
-    SELECT c.id, (c.embedding <=> q_embedding)
-    FROM chunks c
+    SELECT c.id, (c.embedding OPERATOR(@extschema:vector@.<=>) q_embedding)
+    FROM @pgkg_schema@.chunks c
     WHERE p_source = 'chunks'
       AND q_embedding IS NOT NULL
       AND c.embedding IS NOT NULL
-      AND pgkg_chunk_live(c.id, c.refcount)
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_chunk_live(c.id, c.refcount)
+      AND @pgkg_schema@.pgkg_visible(
             c.org_id, c.collection_id, c.visibility,
             c.owner_user_id, c.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
           )
-    ORDER BY c.embedding <=> q_embedding
+    ORDER BY c.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
     LIMIT k_initial
     )
 ) sub
@@ -539,8 +539,8 @@ profiled AS (
         p.access_count,
         p.confidence
     FROM cand
-    JOIN propositions p ON p.id = cand.item_id
-    JOIN collections col ON col.id = p.collection_id
+    JOIN @pgkg_schema@.propositions p ON p.id = cand.item_id
+    JOIN @pgkg_schema@.collections col ON col.id = p.collection_id
 
     UNION ALL
 
@@ -551,8 +551,8 @@ profiled AS (
         0,
         1.0::REAL
     FROM cand
-    JOIN chunks c ON c.id = cand.item_id
-    JOIN collections col ON col.id = c.collection_id
+    JOIN @pgkg_schema@.chunks c ON c.id = cand.item_id
+    JOIN @pgkg_schema@.collections col ON col.id = c.collection_id
 )
 
 SELECT
@@ -614,8 +614,8 @@ AS $$
         p.collection_id,
         CASE WHEN col.kind = 'corpus' THEN 'corpus' ELSE 'memory' END,
         p.claim_scope
-    FROM propositions p
-    JOIN collections col ON col.id = p.collection_id
+    FROM @pgkg_schema@.propositions p
+    JOIN @pgkg_schema@.collections col ON col.id = p.collection_id
     WHERE p.id = ANY(p_item_ids)
 
     UNION ALL
@@ -626,8 +626,8 @@ AS $$
         c.collection_id,
         CASE WHEN col.kind = 'corpus' THEN 'corpus' ELSE 'memory' END,
         col.claim_scope
-    FROM chunks c
-    JOIN collections col ON col.id = c.collection_id
+    FROM @pgkg_schema@.chunks c
+    JOIN @pgkg_schema@.collections col ON col.id = c.collection_id
     WHERE c.id = ANY(p_item_ids)
 $$;
 
@@ -678,7 +678,7 @@ cand AS (
 labelled AS (
     SELECT cand.item_id, cand.raw_score, s.bucket, s.claim_scope
     FROM cand
-    JOIN pgkg_item_scope(
+    JOIN @pgkg_schema@.pgkg_item_scope(
         (SELECT array_agg(inner_cand.item_id) FROM cand inner_cand)
     ) s ON s.item_id = cand.item_id
 ),
@@ -772,18 +772,18 @@ SELECT
     MIN(neighbour.ord)::INT,
     MAX(neighbour.ord)::INT,
     string_agg(n.text, E'\n\n' ORDER BY neighbour.ord)
-FROM document_version_chunks anchor
-JOIN document_versions dv
+FROM @pgkg_schema@.document_version_chunks anchor
+JOIN @pgkg_schema@.document_versions dv
   ON dv.id = anchor.document_version_id
  AND dv.status = 'current'
-JOIN documents d
+JOIN @pgkg_schema@.documents d
   ON d.id = dv.document_id
  AND d.deleted_at IS NULL
-JOIN document_version_chunks neighbour
+JOIN @pgkg_schema@.document_version_chunks neighbour
   ON neighbour.document_version_id = anchor.document_version_id
  AND neighbour.ord BETWEEN anchor.ord - GREATEST(p_before, 0)
                        AND anchor.ord + GREATEST(p_after, 0)
-JOIN chunks n ON n.id = neighbour.chunk_id
+JOIN @pgkg_schema@.chunks n ON n.id = neighbour.chunk_id
 WHERE anchor.chunk_id = ANY(p_chunk_ids)
 GROUP BY anchor.chunk_id, anchor.document_version_id;
 $$;
@@ -859,8 +859,8 @@ WITH
 retrieved AS (
     SELECT
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(
                 q_text, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'propositions'
@@ -868,8 +868,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(
                 q_embedding, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'propositions'
@@ -877,8 +877,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(
                 q_text, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'chunks'
@@ -886,8 +886,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(
                 q_embedding, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'chunks'
@@ -897,16 +897,16 @@ retrieved AS (
 
 seeds AS (
     SELECT ARRAY(
-        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
-        FROM retrieved r, pgkg_fuse(r.candidates, rrf_k) f
+        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
+        FROM retrieved r, @pgkg_schema@.pgkg_fuse(r.candidates, rrf_k) f
     ) AS candidates
 ),
 
 expanded AS (
     SELECT ARRAY(
-        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-        FROM pgkg_graph_candidates(
-            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::pgkg_candidate[] END,
+        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+        FROM @pgkg_schema@.pgkg_graph_candidates(
+            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::@pgkg_schema@.pgkg_candidate[] END,
             p_namespace, 20, 10, 100,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
             p_valid_at
@@ -917,7 +917,7 @@ expanded AS (
 
 fused AS (
     SELECT f.*
-    FROM retrieved r, expanded x, pgkg_fuse(r.candidates || x.candidates, rrf_k) f
+    FROM retrieved r, expanded x, @pgkg_schema@.pgkg_fuse(r.candidates || x.candidates, rrf_k) f
 ),
 
 weighted AS (
@@ -935,15 +935,15 @@ weighted AS (
                ELSE              w_scope_org
            END)::REAL AS weighted_score
     FROM fused f
-    JOIN pgkg_item_scope(ARRAY(SELECT inner_f.item_id FROM fused inner_f)) s
+    JOIN @pgkg_schema@.pgkg_item_scope(ARRAY(SELECT inner_f.item_id FROM fused inner_f)) s
       ON s.item_id = f.item_id
 ),
 
 quota AS (
     SELECT q.*
-    FROM pgkg_apply_quotas(
+    FROM @pgkg_schema@.pgkg_apply_quotas(
         ARRAY(
-            SELECT (w.item_id, 'fused'::TEXT, 0, w.weighted_score)::pgkg_candidate
+            SELECT (w.item_id, 'fused'::TEXT, 0, w.weighted_score)::@pgkg_schema@.pgkg_candidate
             FROM weighted w
         ),
         k_rerank, corpus_fraction, memory_floor
@@ -952,9 +952,9 @@ quota AS (
 
 profiled AS (
     SELECT ap.*
-    FROM pgkg_apply_profile(
+    FROM @pgkg_schema@.pgkg_apply_profile(
         ARRAY(
-            SELECT (q.item_id, 'fused'::TEXT, 0, q.quota_score)::pgkg_candidate
+            SELECT (q.item_id, 'fused'::TEXT, 0, q.quota_score)::@pgkg_schema@.pgkg_candidate
             FROM quota q
         ),
         recency_half_life_days, perishable_half_life_days
@@ -963,13 +963,13 @@ profiled AS (
 
 payload AS (
     SELECT p.id AS item_id, p.text, p.asserted_at
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.id IN (SELECT q.item_id FROM quota q)
 
     UNION ALL
 
     SELECT c.id, c.text, c.asserted_at
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.id IN (SELECT q.item_id FROM quota q)
 ),
 
@@ -978,7 +978,7 @@ payload AS (
 -- context: the lowest version id is an arbitrary choice, but a stable one.
 windows AS (
     SELECT DISTINCT ON (cw.chunk_id) cw.chunk_id, cw.context_text
-    FROM pgkg_chunk_window(
+    FROM @pgkg_schema@.pgkg_chunk_window(
         ARRAY(SELECT q.item_id FROM quota q), window_before, window_after
     ) cw
     ORDER BY cw.chunk_id, cw.document_version_id

@@ -74,9 +74,9 @@ CREATE FUNCTION pgkg_gazetteer_keys(p_texts TEXT[]) RETURNS TEXT[]
 LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
 AS $$
     SELECT ARRAY(
-        SELECT public.pgkg_gazetteer_key(t)
+        SELECT @pgkg_schema@.pgkg_gazetteer_key(t)
         FROM unnest(p_texts) AS t
-        WHERE length(public.pgkg_gazetteer_key(t)) >= 3
+        WHERE length(@pgkg_schema@.pgkg_gazetteer_key(t)) >= 3
     )
 $$;
 
@@ -174,7 +174,7 @@ BEGIN
 
     target AS (
         SELECT c.id, c.org_id, lower(c.text) AS lowered
-        FROM chunks c
+        FROM @pgkg_schema@.chunks c
         WHERE c.id = ANY(p_chunk_ids)
     ),
 
@@ -206,7 +206,7 @@ BEGIN
             a.org_id,
             a.w_start AS span_start,
             b.w_end   AS span_end,
-            pgkg_gazetteer_key(
+            @pgkg_schema@.pgkg_gazetteer_key(
                 substr(a.lowered, a.w_start + 1, b.w_end - a.w_start)
             ) AS phrase
         FROM positioned a
@@ -225,29 +225,29 @@ BEGIN
         SELECT u.chunk_id, u.org_id, e.id AS entity_id,
                u.span_start, u.span_end, 'name'::TEXT AS match_kind
         FROM usable u
-        JOIN entities e
+        JOIN @pgkg_schema@.entities e
           ON e.org_id = u.org_id
-         AND pgkg_gazetteer_key(e.name) = u.phrase
+         AND @pgkg_schema@.pgkg_gazetteer_key(e.name) = u.phrase
 
         UNION ALL
 
         SELECT u.chunk_id, u.org_id, e.id,
                u.span_start, u.span_end, 'alias'
         FROM usable u
-        JOIN entities e
+        JOIN @pgkg_schema@.entities e
           ON e.org_id = u.org_id
-         AND pgkg_gazetteer_keys(e.aliases) @> ARRAY[u.phrase]
+         AND @pgkg_schema@.pgkg_gazetteer_keys(e.aliases) @> ARRAY[u.phrase]
 
         UNION ALL
 
         SELECT u.chunk_id, u.org_id, e.id,
                u.span_start, u.span_end, 'fuzzy'
         FROM usable u
-        JOIN entities e
+        JOIN @pgkg_schema@.entities e
           ON e.org_id = u.org_id
-         AND e.name % u.phrase
-         AND similarity(pgkg_gazetteer_key(e.name), u.phrase) >= p_threshold
-        WHERE pgkg_gazetteer_key(e.name) <> u.phrase
+         AND e.name OPERATOR(@extschema:pg_trgm@.%) u.phrase
+         AND @extschema:pg_trgm@.similarity(@pgkg_schema@.pgkg_gazetteer_key(e.name), u.phrase) >= p_threshold
+        WHERE @pgkg_schema@.pgkg_gazetteer_key(e.name) <> u.phrase
     ),
 
     -- One row per pair.  Certainty outranks position: a phrase that IS the name
@@ -266,7 +266,7 @@ BEGIN
     ),
 
     inserted AS (
-        INSERT INTO entity_mentions
+        INSERT INTO @pgkg_schema@.entity_mentions
             (entity_id, chunk_id, org_id, span_start, span_end, match_kind)
         SELECT entity_id, chunk_id, org_id, span_start, span_end, match_kind
         FROM best
@@ -276,7 +276,7 @@ BEGIN
 
     SELECT COUNT(*) INTO v_added FROM inserted;
 
-    UPDATE chunks SET mentions_matched_at = now()
+    UPDATE @pgkg_schema@.chunks SET mentions_matched_at = now()
     WHERE id = ANY(p_chunk_ids)
       AND mentions_matched_at IS NULL;
 
@@ -305,23 +305,23 @@ CREATE FUNCTION pgkg_match_chunk_mentions(
 ) RETURNS BIGINT
 LANGUAGE SQL
 AS $$
-    SELECT pgkg_match_entity_mentions(
+    SELECT @pgkg_schema@.pgkg_match_entity_mentions(
         ARRAY(
             SELECT DISTINCT c.id
             FROM (
                 SELECT e.org_id, k.key
-                FROM entities e
+                FROM @pgkg_schema@.entities e
                 CROSS JOIN LATERAL (
-                    SELECT pgkg_gazetteer_key(e.name) AS key
+                    SELECT @pgkg_schema@.pgkg_gazetteer_key(e.name) AS key
                     UNION
-                    SELECT a.key FROM unnest(pgkg_gazetteer_keys(e.aliases)) AS a(key)
+                    SELECT a.key FROM unnest(@pgkg_schema@.pgkg_gazetteer_keys(e.aliases)) AS a(key)
                 ) k
                 WHERE e.id = ANY(p_entity_ids)
                   AND length(k.key) >= 3
             ) n
             CROSS JOIN LATERAL (
                 SELECT c.id
-                FROM chunks c
+                FROM @pgkg_schema@.chunks c
                 WHERE c.org_id = n.org_id
                   AND c.tsv @@ plainto_tsquery('english', n.key)
                 LIMIT GREATEST(p_max_chunks, 0)
@@ -342,10 +342,10 @@ CREATE FUNCTION pgkg_unmatched_chunks(
 LANGUAGE SQL STABLE
 AS $$
     SELECT c.id
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.org_id = p_org_id
       AND c.mentions_matched_at IS NULL
-      AND pgkg_chunk_live(c.id, c.refcount)
+      AND @pgkg_schema@.pgkg_chunk_live(c.id, c.refcount)
     ORDER BY c.created_at, c.id
     LIMIT GREATEST(p_limit, 0)
 $$;
@@ -397,16 +397,16 @@ DECLARE
     v_org_side    UUID;
     v_shared_side UUID;
 BEGIN
-    SELECT org_id INTO v_org_side FROM entities WHERE id = NEW.org_entity_id;
-    SELECT org_id INTO v_shared_side FROM entities WHERE id = NEW.shared_entity_id;
+    SELECT org_id INTO v_org_side FROM @pgkg_schema@.entities WHERE id = NEW.org_entity_id;
+    SELECT org_id INTO v_shared_side FROM @pgkg_schema@.entities WHERE id = NEW.shared_entity_id;
 
-    IF v_shared_side IS DISTINCT FROM pgkg_system_org() THEN
+    IF v_shared_side IS DISTINCT FROM @pgkg_schema@.pgkg_system_org() THEN
         RAISE EXCEPTION
             'entity_links bridges into shared entity space: % is owned by %, '
             'not by the system org', NEW.shared_entity_id, v_shared_side;
     END IF;
 
-    IF v_org_side IS NOT DISTINCT FROM pgkg_system_org() THEN
+    IF v_org_side IS NOT DISTINCT FROM @pgkg_schema@.pgkg_system_org() THEN
         RAISE EXCEPTION
             'entity_links bridges from an org entity: % is already shared',
             NEW.org_entity_id;
@@ -482,21 +482,21 @@ seeds AS (
 named AS (
     SELECT p.subject_id AS entity_id, s.score
     FROM seeds s
-    JOIN propositions p ON p.id = s.seed_id
+    JOIN @pgkg_schema@.propositions p ON p.id = s.seed_id
     WHERE p.subject_id IS NOT NULL
 
     UNION ALL
 
     SELECT p.object_id, s.score
     FROM seeds s
-    JOIN propositions p ON p.id = s.seed_id
+    JOIN @pgkg_schema@.propositions p ON p.id = s.seed_id
     WHERE p.object_id IS NOT NULL
 
     UNION ALL
 
     SELECT m.entity_id, s.score
     FROM seeds s
-    JOIN entity_mentions m ON m.chunk_id = s.seed_id
+    JOIN @pgkg_schema@.entity_mentions m ON m.chunk_id = s.seed_id
 ),
 
 -- Plus whatever those entities are bridged to in shared space, discounted by
@@ -508,7 +508,7 @@ bridged AS (
 
     SELECT el.shared_entity_id, (n.score * el.confidence)::REAL
     FROM named n
-    JOIN entity_links el ON el.org_entity_id = n.entity_id
+    JOIN @pgkg_schema@.entity_links el ON el.org_entity_id = n.entity_id
 ),
 
 seed_entities AS (
@@ -528,7 +528,7 @@ seed_entities AS (
 -- carries.
 mention_weight AS (
     SELECT m.chunk_id, COUNT(DISTINCT m.entity_id) AS seeds_named
-    FROM entity_mentions m
+    FROM @pgkg_schema@.entity_mentions m
     JOIN seed_entities se ON se.entity_id = m.entity_id
     GROUP BY m.chunk_id
 ),
@@ -546,7 +546,7 @@ fact_route AS (
         SELECT se.entity_id, e.proposition_id AS cand_id,
                COALESCE(e.weight, 0.0) AS weight
         FROM seed_entities se
-        JOIN edges e
+        JOIN @pgkg_schema@.edges e
           ON e.src_entity = se.entity_id
           OR e.dst_entity = se.entity_id
 
@@ -554,7 +554,7 @@ fact_route AS (
 
         SELECT se.entity_id, np.id, 0.0
         FROM seed_entities se
-        JOIN propositions np
+        JOIN @pgkg_schema@.propositions np
           ON np.subject_id = se.entity_id
           OR np.object_id = se.entity_id
     ) u
@@ -564,14 +564,14 @@ fact_route AS (
 visible_facts AS (
     SELECT fr.entity_id, fr.cand_id, fr.weight
     FROM fact_route fr
-    JOIN propositions np ON np.id = fr.cand_id
+    JOIN @pgkg_schema@.propositions np ON np.id = fr.cand_id
     WHERE np.namespace = p_namespace
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             np.invalidated_at, np.valid_from, np.valid_to,
             COALESCE(p_valid_at, now())
           )
       AND NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = np.id)
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             np.org_id, np.collection_id, np.visibility,
             np.owner_user_id, np.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -598,12 +598,12 @@ per_seed AS (
             ORDER BY mw.seeds_named DESC, c.id
         )
     FROM seed_entities se
-    JOIN entity_mentions m ON m.entity_id = se.entity_id
-    JOIN chunks c ON c.id = m.chunk_id
+    JOIN @pgkg_schema@.entity_mentions m ON m.entity_id = se.entity_id
+    JOIN @pgkg_schema@.chunks c ON c.id = m.chunk_id
     JOIN mention_weight mw ON mw.chunk_id = c.id
     WHERE NOT EXISTS (SELECT 1 FROM seeds s WHERE s.seed_id = c.id)
-      AND pgkg_chunk_live(c.id, c.refcount)
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_chunk_live(c.id, c.refcount)
+      AND @pgkg_schema@.pgkg_visible(
             c.org_id, c.collection_id, c.visibility,
             c.owner_user_id, c.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups

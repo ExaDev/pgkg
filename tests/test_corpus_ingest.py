@@ -1717,9 +1717,8 @@ async def test_the_worker_does_not_deadlock_at_its_slot_budget(
     hung for ever with no error.  The control below is the same worker with one
     slot spare: if that drains and this one hangs, the cause is the budget.
     """
-    from pgvector.asyncpg import register_vector
-
     from pgkg.corpus import CorpusIngest
+    from pgkg.db import make_pool
     from pgkg.ingest_jobs import IngestWorker, enqueue_document
 
     org, collection, spy = tenant
@@ -1732,9 +1731,7 @@ async def test_the_worker_does_not_deadlock_at_its_slot_budget(
             text=sectioned_document(3),
         )
 
-    small = await asyncpg.create_pool(
-        pg_dsn, min_size=2, max_size=2, init=lambda c: register_vector(c)
-    )
+    small = await make_pool(pg_dsn, min_size=2, max_size=2)
     try:
         worker = IngestWorker(
             small,
@@ -1756,9 +1753,8 @@ async def test_control_the_worker_drains_when_a_slot_is_spare(
     pg_dsn: str, pool: asyncpg.Pool, tenant
 ) -> None:
     """The control for the test above: same pool, one fewer slot."""
-    from pgvector.asyncpg import register_vector
-
     from pgkg.corpus import CorpusIngest
+    from pgkg.db import make_pool
     from pgkg.ingest_jobs import IngestWorker, enqueue_document
 
     org, collection, spy = tenant
@@ -1771,9 +1767,7 @@ async def test_control_the_worker_drains_when_a_slot_is_spare(
             text=sectioned_document(3),
         )
 
-    small = await asyncpg.create_pool(
-        pg_dsn, min_size=2, max_size=2, init=lambda c: register_vector(c)
-    )
+    small = await make_pool(pg_dsn, min_size=2, max_size=2)
     try:
         worker = IngestWorker(
             small,

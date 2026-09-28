@@ -6,7 +6,10 @@ from functools import lru_cache
 from typing import Literal, Protocol
 from uuid import UUID
 
+from pydantic import ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from pgkg.migrate import plain_identifier
 
 
 # The rows migrations 020-022 reserve, as constants rather than lookups: a
@@ -53,6 +56,14 @@ class Settings(BaseSettings):
     # When None, pgkg auto-starts an embedded Postgres via pgserver (no Docker).
     # Set explicitly to connect to an external Postgres instance.
     database_url: str | None = None
+    # The schema pgkg is installed into and queried in (issue #30).  A host
+    # application can vendor pgkg into a schema of its own; the migrations
+    # qualify every reference in a function, trigger or policy body with it, so
+    # those bodies work whatever the caller's search_path holds.
+    db_schema: str = "public"
+    # Where `pgkg migrate` creates an extension the database does not have yet.
+    # One it already has is used wherever it is.
+    extension_schema: str = "public"
     embed_model: str = "BAAI/bge-m3"
     rerank_model: str = "BAAI/bge-reranker-v2-m3"
     # The embedding width is a property of the schema, not of configuration:
@@ -89,6 +100,10 @@ class Settings(BaseSettings):
     # statement of the policies, and a deployment that can set the mark should.
     keyword_arm: KeywordArm = "policy"
 
+    @field_validator("db_schema", "extension_schema")
+    @classmethod
+    def _plain_schema_name(cls, value: str, info: ValidationInfo) -> str:
+        return plain_identifier(value, info.field_name or "schema")
 
     @property
     def resolved_extractor_model(self) -> str:

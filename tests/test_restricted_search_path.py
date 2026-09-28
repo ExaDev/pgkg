@@ -23,6 +23,8 @@ import uuid
 
 import asyncpg
 
+from pgkg.migrate import render_for
+
 MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
 
 DEFAULT_ORG = uuid.UUID("00000000-0000-0000-0000-000000000001")
@@ -36,7 +38,7 @@ def unique(prefix: str) -> str:
 
 
 async def test_an_index_over_the_gazetteer_keys_builds_under_the_maintenance_search_path(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool, pgkg_schema: str
 ) -> None:
     async with pool.acquire() as conn:
         tx = conn.transaction()
@@ -52,9 +54,10 @@ async def test_an_index_over_the_gazetteer_keys_builds_under_the_maintenance_sea
             await conn.execute(f"SET LOCAL search_path = {MAINTENANCE_SEARCH_PATH}")
 
             await conn.execute(
-                """
+                f"""
                 CREATE INDEX restricted_path_alias_keys_idx
-                    ON public.entities USING gin (public.pgkg_gazetteer_keys(aliases))
+                    ON {pgkg_schema}.entities
+                    USING gin ({pgkg_schema}.pgkg_gazetteer_keys(aliases))
                 """
             )
         finally:
@@ -62,7 +65,7 @@ async def test_an_index_over_the_gazetteer_keys_builds_under_the_maintenance_sea
 
 
 async def test_the_stored_gazetteer_keys_compute_under_an_empty_search_path(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool, pgkg_schema: str
 ) -> None:
     async with pool.acquire() as conn:
         tx = conn.transaction()
@@ -71,8 +74,8 @@ async def test_the_stored_gazetteer_keys_compute_under_an_empty_search_path(
             await conn.execute("SET LOCAL search_path = ''")
 
             keys = await conn.fetchrow(
-                """
-                INSERT INTO public.entities (name, type, namespace, org_id, aliases)
+                f"""
+                INSERT INTO {pgkg_schema}.entities (name, type, namespace, org_id, aliases)
                 VALUES ($1, 'concept', 'default', $2, $3)
                 RETURNING gazetteer_name_key, gazetteer_alias_keys
                 """,
@@ -102,7 +105,7 @@ $$
 
 
 async def test_an_install_that_ran_the_original_040_is_repaired_by_057(
-    pool: asyncpg.Pool,
+    pool: asyncpg.Pool, pgkg_schema: str
 ) -> None:
     (repair,) = MIGRATIONS_DIR.glob("057_*.sql")
     async with pool.acquire() as conn:
@@ -110,11 +113,13 @@ async def test_an_install_that_ran_the_original_040_is_repaired_by_057(
         await tx.start()
         try:
             await conn.execute(UNQUALIFIED_GAZETTEER_KEYS)
-            await conn.execute(repair.read_text())
+            await conn.execute(
+                await render_for(conn, repair.read_text(), schema=pgkg_schema)
+            )
             await conn.execute("SET LOCAL search_path = ''")
 
             keys = await conn.fetchval(
-                "SELECT public.pgkg_gazetteer_keys($1)", ["Project-Helios"]
+                f"SELECT {pgkg_schema}.pgkg_gazetteer_keys($1)", ["Project-Helios"]
             )
         finally:
             await tx.rollback()

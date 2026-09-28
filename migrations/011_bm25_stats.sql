@@ -95,24 +95,24 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'proposition'
       AND (p_namespace IS NULL OR namespace = p_namespace);
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'proposition'
       AND (p_namespace IS NULL OR namespace = p_namespace);
 
-    INSERT INTO corpus_stats (namespace, kind, n_total, total_len)
+    INSERT INTO @pgkg_schema@.corpus_stats (namespace, kind, n_total, total_len)
     SELECT p.namespace, 'proposition', COUNT(*), COALESCE(SUM(p.doc_len), 0)
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.superseded_by IS NULL
       AND (p_namespace IS NULL OR p.namespace = p_namespace)
     GROUP BY p.namespace;
 
-    INSERT INTO lexeme_df (namespace, kind, lexeme, df)
+    INSERT INTO @pgkg_schema@.lexeme_df (namespace, kind, lexeme, df)
     SELECT p.namespace, 'proposition', u.lexeme, COUNT(*)
-    FROM propositions p, unnest(p.tsv) AS u(lexeme, positions, weights)
+    FROM @pgkg_schema@.propositions p, unnest(p.tsv) AS u(lexeme, positions, weights)
     WHERE p.superseded_by IS NULL
       AND (p_namespace IS NULL OR p.namespace = p_namespace)
     GROUP BY p.namespace, u.lexeme;
@@ -130,7 +130,7 @@ AS $$
 DECLARE
     delta_sign INT := TG_ARGV[0]::INT;
 BEGIN
-    INSERT INTO corpus_stats AS cs (namespace, kind, n_total, total_len)
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs (namespace, kind, n_total, total_len)
     SELECT d.namespace,
            'proposition',
            delta_sign * COUNT(*),
@@ -143,7 +143,7 @@ BEGIN
             total_len  = GREATEST(cs.total_len + EXCLUDED.total_len, 0),
             updated_at = now();
 
-    INSERT INTO lexeme_df AS ld (namespace, kind, lexeme, df)
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld (namespace, kind, lexeme, df)
     SELECT d.namespace, 'proposition', u.lexeme, delta_sign * COUNT(*)
     FROM delta_rows d, unnest(d.tsv) AS u(lexeme, positions, weights)
     WHERE d.superseded_by IS NULL
@@ -191,7 +191,7 @@ BEGIN
           )
     ),
     corpus AS (
-        INSERT INTO corpus_stats AS cs (namespace, kind, n_total, total_len)
+        INSERT INTO @pgkg_schema@.corpus_stats AS cs (namespace, kind, n_total, total_len)
         SELECT d.namespace,
                'proposition',
                SUM(d.delta_sign),
@@ -204,7 +204,7 @@ BEGIN
                 updated_at = now()
         RETURNING 1
     )
-    INSERT INTO lexeme_df AS ld (namespace, kind, lexeme, df)
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld (namespace, kind, lexeme, df)
     SELECT d.namespace, 'proposition', u.lexeme, SUM(d.delta_sign)
     FROM delta d, unnest(d.tsv) AS u(lexeme, positions, weights)
     GROUP BY d.namespace, u.lexeme
@@ -286,7 +286,7 @@ stats AS (
         GREATEST(COALESCE(cs.n_total, 1), 1)::FLOAT8 AS n_total,
         COALESCE(cs.avgdl, 1.0)                      AS avgdl
     FROM (VALUES (1)) AS present(x)
-    LEFT JOIN corpus_stats cs
+    LEFT JOIN @pgkg_schema@.corpus_stats cs
         ON cs.namespace = p_namespace
        AND cs.kind = 'proposition'
 ),
@@ -303,7 +303,7 @@ idf AS (
         ) AS idf_val
     FROM query_lexemes ql
     CROSS JOIN stats s
-    LEFT JOIN lexeme_df ld
+    LEFT JOIN @pgkg_schema@.lexeme_df ld
         ON ld.namespace = p_namespace
        AND ld.kind = 'proposition'
        AND ld.lexeme = ql.lexeme
@@ -328,7 +328,7 @@ FROM (
             JOIN idf i ON i.lexeme = u.lexeme
             CROSS JOIN stats s
         ) AS bm25_score
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN query_or
     WHERE q_text IS NOT NULL
       AND q_text <> ''

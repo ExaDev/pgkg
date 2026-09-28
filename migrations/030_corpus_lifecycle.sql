@@ -238,7 +238,7 @@ AS $$
 DECLARE
     delta_sign INT := TG_ARGV[0]::INT;
 BEGIN
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET refcount = GREATEST(c.refcount + delta_sign * d.links, 0)
     FROM (
         SELECT chunk_id, COUNT(*)::INT AS links
@@ -279,8 +279,8 @@ DECLARE
     v_new       UUID;
 BEGIN
     SELECT dv.id INTO v_unchanged
-    FROM documents d
-    JOIN document_versions dv ON dv.id = d.current_version_id
+    FROM @pgkg_schema@.documents d
+    JOIN @pgkg_schema@.document_versions dv ON dv.id = d.current_version_id
     WHERE d.id = p_document_id
       AND dv.content_hash = p_content_hash;
 
@@ -289,20 +289,20 @@ BEGIN
         RETURN;
     END IF;
 
-    INSERT INTO document_versions
+    INSERT INTO @pgkg_schema@.document_versions
         (document_id, org_id, version_no, content_hash, status, provenance_id)
     SELECT
         d.id,
         d.org_id,
         COALESCE(
-            (SELECT MAX(dv.version_no) FROM document_versions dv
+            (SELECT MAX(dv.version_no) FROM @pgkg_schema@.document_versions dv
              WHERE dv.document_id = d.id),
             0
         ) + 1,
         p_content_hash,
         'pending',
-        COALESCE(p_provenance_id, pgkg_unattributed_provenance())
-    FROM documents d
+        COALESCE(p_provenance_id, @pgkg_schema@.pgkg_unattributed_provenance())
+    FROM @pgkg_schema@.documents d
     WHERE d.id = p_document_id
     RETURNING document_versions.id INTO v_new;
 
@@ -335,14 +335,14 @@ DECLARE
     v_org        UUID;
     v_collection UUID;
     v_provenance UUID;
-    v_hash       BYTEA := digest(p_text, 'sha256');
+    v_hash       BYTEA := @extschema:pgcrypto@.digest(p_text, 'sha256');
     v_chunk      UUID;
     v_is_new     BOOLEAN := FALSE;
 BEGIN
     SELECT d.org_id, d.collection_id, dv.provenance_id
     INTO v_org, v_collection, v_provenance
-    FROM document_versions dv
-    JOIN documents d ON d.id = dv.document_id
+    FROM @pgkg_schema@.document_versions dv
+    JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
     WHERE dv.id = p_version_id;
 
     IF v_org IS NULL THEN
@@ -354,7 +354,7 @@ BEGIN
     --
     -- ON CONFLICT rather than a look-then-insert: two connectors crawling the
     -- same boilerplate concurrently would otherwise race on that index.
-    INSERT INTO chunks (text, org_id, collection_id, acl_group_id,
+    INSERT INTO @pgkg_schema@.chunks (text, org_id, collection_id, acl_group_id,
                         provenance_id, asserted_at)
     VALUES (p_text, v_org, v_collection, p_acl_group_id,
             v_provenance, p_asserted_at)
@@ -363,7 +363,7 @@ BEGIN
 
     IF v_chunk IS NULL THEN
         SELECT c.id INTO v_chunk
-        FROM chunks c
+        FROM @pgkg_schema@.chunks c
         WHERE c.org_id = v_org
           AND c.content_hash = v_hash
           AND c.document_id IS NULL;
@@ -374,7 +374,7 @@ BEGIN
     -- Named constraint rather than an inferred one: this function's output
     -- column is called chunk_id too, and an inference list is an expression
     -- context where plpgsql would resolve the name to the variable.
-    INSERT INTO document_version_chunks (document_version_id, chunk_id, ord)
+    INSERT INTO @pgkg_schema@.document_version_chunks (document_version_id, chunk_id, ord)
     VALUES (p_version_id, v_chunk, p_ord)
     ON CONFLICT ON CONSTRAINT document_version_chunks_pkey DO NOTHING;
 
@@ -395,7 +395,7 @@ DECLARE
     v_previous UUID;
 BEGIN
     SELECT dv.document_id INTO v_document
-    FROM document_versions dv WHERE dv.id = p_version_id;
+    FROM @pgkg_schema@.document_versions dv WHERE dv.id = p_version_id;
 
     IF v_document IS NULL THEN
         RAISE EXCEPTION 'no such document version %', p_version_id;
@@ -404,7 +404,7 @@ BEGIN
     -- The row lock serialises two promotions of the same document; without it
     -- both would read the same outgoing version and one retire would be lost.
     SELECT d.current_version_id INTO v_previous
-    FROM documents d WHERE d.id = v_document FOR UPDATE;
+    FROM @pgkg_schema@.documents d WHERE d.id = v_document FOR UPDATE;
 
     IF v_previous IS NOT DISTINCT FROM p_version_id THEN
         RETURN;
@@ -412,30 +412,30 @@ BEGIN
 
     -- 1. Retire the outgoing version first: the partial unique index permits
     -- exactly one current version, and it is checked per statement.
-    UPDATE document_versions
+    UPDATE @pgkg_schema@.document_versions
     SET status = 'retired', retired_at = now()
     WHERE id = v_previous;
 
     -- 2. Promote the incoming one.
-    UPDATE document_versions SET status = 'current' WHERE id = p_version_id;
+    UPDATE @pgkg_schema@.document_versions SET status = 'current' WHERE id = p_version_id;
 
     -- 3. Flip the pointer retrieval reads.
-    UPDATE documents SET current_version_id = p_version_id WHERE id = v_document;
+    UPDATE @pgkg_schema@.documents SET current_version_id = p_version_id WHERE id = v_document;
 
     -- 4. Withdraw the facts derived from chunks this version does not carry.
     -- source_updated, not superseded: nothing replaced these claims, their
     -- source stopped saying them.  An existing reason is never overwritten —
     -- the first withdrawal is the true one (021).
-    UPDATE propositions p
+    UPDATE @pgkg_schema@.propositions p
     SET invalidated_at = now(), invalidation_reason = 'source_updated'
     WHERE p.invalidated_at IS NULL
       AND p.chunk_id IN (
           SELECT dvc.chunk_id
-          FROM document_version_chunks dvc
+          FROM @pgkg_schema@.document_version_chunks dvc
           WHERE dvc.document_version_id = v_previous
           EXCEPT
           SELECT dvc.chunk_id
-          FROM document_version_chunks dvc
+          FROM @pgkg_schema@.document_version_chunks dvc
           WHERE dvc.document_version_id = p_version_id
       );
 END;
@@ -461,7 +461,7 @@ DECLARE
     v_purged BIGINT;
 BEGIN
     WITH purged AS (
-        DELETE FROM document_versions
+        DELETE FROM @pgkg_schema@.document_versions
         WHERE status = 'retired'
           AND retired_at < now() - p_grace
           AND (p_org_id IS NULL OR org_id = p_org_id)
@@ -486,15 +486,15 @@ DECLARE
     v_collected BIGINT;
 BEGIN
     WITH collected AS (
-        DELETE FROM chunks c
+        DELETE FROM @pgkg_schema@.chunks c
         WHERE c.refcount = 0
           AND (p_org_id IS NULL OR c.org_id = p_org_id)
           AND NOT EXISTS (
-              SELECT 1 FROM document_version_chunks dvc
+              SELECT 1 FROM @pgkg_schema@.document_version_chunks dvc
               WHERE dvc.chunk_id = c.id
           )
           AND NOT EXISTS (
-              SELECT 1 FROM propositions p WHERE p.chunk_id = c.id
+              SELECT 1 FROM @pgkg_schema@.propositions p WHERE p.chunk_id = c.id
           )
         RETURNING c.id
     )
@@ -530,8 +530,8 @@ AS $$
         SELECT p_org_id
         UNION
         SELECT c.owner_org_id
-        FROM collection_subscriptions s
-        JOIN collections c ON c.id = s.collection_id
+        FROM @pgkg_schema@.collection_subscriptions s
+        JOIN @pgkg_schema@.collections c ON c.id = s.collection_id
         WHERE s.org_id = p_org_id
           AND s.enabled
           AND c.visibility = 'shared'
@@ -543,8 +543,8 @@ LANGUAGE SQL STABLE PARALLEL SAFE
 AS $$
     SELECT ARRAY(
         SELECT s.collection_id
-        FROM collection_subscriptions s
-        JOIN collections c ON c.id = s.collection_id
+        FROM @pgkg_schema@.collection_subscriptions s
+        JOIN @pgkg_schema@.collections c ON c.id = s.collection_id
         WHERE s.org_id = p_org_id
           AND s.enabled
           AND c.visibility = 'shared'

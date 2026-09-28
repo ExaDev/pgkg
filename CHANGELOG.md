@@ -143,6 +143,33 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   Four assertions that read 16's behaviour literally now hold on 18 too: 18 reports an
   `ON DELETE RESTRICT` refusal as `restrict_violation`, and can answer an arm that lost its index
   with a filtered scan of `entities_org_idx` rather than a sequential scan.
+- **pgkg installs into a schema of its own.** `PGKG_DB_SCHEMA` (default `public`) is where
+  `pgkg migrate` installs and where the application pool looks; `PGKG_EXTENSION_SCHEMA` is where a
+  missing extension is created. Before, a host that vendored pgkg into its own schema and left it
+  off the `search_path` got `function pgkg_default_org() does not exist … during inlining` from
+  every RLS policy and `relation "corpus_stats" does not exist` from the triggers (#30). Every
+  reference in every function and trigger body is now qualified — relations, functions, composite
+  types, and the extensions' functions, types, opclasses and operators
+  (`OPERATOR(ext.<=>)`, `OPERATOR(ext.%)`), each with the schema that extension actually lives
+  in. Not `SET search_path`: a function carrying one is not inlined, and measured, `pgkg_visible`
+  went from an Index Cond on `prop_live_tenancy_idx` to a filter over a parallel seq scan. The
+  files spell the schemas `@pgkg_schema@` and `@extschema:<name>@`, and `pgkg migrate`,
+  `scripts/run_migrations.py` and the test fixture share one runner (`pgkg/migrate.py`) that
+  substitutes them, sets the migration's `search_path`, and keeps `pgkg_schema_migrations` in the
+  install schema. The 020 grants name the install schema rather than `public`. No migration: an
+  existing install in `public` keeps working as it did. `tests/test_vendored_schema.py` installs
+  into `pgkg_host` with extensions in `pgkg_ext` and drives policies, triggers, retrieval and the
+  gazetteer from a caller whose path is `''`, re-creates every SQL function under that path (an
+  exact name-resolution check), reads every plpgsql body for an unqualified name, and pins that the
+  visibility predicate and both arms still inline onto their indexes. A second CI job runs the whole
+  suite installed in `pgkg_host`. The runner grants `pgkg_app` `USAGE` on each extension's schema
+  (a schema an operator made grants it nothing, and retrieval as `pgkg_app` failed with `permission
+  denied for schema`), creates the extension schema only when an extension goes into it, refuses
+  reserved words and `pg_` names, and refuses a schema holding pgkg tables without a migration
+  record rather than re-applying from 001. `pgkg_embedding_dim()` and
+  `pgkg_set_embedding_storage()` take a schema-qualified table as written. Requires `pgvector`
+  (Python) 0.3.4, the first with `register_vector(schema=)`. The function bodies are pinned to the
+  extensions' schemas at install: `ALTER EXTENSION ... SET SCHEMA` afterwards breaks them.
 
 ## 0.6.0
 

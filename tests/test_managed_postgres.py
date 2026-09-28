@@ -28,6 +28,8 @@ from contextlib import asynccontextmanager
 import asyncpg
 import pytest
 
+from pgkg.config import get_settings
+
 ORG_GUC = "pgkg.org_id"
 ARM_GUC = "pgkg.keyword_arm"
 SYSTEM_ORG = uuid.UUID("00000000-0000-0000-0000-000000000000")
@@ -45,8 +47,11 @@ SERVES = {
     CONTAINS: "gazetteer",
 }
 
+# Where the suite installed pgkg: public, or the vendored schema (issue #30).
+SCHEMA = get_settings().db_schema
+
 OWNER_ARM = (
-    "public.pgkg_bm25_candidates_as_owner"
+    f"{SCHEMA}.pgkg_bm25_candidates_as_owner"
     "(text, text, text, integer, uuid[], uuid[], uuid, uuid[],"
     " timestamp with time zone, text)"
 )
@@ -202,8 +207,8 @@ async def test_the_owner_arm_warns_when_its_owner_is_under_the_policy(
             # the owner has to become a role that does not.
             owner = unique("pgkg_owner")
             await conn.execute(f"CREATE ROLE {owner} NOLOGIN")
-            await conn.execute(f"GRANT USAGE ON SCHEMA public TO {owner}")
-            await conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {owner}")
+            await conn.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {owner}")
+            await conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {SCHEMA} TO {owner}")
             await conn.execute(f"ALTER FUNCTION {OWNER_ARM} OWNER TO {owner}")
             not_owner = await conn.fetchval("SELECT pgkg_owner_arm_bypasses_policy()")
             for table in OWNER_ARM_TABLES:
@@ -512,8 +517,11 @@ async def _nested_plans(
     a SECURITY DEFINER function never inlines, so its body is one Function
     Scan to the caller.  auto_explain logs nested statements, and at NOTICE
     the log comes back on the connection that ran them.  A connection of its
-    own, because LOAD outlives the transaction."""
-    conn = await asyncpg.connect(dsn)
+    own, because LOAD outlives the transaction, with the application's
+    search_path so it finds pgkg wherever the suite installed it."""
+    from pgkg.db import connect
+
+    conn = await connect(dsn)
     notices: list[str] = []
     conn.add_log_listener(lambda _c, message: notices.append(str(message)))
     try:
@@ -588,7 +596,7 @@ async def test_the_owner_arm_depends_on_no_caller_search_path(
             await as_app(conn, tenancy["mine"])
             await conn.execute("SET LOCAL search_path = ''")
             rows = await conn.fetch(
-                "SELECT item_id FROM public.pgkg_bm25_candidates_as_owner("
+                f"SELECT item_id FROM {SCHEMA}.pgkg_bm25_candidates_as_owner("
                 "$1, $2, NULL, 200, $3::uuid[], $4::uuid[], $5::uuid,"
                 " $6::uuid[], NULL, $7)",
                 *args,
@@ -607,10 +615,11 @@ async def test_the_policies_the_owner_arm_restates_are_the_policies_in_force(
             """
             SELECT tablename, permissive, cmd, qual
             FROM pg_policies
-            WHERE schemaname = 'public' AND tablename = ANY($1::text[])
+            WHERE schemaname = $2 AND tablename = ANY($1::text[])
             ORDER BY tablename
             """,
             list(OWNER_ARM_TABLES),
+            SCHEMA,
         )
 
     assert [
@@ -735,6 +744,14 @@ async def test_the_keyword_arm_dispatches_on_the_setting(
 # denied every keyword call for such a role, on the default path with the GUC
 # unset.
 
+async def _extension_schemas(conn: asyncpg.Connection) -> set[str]:
+    from pgkg.migrate import extension_schemas
+
+    return set((await extension_schemas(conn, default="public")).values()) - {
+        "pg_catalog"
+    }
+
+
 @asynccontextmanager
 async def as_other_role(
     conn: asyncpg.Connection, org: uuid.UUID
@@ -743,8 +760,10 @@ async def as_other_role(
     async with conn.transaction():
         role = unique("other_app")
         await conn.execute(f"CREATE ROLE {role} NOLOGIN")
-        await conn.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
-        await conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}")
+        await conn.execute(f"GRANT USAGE ON SCHEMA {SCHEMA} TO {role}")
+        await conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA {SCHEMA} TO {role}")
+        for extension_schema in await _extension_schemas(conn):
+            await conn.execute(f"GRANT USAGE ON SCHEMA {extension_schema} TO {role}")
         await conn.execute(f"SET LOCAL ROLE {role}")
         await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(org))
         yield role
@@ -840,7 +859,8 @@ DEFAULT_ORG_RULE = "SELECT '00000000-0000-0000-0000-000000000001'::UUID"
 def _normalised(sql: str) -> str:
     """Whitespace, schema qualification and parenthesis padding removed, so
     the #30 qualification of these bodies does not read as a redefinition."""
-    text = " ".join(sql.replace("public.", "").replace("pg_catalog.", "").split())
+    unqualified = sql.replace(f"{SCHEMA}.", "").replace("public.", "")
+    text = " ".join(unqualified.replace("pg_catalog.", "").split())
     return text.replace("( ", "(").replace(" )", ")")
 
 
@@ -853,7 +873,7 @@ async def test_the_owner_arm_restates_the_org_rule_the_policies_call(
             for row in await conn.fetch(
                 "SELECT proname, prosrc FROM pg_proc p"
                 " JOIN pg_namespace n ON n.oid = p.pronamespace"
-                " WHERE n.nspname = 'public' AND proname = ANY($1::text[])",
+                " WHERE n.nspname = current_schema() AND proname = ANY($1::text[])",
                 ["pgkg_current_org", "pgkg_default_org",
                  "pgkg_bm25_candidates_as_owner"],
             )

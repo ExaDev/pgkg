@@ -348,7 +348,7 @@ async def test_every_table_with_an_org_column_is_policied(
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 JOIN pg_attribute a
                   ON a.attrelid = c.oid AND a.attname = 'org_id' AND a.attnum > 0
-                WHERE n.nspname = 'public' AND c.relkind = 'r'
+                WHERE n.nspname = current_schema() AND c.relkind = 'r'
                 """
             )
         }
@@ -359,7 +359,7 @@ async def test_every_table_with_an_org_column_is_policied(
                 SELECT c.relname
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = 'public' AND c.relkind = 'r'
+                WHERE n.nspname = current_schema() AND c.relkind = 'r'
                   AND c.relrowsecurity
                 """
             )
@@ -388,7 +388,7 @@ async def test_every_rls_enabled_table_is_covered_here(pool: asyncpg.Pool) -> No
                 SELECT c.relname
                 FROM pg_class c
                 JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = 'public'
+                WHERE n.nspname = current_schema()
                   AND c.relkind = 'r'
                   AND c.relrowsecurity
                 ORDER BY c.relname

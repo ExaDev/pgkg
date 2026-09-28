@@ -18,6 +18,8 @@ import asyncpg
 import pytest
 from pgvector import HalfVector
 
+from pgkg.migrate import render_for
+
 
 def _ns(tag: str) -> str:
     return f"link_{tag}_{uuid.uuid4().hex[:8]}"
@@ -316,10 +318,12 @@ def mixed(dim: int, *, primary: int, secondary: int, weight: float) -> HalfVecto
     return HalfVector(v)
 
 
-def _shipped_migration() -> str:
+async def _shipped_migration(conn: asyncpg.Connection) -> str:
+    """051 as the runner renders it for the schema this suite installed into."""
     paths = sorted(MIGRATIONS_DIR.glob("051_*.sql"))
     assert len(paths) == 1, f"expected exactly one 051 migration, found {paths}"
-    return paths[0].read_text()
+    schema = await conn.fetchval("SELECT current_schema()")
+    return await render_for(conn, paths[0].read_text(), schema=schema)
 
 
 @pytest.fixture(scope="module")
@@ -478,7 +482,7 @@ async def test_the_prior_similarity_call_reached_no_index_for_any_role(
             )
             after = await _trigram_scans(conn)
         finally:
-            await conn.execute(_shipped_migration())
+            await conn.execute(await _shipped_migration(conn))
         restored = await _trigram_scans(conn)
         again = await conn.fetchval(
             "SELECT pgkg_link_entity($1, $2, 'thing', $3)",
@@ -547,7 +551,7 @@ async def test_the_operator_rewrite_keeps_the_candidate_set_and_the_winner(
         try:
             prior = await outcomes(conn)
         finally:
-            await conn.execute(_shipped_migration())
+            await conn.execute(await _shipped_migration(conn))
 
     assert shipped == prior, (
         f"the rewrite changed which entity stage 2 resolves: {prior} became "
@@ -636,7 +640,7 @@ async def test_the_confirmation_holds_the_line_at_0_6_without_the_pin(
                 )
                 await tx.rollback()
         finally:
-            await conn.execute(_shipped_migration())
+            await conn.execute(await _shipped_migration(conn))
         repinned = await conn.fetchval(
             "SELECT proconfig FROM pg_proc WHERE oid = $1::regprocedure", signature
         )

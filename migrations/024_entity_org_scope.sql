@@ -59,11 +59,11 @@ SECURITY INVOKER
 AS $$
 DECLARE
     v_id  UUID;
-    v_org UUID := pgkg_current_org();
+    v_org UUID := @pgkg_schema@.pgkg_current_org();
 BEGIN
     -- 1. Exact name + type match within namespace, inside this org
     SELECT id INTO v_id
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE org_id = v_org
       AND namespace = p_namespace
       AND name = p_name
@@ -77,12 +77,12 @@ BEGIN
     -- 2. Trigram + embedding similarity match, inside this org
     IF p_embedding IS NOT NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE org_id = v_org
           AND namespace = p_namespace
-          AND similarity(name, p_name) > 0.6
-          AND (1 - (embedding <=> p_embedding)) > p_threshold
-        ORDER BY (embedding <=> p_embedding)
+          AND @extschema:pg_trgm@.similarity(name, p_name) > 0.6
+          AND (1 - (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)) > p_threshold
+        ORDER BY (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)
         LIMIT 1;
     END IF;
 
@@ -96,14 +96,14 @@ BEGIN
     -- snapshot, because each plpgsql statement takes one — finds the winner.
     -- The competitor can now only be inside this org, which is what makes the
     -- recovery read able to see it.
-    INSERT INTO entities (name, type, embedding, namespace, org_id)
+    INSERT INTO @pgkg_schema@.entities (name, type, embedding, namespace, org_id)
     VALUES (p_name, p_type, p_embedding, p_namespace, v_org)
     ON CONFLICT (org_id, namespace, name, COALESCE(type, '')) DO NOTHING
     RETURNING id INTO v_id;
 
     IF v_id IS NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE org_id = v_org
           AND namespace = p_namespace
           AND name = p_name

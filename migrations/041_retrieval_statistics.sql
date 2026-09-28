@@ -191,9 +191,9 @@ AS $$
     SELECT (p_refcount = 0 AND p_document_id IS NULL)
         OR EXISTS (
             SELECT 1
-            FROM document_version_chunks dvc
-            JOIN document_versions dv ON dv.id = dvc.document_version_id
-            JOIN documents d ON d.id = dv.document_id
+            FROM @pgkg_schema@.document_version_chunks dvc
+            JOIN @pgkg_schema@.document_versions dv ON dv.id = dvc.document_version_id
+            JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
             WHERE dvc.chunk_id = p_chunk_id
               AND dv.status = 'current'
               AND d.deleted_at IS NULL
@@ -218,9 +218,9 @@ AS $$
 WITH target AS (
     SELECT c.id, c.org_id, c.collection_id, c.doc_len, c.tsv,
            c.retrievable AS was_retrievable,
-           pgkg_chunk_retrievable(c.id, c.document_id, c.refcount)
+           @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.document_id, c.refcount)
                AS is_retrievable
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.id = ANY(p_chunk_ids)
 ),
 flipped AS (
@@ -229,14 +229,14 @@ flipped AS (
     WHERE t.is_retrievable IS DISTINCT FROM t.was_retrievable
 ),
 marked AS (
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET retrievable = f.is_retrievable
     FROM flipped f
     WHERE c.id = f.id
     RETURNING c.id
 ),
 totals AS (
-    INSERT INTO corpus_stats AS cs
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', f.org_id, f.collection_id,
            SUM(f.delta_sign), SUM(f.delta_sign * f.doc_len)
@@ -248,7 +248,7 @@ totals AS (
             updated_at = now()
     RETURNING 1
 )
-INSERT INTO lexeme_df AS ld
+INSERT INTO @pgkg_schema@.lexeme_df AS ld
     (kind, namespace, lexeme, org_id, collection_id, df)
 SELECT 'chunk', '', u.lexeme, f.org_id, f.collection_id, SUM(f.delta_sign)
 FROM flipped f, unnest(f.tsv) AS u(lexeme, positions, weights)
@@ -300,7 +300,7 @@ BEGIN
     WHERE n.document_id IS DISTINCT FROM o.document_id;
 
     IF v_ids IS NOT NULL THEN
-        PERFORM pgkg_chunk_retrievability_sync(v_ids);
+        PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync(v_ids);
     END IF;
 
     RETURN NULL;
@@ -311,7 +311,7 @@ CREATE FUNCTION pgkg_chunks_retrievability_insert() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    PERFORM pgkg_chunk_retrievability_sync(
+    PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync(
         (SELECT array_agg(DISTINCT d.id) FROM delta_rows d)
     );
     RETURN NULL;
@@ -322,7 +322,7 @@ CREATE FUNCTION pgkg_version_chunks_retrievability() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    PERFORM pgkg_chunk_retrievability_sync(
+    PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync(
         (SELECT array_agg(DISTINCT d.chunk_id) FROM delta_rows d)
     );
     RETURN NULL;
@@ -336,18 +336,18 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
     IF TG_TABLE_NAME = 'document_versions' THEN
-        PERFORM pgkg_chunk_retrievability_sync((
+        PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync((
             SELECT array_agg(DISTINCT dvc.chunk_id)
             FROM delta_rows d
-            JOIN document_version_chunks dvc
+            JOIN @pgkg_schema@.document_version_chunks dvc
                  ON dvc.document_version_id = d.id
         ));
     ELSE
-        PERFORM pgkg_chunk_retrievability_sync((
+        PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync((
             SELECT array_agg(DISTINCT dvc.chunk_id)
             FROM delta_rows d
-            JOIN document_versions dv ON dv.document_id = d.id
-            JOIN document_version_chunks dvc
+            JOIN @pgkg_schema@.document_versions dv ON dv.document_id = d.id
+            JOIN @pgkg_schema@.document_version_chunks dvc
                  ON dvc.document_version_id = dv.id
         ));
     END IF;
@@ -402,7 +402,7 @@ CREATE OR REPLACE FUNCTION pgkg_chunks_stats_delta() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO corpus_stats AS cs
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', d.org_id, d.collection_id,
            -COUNT(*), -COALESCE(SUM(d.doc_len), 0)
@@ -414,7 +414,7 @@ BEGIN
             total_len  = GREATEST(cs.total_len + EXCLUDED.total_len, 0),
             updated_at = now();
 
-    INSERT INTO lexeme_df AS ld
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'chunk', '', u.lexeme, d.org_id, d.collection_id, -COUNT(*)
     FROM delta_rows d, unnest(d.tsv) AS u(lexeme, positions, weights)
@@ -442,33 +442,33 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    UPDATE chunks c
-    SET retrievable = pgkg_chunk_retrievable(c.id, c.document_id, c.refcount)
+    UPDATE @pgkg_schema@.chunks c
+    SET retrievable = @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.document_id, c.refcount)
     WHERE (p_collection_id IS NULL OR c.collection_id = p_collection_id)
       AND c.retrievable IS DISTINCT FROM
-          pgkg_chunk_retrievable(c.id, c.document_id, c.refcount);
+          @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.document_id, c.refcount);
 
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL OR collection_id = p_collection_id);
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL OR collection_id = p_collection_id);
 
-    INSERT INTO corpus_stats
+    INSERT INTO @pgkg_schema@.corpus_stats
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', c.org_id, c.collection_id,
            COUNT(*), COALESCE(SUM(c.doc_len), 0)
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.retrievable
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
     GROUP BY c.org_id, c.collection_id;
 
-    INSERT INTO lexeme_df
+    INSERT INTO @pgkg_schema@.lexeme_df
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'chunk', '', u.lexeme, c.org_id, c.collection_id, COUNT(*)
-    FROM chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
+    FROM @pgkg_schema@.chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
     WHERE c.retrievable
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
     GROUP BY u.lexeme, c.org_id, c.collection_id;
@@ -484,28 +484,28 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'proposition'
       AND (p_namespace IS NULL OR namespace = p_namespace);
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'proposition'
       AND (p_namespace IS NULL OR namespace = p_namespace);
 
-    INSERT INTO corpus_stats
+    INSERT INTO @pgkg_schema@.corpus_stats
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'proposition', p.namespace, p.org_id, p.collection_id,
            COUNT(*), COALESCE(SUM(p.doc_len), 0)
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.invalidated_at IS NULL
       AND (p_namespace IS NULL OR p.namespace = p_namespace)
     GROUP BY p.namespace, p.org_id, p.collection_id;
 
-    INSERT INTO lexeme_df
+    INSERT INTO @pgkg_schema@.lexeme_df
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'proposition', p.namespace, u.lexeme, p.org_id, p.collection_id,
            COUNT(*)
-    FROM propositions p, unnest(p.tsv) AS u(lexeme, positions, weights)
+    FROM @pgkg_schema@.propositions p, unnest(p.tsv) AS u(lexeme, positions, weights)
     WHERE p.invalidated_at IS NULL
       AND (p_namespace IS NULL OR p.namespace = p_namespace)
     GROUP BY p.namespace, u.lexeme, p.org_id, p.collection_id;
@@ -519,7 +519,7 @@ AS $$
 DECLARE
     delta_sign INT := TG_ARGV[0]::INT;
 BEGIN
-    INSERT INTO corpus_stats AS cs
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'proposition', d.namespace, d.org_id, d.collection_id,
            delta_sign * COUNT(*),
@@ -532,7 +532,7 @@ BEGIN
             total_len  = GREATEST(cs.total_len + EXCLUDED.total_len, 0),
             updated_at = now();
 
-    INSERT INTO lexeme_df AS ld
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'proposition', d.namespace, u.lexeme, d.org_id, d.collection_id,
            delta_sign * COUNT(*)
@@ -582,7 +582,7 @@ BEGIN
           )
     ),
     corpus AS (
-        INSERT INTO corpus_stats AS cs
+        INSERT INTO @pgkg_schema@.corpus_stats AS cs
             (kind, namespace, org_id, collection_id, n_total, total_len)
         SELECT 'proposition', d.namespace, d.org_id, d.collection_id,
                SUM(d.delta_sign), SUM(d.delta_sign * d.doc_len)
@@ -594,7 +594,7 @@ BEGIN
                 updated_at = now()
         RETURNING 1
     )
-    INSERT INTO lexeme_df AS ld
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'proposition', d.namespace, u.lexeme, d.org_id, d.collection_id,
            SUM(d.delta_sign)
@@ -623,7 +623,7 @@ RETURNS BOOLEAN
 LANGUAGE SQL STABLE PARALLEL SAFE
 AS $$
     SELECT EXISTS (
-        SELECT 1 FROM chunks c WHERE c.id = p_chunk_id AND c.retrievable
+        SELECT 1 FROM @pgkg_schema@.chunks c WHERE c.id = p_chunk_id AND c.retrievable
     )
 $$;
 
@@ -705,7 +705,7 @@ stats AS (
             / GREATEST(COALESCE(SUM(cs.n_total), 1), 1)::FLOAT8,
             1.0
         ) AS avgdl
-    FROM corpus_stats cs
+    FROM @pgkg_schema@.corpus_stats cs
     WHERE cs.kind = CASE p_source
                         WHEN 'propositions' THEN 'proposition'
                         WHEN 'chunks'       THEN 'chunk'
@@ -718,7 +718,7 @@ stats AS (
 -- Document frequency for the query's own terms, summed over the same domains.
 term_df AS (
     SELECT ld.lexeme, SUM(ld.df)::FLOAT8 AS df
-    FROM lexeme_df ld
+    FROM @pgkg_schema@.lexeme_df ld
     CROSS JOIN query_terms qt
     WHERE ld.kind = CASE p_source
                         WHEN 'propositions' THEN 'proposition'
@@ -754,13 +754,13 @@ idf AS (
 -- chunks.retrievable carries.
 candidates AS (
     SELECT p.id AS cand_id, p.tsv AS tsv, p.doc_len AS doc_len
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN query_or
     WHERE p_source = 'propositions'
       AND q_text IS NOT NULL
       AND q_text <> ''
       AND p.namespace = p_namespace
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             p.invalidated_at, p.valid_from, p.valid_to,
             COALESCE(p_valid_at, now())
           )
@@ -771,7 +771,7 @@ candidates AS (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             p.org_id, p.collection_id, p.visibility,
             p.owner_user_id, p.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -780,7 +780,7 @@ candidates AS (
     UNION ALL
 
     SELECT c.id, c.tsv, c.doc_len
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     CROSS JOIN query_or
     WHERE p_source = 'chunks'
       AND q_text IS NOT NULL
@@ -788,7 +788,7 @@ candidates AS (
       AND query_or.q IS NOT NULL
       AND c.tsv @@ query_or.q
       AND c.retrievable
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             c.org_id, c.collection_id, c.visibility,
             c.owner_user_id, c.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -861,7 +861,7 @@ WITH
 -- unrestricted rather than empty.
 primary_space AS (
     SELECT array_agg(oe.generation_id) AS generations
-    FROM org_embedders oe
+    FROM @pgkg_schema@.org_embedders oe
     WHERE oe.role = 'primary'
       AND (p_org_ids IS NULL OR oe.org_id = ANY(p_org_ids))
 )
@@ -873,8 +873,8 @@ SELECT
     (1.0 - sub.distance)::REAL
 FROM (
     (
-    SELECT p.id AS cand_id, (p.embedding <=> q_embedding) AS distance
-    FROM propositions p
+    SELECT p.id AS cand_id, (p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding) AS distance
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN primary_space ps
     WHERE p_source = 'propositions'
       AND q_embedding IS NOT NULL
@@ -884,7 +884,7 @@ FROM (
             ps.generations IS NULL
             OR p.embedder_generation_id = ANY(ps.generations)
           )
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             p.invalidated_at, p.valid_from, p.valid_to,
             COALESCE(p_valid_at, now())
           )
@@ -893,20 +893,20 @@ FROM (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             p.org_id, p.collection_id, p.visibility,
             p.owner_user_id, p.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
           )
-    ORDER BY p.embedding <=> q_embedding
+    ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
     LIMIT k_initial
     )
 
     UNION ALL
 
     (
-    SELECT c.id, (c.embedding <=> q_embedding)
-    FROM chunks c
+    SELECT c.id, (c.embedding OPERATOR(@extschema:vector@.<=>) q_embedding)
+    FROM @pgkg_schema@.chunks c
     CROSS JOIN primary_space ps
     WHERE p_source = 'chunks'
       AND q_embedding IS NOT NULL
@@ -916,12 +916,12 @@ FROM (
             ps.generations IS NULL
             OR c.embedder_generation_id = ANY(ps.generations)
           )
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             c.org_id, c.collection_id, c.visibility,
             c.owner_user_id, c.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
           )
-    ORDER BY c.embedding <=> q_embedding
+    ORDER BY c.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
     LIMIT k_initial
     )
 ) sub
@@ -953,14 +953,14 @@ AS $$
         CASE
             WHEN col.kind = 'corpus' THEN 'corpus'
             WHEN EXISTS (
-                SELECT 1 FROM document_version_chunks dvc
+                SELECT 1 FROM @pgkg_schema@.document_version_chunks dvc
                 WHERE dvc.chunk_id = p.chunk_id
             ) THEN 'corpus'
             ELSE 'memory'
         END,
         p.claim_scope
-    FROM propositions p
-    JOIN collections col ON col.id = p.collection_id
+    FROM @pgkg_schema@.propositions p
+    JOIN @pgkg_schema@.collections col ON col.id = p.collection_id
     WHERE p.id = ANY(p_item_ids)
 
     UNION ALL
@@ -971,8 +971,8 @@ AS $$
         c.collection_id,
         'corpus'::TEXT,
         col.claim_scope
-    FROM chunks c
-    JOIN collections col ON col.id = c.collection_id
+    FROM @pgkg_schema@.chunks c
+    JOIN @pgkg_schema@.collections col ON col.id = c.collection_id
     WHERE c.id = ANY(p_item_ids)
 $$;
 

@@ -79,10 +79,11 @@
 -- The hardening a SECURITY DEFINER function needs.  `SET search_path =
 -- pg_catalog, pg_temp`: nothing the caller can create is on the path, pg_temp
 -- is named last so it is not implicitly searched first, and every pgkg object
--- in the body is named `public.` — the schema 020 grants on.  The helpers that
--- inline into it (pgkg_visible, pgkg_temporal_visible, pgkg_default_org,
--- pgkg_system_org) name only their arguments and pg_catalog, so they parse
--- under that path too; a test calls the function from an empty search_path to
+-- in the body is named with the install schema the runner substitutes (issue
+-- #30) — the schema 020 grants on.  The helpers that inline into it
+-- (pgkg_visible, pgkg_temporal_visible, pgkg_default_org, pgkg_system_org) name
+-- only their arguments, pg_catalog and that schema, so they parse under that
+-- path too; a test calls the function from an empty search_path to
 -- prove it.  The pinned path is acceptable here because this is a set-returning
 -- candidate function, not a predicate meant to inline into a caller's index
 -- condition: it never inlines anyway, being SECURITY DEFINER.  EXECUTE is
@@ -134,12 +135,12 @@ SELECT
     p.proleakproof,
     format('ALTER FUNCTION %I.%s LEAKPROOF', n.nspname, s.sig)
 FROM (VALUES
-    ('ts_match_vq(tsvector,tsquery)',    'keyword'),
-    ('ts_match_qv(tsquery,tsvector)',    'keyword'),
-    ('similarity_op(text,text)',         'gazetteer'),
-    ('arraycontains(anyarray,anyarray)', 'gazetteer')
-) AS s(sig, serves)
-LEFT JOIN pg_proc p ON p.oid = to_regprocedure(s.sig)
+    ('ts_match_vq(tsvector,tsquery)',    'keyword',   'pg_catalog'),
+    ('ts_match_qv(tsquery,tsvector)',    'keyword',   'pg_catalog'),
+    ('similarity_op(text,text)',         'gazetteer', '@extschema:pg_trgm@'),
+    ('arraycontains(anyarray,anyarray)', 'gazetteer', 'pg_catalog')
+) AS s(sig, serves, nsp)
+LEFT JOIN pg_proc p ON p.oid = to_regprocedure(s.nsp || '.' || s.sig)
 LEFT JOIN pg_namespace n ON n.oid = p.pronamespace
 ORDER BY s.serves DESC, s.sig;
 $$;
@@ -156,7 +157,7 @@ RETURNS TABLE (signature TEXT, leakproof BOOLEAN)
 LANGUAGE SQL STABLE
 AS $$
 SELECT s.signature, s.leakproof
-FROM pgkg_leakproof_state() s
+FROM @pgkg_schema@.pgkg_leakproof_state() s
 WHERE s.serves = 'keyword';
 $$;
 
@@ -222,9 +223,9 @@ readable_orgs AS (
     SELECT ARRAY[
         COALESCE(
             NULLIF(pg_catalog.current_setting('pgkg.org_id', TRUE), '')::UUID,
-            public.pgkg_default_org()
+            @pgkg_schema@.pgkg_default_org()
         ),
-        public.pgkg_system_org()
+        @pgkg_schema@.pgkg_system_org()
     ] AS orgs
 ),
 
@@ -256,7 +257,7 @@ stats AS (
             / GREATEST(COALESCE(SUM(cs.n_total), 1), 1)::FLOAT8,
             1.0
         ) AS avgdl
-    FROM public.corpus_stats cs
+    FROM @pgkg_schema@.corpus_stats cs
     CROSS JOIN readable_orgs ro
     WHERE cs.kind = CASE p_source
                         WHEN 'propositions' THEN 'proposition'
@@ -270,7 +271,7 @@ stats AS (
 
 term_df AS (
     SELECT ld.lexeme, SUM(ld.df)::FLOAT8 AS df
-    FROM public.lexeme_df ld
+    FROM @pgkg_schema@.lexeme_df ld
     CROSS JOIN query_terms qt
     CROSS JOIN readable_orgs ro
     WHERE ld.kind = CASE p_source
@@ -300,7 +301,7 @@ idf AS (
 
 candidates AS (
     SELECT p.id AS cand_id, p.tsv AS tsv, p.doc_len AS doc_len
-    FROM public.propositions p
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN query_or
     CROSS JOIN readable_orgs ro
     WHERE p_source = 'propositions'
@@ -308,7 +309,7 @@ candidates AS (
       AND q_text <> ''
       AND p.org_id = ANY(ro.orgs)
       AND p.namespace = p_namespace
-      AND public.pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             p.invalidated_at, p.valid_from, p.valid_to,
             COALESCE(p_valid_at, now())
           )
@@ -319,7 +320,7 @@ candidates AS (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-      AND public.pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             p.org_id, p.collection_id, p.visibility,
             p.owner_user_id, p.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -328,7 +329,7 @@ candidates AS (
     UNION ALL
 
     SELECT c.id, c.tsv, c.doc_len
-    FROM public.chunks c
+    FROM @pgkg_schema@.chunks c
     CROSS JOIN query_or
     CROSS JOIN readable_orgs ro
     WHERE p_source = 'chunks'
@@ -338,7 +339,7 @@ candidates AS (
       AND query_or.q IS NOT NULL
       AND c.tsv @@ query_or.q
       AND c.retrievable
-      AND public.pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             c.org_id, c.collection_id, c.visibility,
             c.owner_user_id, c.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -437,7 +438,7 @@ AS $$
 BEGIN
     RETURN QUERY
     SELECT o.item_id, o.kind, o.rank, o.raw_score
-    FROM public.pgkg_bm25_candidates_as_owner(
+    FROM @pgkg_schema@.pgkg_bm25_candidates_as_owner(
         q_text, p_namespace, p_session_id, k_initial, p_org_ids,
         p_collection_ids, p_user_id, p_acl_groups, p_valid_at, p_source
     ) o;
@@ -469,7 +470,7 @@ CREATE FUNCTION pgkg_bm25_candidates(
 LANGUAGE SQL STABLE
 AS $$
 SELECT b.item_id, b.kind, b.rank, b.raw_score
-FROM public.pgkg_bm25_candidates_under_policy(
+FROM @pgkg_schema@.pgkg_bm25_candidates_under_policy(
     q_text, p_namespace, p_session_id, k_initial, p_org_ids, p_collection_ids,
     p_user_id, p_acl_groups, p_valid_at, p_source
 ) b
@@ -478,7 +479,7 @@ WHERE pg_catalog.current_setting('pgkg.keyword_arm', TRUE) IS DISTINCT FROM 'own
 UNION ALL
 
 SELECT o.item_id, o.kind, o.rank, o.raw_score
-FROM public.pgkg_bm25_candidates_owner_gate(
+FROM @pgkg_schema@.pgkg_bm25_candidates_owner_gate(
     q_text, p_namespace, p_session_id, k_initial, p_org_ids, p_collection_ids,
     p_user_id, p_acl_groups, p_valid_at, p_source
 ) o
@@ -511,11 +512,11 @@ FROM pg_proc p
 JOIN pg_roles r ON r.oid = p.proowner
 CROSS JOIN pg_class c
 WHERE p.oid = to_regprocedure(
-          'public.pgkg_bm25_candidates_as_owner(text, text, text, integer, '
+          '@pgkg_schema@.pgkg_bm25_candidates_as_owner(text, text, text, integer, '
           'uuid[], uuid[], uuid, uuid[], timestamp with time zone, text)')
   AND c.oid IN (
-          to_regclass('public.propositions'), to_regclass('public.chunks'),
-          to_regclass('public.corpus_stats'), to_regclass('public.lexeme_df'));
+          to_regclass('@pgkg_schema@.propositions'), to_regclass('@pgkg_schema@.chunks'),
+          to_regclass('@pgkg_schema@.corpus_stats'), to_regclass('@pgkg_schema@.lexeme_df'));
 $$;
 
 COMMENT ON FUNCTION pgkg_owner_arm_bypasses_policy() IS

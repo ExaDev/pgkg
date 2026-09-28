@@ -55,6 +55,9 @@
 
 -- 1. The declared width of an embedding column.  pgvector stores the dimension
 -- directly in atttypmod; an unconstrained column has -1 and reads as NULL.
+--
+-- An unqualified table name means pgkg's own schema, whatever the caller's
+-- search_path holds (issue #30); a qualified one is taken as written.
 CREATE FUNCTION pgkg_embedding_dim(p_table TEXT, p_column TEXT)
 RETURNS INT
 LANGUAGE SQL
@@ -62,7 +65,11 @@ STABLE
 AS $$
     SELECT NULLIF(a.atttypmod, -1)
     FROM pg_attribute a
-    WHERE a.attrelid = p_table::regclass
+    WHERE a.attrelid = (
+            CASE WHEN strpos(p_table, '.') > 0 THEN p_table
+                 ELSE '@pgkg_schema@.' || p_table
+            END
+          )::regclass
       AND a.attname = p_column
       AND NOT a.attisdropped;
 $$;
@@ -84,7 +91,17 @@ CREATE FUNCTION pgkg_set_embedding_storage(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_dim INT := COALESCE(p_dim, pgkg_embedding_dim(p_table, p_column));
+    v_dim    INT := COALESCE(p_dim, @pgkg_schema@.pgkg_embedding_dim(p_table, p_column));
+    v_table  REGCLASS := (
+        CASE WHEN strpos(p_table, '.') > 0 THEN p_table
+             ELSE '@pgkg_schema@.' || p_table
+        END
+    )::regclass;
+    v_schema NAME := (
+        SELECT n.nspname FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = v_table
+    );
 BEGIN
     IF v_dim IS NULL THEN
         RAISE EXCEPTION
@@ -93,18 +110,19 @@ BEGIN
     END IF;
 
     IF p_index IS NOT NULL THEN
-        EXECUTE format('DROP INDEX IF EXISTS %I', p_index);
+        EXECUTE format('DROP INDEX IF EXISTS %I.%I', v_schema, p_index);
     END IF;
 
     EXECUTE format(
-        'ALTER TABLE %s ALTER COLUMN %I TYPE halfvec(%s) USING %I::halfvec(%s)',
-        p_table::regclass, p_column, v_dim, p_column, v_dim
+        'ALTER TABLE %s ALTER COLUMN %I TYPE @extschema:vector@.halfvec(%s) '
+        'USING %I::@extschema:vector@.halfvec(%s)',
+        v_table, p_column, v_dim, p_column, v_dim
     );
 
     IF p_index IS NOT NULL THEN
         EXECUTE format(
-            'CREATE INDEX %I ON %s USING hnsw (%I halfvec_cosine_ops)',
-            p_index, p_table::regclass, p_column
+            'CREATE INDEX %I ON %s USING hnsw (%I @extschema:vector@.halfvec_cosine_ops)',
+            p_index, v_table, p_column
         );
     END IF;
 END;
@@ -137,9 +155,9 @@ AS $$
 SELECT
     p.id,
     'vec'::TEXT,
-    (ROW_NUMBER() OVER (ORDER BY p.embedding <=> q_embedding))::INT,
-    (1.0 - (p.embedding <=> q_embedding))::REAL
-FROM propositions p
+    (ROW_NUMBER() OVER (ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::INT,
+    (1.0 - (p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::REAL
+FROM @pgkg_schema@.propositions p
 WHERE q_embedding IS NOT NULL
   AND p.embedding IS NOT NULL
   AND p.namespace = p_namespace
@@ -149,7 +167,7 @@ WHERE q_embedding IS NOT NULL
         OR p.session_id = p_session_id
         OR p.session_id IS NULL
       )
-ORDER BY p.embedding <=> q_embedding
+ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
 LIMIT k_initial;
 $$;
 
@@ -172,7 +190,7 @@ DECLARE
 BEGIN
     -- 1. Exact name + type match within namespace
     SELECT id INTO v_id
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE namespace = p_namespace
       AND name = p_name
       AND (type = p_type OR (type IS NULL AND p_type IS NULL))
@@ -185,11 +203,11 @@ BEGIN
     -- 2. Trigram + embedding similarity match
     IF p_embedding IS NOT NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE namespace = p_namespace
-          AND similarity(name, p_name) > 0.6
-          AND (1 - (embedding <=> p_embedding)) > p_threshold
-        ORDER BY (embedding <=> p_embedding)
+          AND @extschema:pg_trgm@.similarity(name, p_name) > 0.6
+          AND (1 - (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)) > p_threshold
+        ORDER BY (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)
         LIMIT 1;
     END IF;
 
@@ -198,7 +216,7 @@ BEGIN
     END IF;
 
     -- 3. Create new entity
-    INSERT INTO entities (name, type, embedding, namespace)
+    INSERT INTO @pgkg_schema@.entities (name, type, embedding, namespace)
     VALUES (p_name, p_type, p_embedding, p_namespace)
     RETURNING id INTO v_id;
 
@@ -241,13 +259,13 @@ WITH
 retrieved AS (
     SELECT
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(q_text, p_namespace, p_session_id, k_initial) b
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(q_text, p_namespace, p_session_id, k_initial) b
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(q_embedding, p_namespace, p_session_id, k_initial) v
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(q_embedding, p_namespace, p_session_id, k_initial) v
         ) AS candidates
 ),
 
@@ -255,16 +273,16 @@ retrieved AS (
 -- fused scores set both the seed-entity ordering and the neighbour floor.
 seeds AS (
     SELECT ARRAY(
-        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
-        FROM retrieved r, pgkg_fuse(r.candidates, rrf_k) f
+        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
+        FROM retrieved r, @pgkg_schema@.pgkg_fuse(r.candidates, rrf_k) f
     ) AS candidates
 ),
 
 expanded AS (
     SELECT ARRAY(
-        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-        FROM pgkg_graph_candidates(
-            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::pgkg_candidate[] END,
+        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+        FROM @pgkg_schema@.pgkg_graph_candidates(
+            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::@pgkg_schema@.pgkg_candidate[] END,
             p_namespace
         ) g
     ) AS candidates
@@ -273,14 +291,14 @@ expanded AS (
 
 fused AS (
     SELECT f.*
-    FROM retrieved r, expanded x, pgkg_fuse(r.candidates || x.candidates, rrf_k) f
+    FROM retrieved r, expanded x, @pgkg_schema@.pgkg_fuse(r.candidates || x.candidates, rrf_k) f
 ),
 
 profiled AS (
     SELECT ap.*
-    FROM pgkg_apply_profile(
+    FROM @pgkg_schema@.pgkg_apply_profile(
         ARRAY(
-            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
+            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
             FROM fused f
         ),
         recency_half_life_days
@@ -290,7 +308,7 @@ profiled AS (
 SELECT
     fused.item_id,
     p.text,
-    p.embedding::vector,
+    p.embedding::@extschema:vector@.vector,
     fused.fused_score,
     profiled.adjusted_score,
     CASE
@@ -305,7 +323,7 @@ SELECT
     p.object_id,
     p.asserted_at
 FROM fused
-JOIN propositions p ON p.id = fused.item_id
+JOIN @pgkg_schema@.propositions p ON p.id = fused.item_id
 JOIN profiled ON profiled.item_id = fused.item_id
 ORDER BY profiled.adjusted_score DESC
 LIMIT k_retrieve;

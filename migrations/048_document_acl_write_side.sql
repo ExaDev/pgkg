@@ -67,7 +67,7 @@ CREATE FUNCTION pgkg_acl_bounded(p_collection_id UUID) RETURNS BOOLEAN
 LANGUAGE SQL STABLE
 AS $$
     SELECT NOT EXISTS (
-        SELECT 1 FROM collections c
+        SELECT 1 FROM @pgkg_schema@.collections c
         WHERE c.id = p_collection_id
           AND c.acl_mode = 'none'
     )
@@ -93,7 +93,7 @@ BEGIN
     INTO v_id, v_collection
     FROM new_rows n
     WHERE n.acl_group_id IS NULL
-      AND pgkg_acl_bounded(n.collection_id)
+      AND @pgkg_schema@.pgkg_acl_bounded(n.collection_id)
     LIMIT 1;
 
     IF v_id IS NOT NULL THEN
@@ -111,7 +111,7 @@ CREATE FUNCTION pgkg_acl_group_kept() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF pgkg_acl_bounded(NEW.collection_id) THEN
+    IF @pgkg_schema@.pgkg_acl_bounded(NEW.collection_id) THEN
         RAISE EXCEPTION
             'collection % is ACL-bounded, so %.% must name an acl_group_id: '
             'a row with none is visible to every caller of the tenant',
@@ -189,7 +189,7 @@ AS $$
 DECLARE
     v_job UUID;
 BEGIN
-    INSERT INTO ingest_jobs
+    INSERT INTO @pgkg_schema@.ingest_jobs
         (org_id, collection_id, external_id, content_hash, payload, uri,
          source, asserted_at, provenance, acl_group_id)
     VALUES (p_org_id, p_collection_id, p_external_id, p_content_hash,
@@ -202,7 +202,7 @@ BEGIN
 
     IF v_job IS NULL THEN
         SELECT j.id INTO v_job
-        FROM ingest_jobs j
+        FROM @pgkg_schema@.ingest_jobs j
         WHERE j.org_id = p_org_id
           AND j.collection_id = p_collection_id
           AND j.external_id = p_external_id
@@ -237,7 +237,7 @@ LANGUAGE SQL
 AS $$
     WITH claimable AS (
         SELECT j.id
-        FROM ingest_jobs j
+        FROM @pgkg_schema@.ingest_jobs j
         WHERE (p_org_id IS NULL OR j.org_id = p_org_id)
           AND (j.status = 'pending'
                OR (j.status = 'running'
@@ -246,7 +246,7 @@ AS $$
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     )
-    UPDATE ingest_jobs j
+    UPDATE @pgkg_schema@.ingest_jobs j
     SET status = 'running',
         attempts = j.attempts + 1,
         started_at = COALESCE(j.started_at, now()),

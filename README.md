@@ -479,6 +479,8 @@ Every variable takes the `PGKG_` prefix — `PGKG_EMBED_MODEL`, not `EMBED_MODEL
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PGKG_DATABASE_URL` | (unset) | Postgres connection string. **When unset, pgkg starts an embedded Postgres via `pgserver` — no Docker.** Set it to point at an external instance. |
+| `PGKG_DB_SCHEMA` | `public` | The schema `pgkg migrate` installs into and the application pool queries. See [Installing into a schema of your own](#installing-into-a-schema-of-your-own). |
+| `PGKG_EXTENSION_SCHEMA` | `public` | Where `pgkg migrate` creates `vector`, `pg_trgm` and `pgcrypto` if the database does not have them yet. An extension already installed is used wherever it is. |
 | `PGKG_EMBED_MODEL` | `BAAI/bge-m3` | HuggingFace sentence-transformer model for embeddings |
 | `PGKG_RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | HuggingFace cross-encoder for reranking |
 | `PGKG_LLM_PROVIDER` | `openai` | One of `openai`, `anthropic`, `ollama`, `claude_code` (local dev only — requires the `claude` CLI) |
@@ -654,6 +656,46 @@ owner arm is selected but is still under the policy, and
 Prefer the superuser fix wherever it is available. The opt-in is a second copy of the policies, and
 any future change to them has to be made in both places.
 
+### Installing into a schema of your own
+
+pgkg can live next to a host application's tables, in a schema of its own, without that schema on
+anyone's `search_path`:
+
+```bash
+PGKG_DATABASE_URL=postgresql://... PGKG_DB_SCHEMA=pgkg PGKG_EXTENSION_SCHEMA=extensions pgkg migrate
+```
+
+The runner creates the schema if it is missing, and the extension schema only if an extension
+still has to be created in it. It keeps `pgkg_schema_migrations` in the install schema, grants
+`pgkg_app` usage of it, and grants `pgkg_app` — not `PUBLIC` — `USAGE` on every schema an extension
+lives in, since a schema an operator creates grants nothing. Schema names must be plain lower-case
+identifiers that are not reserved words and do not start with `pg_`. A schema that already holds
+pgkg's tables but no `pgkg_schema_migrations` is refused rather than migrated from 001: record the
+migrations it has had in that table first.
+
+Every reference inside a function, trigger or policy body is schema-qualified, so those bodies work
+whatever the caller's `search_path` holds — an RLS policy inlines `pgkg.pgkg_current_org()` and a
+trigger writes `pgkg.corpus_stats` for a caller whose path is `''`. Extension objects are qualified
+too, operators included (`OPERATOR(extensions.<=>)`), with the schema each extension actually lives
+in. The bodies are qualified rather than given `SET search_path`, because a function carrying a
+`SET` clause is never inlined: the visibility predicate would stop being an index condition and
+become a per-row call. Migration files spell the schemas `@pgkg_schema@` and
+`@extschema:vector@` (PostgreSQL's own spelling for extension scripts), and `pgkg migrate`
+substitutes them; run the files through it rather than through `psql`.
+
+The application's own queries are unqualified: its pool sets `search_path` to `PGKG_DB_SCHEMA`
+followed by the extensions' schemas, as a startup option so it survives asyncpg's `RESET ALL`. That
+startup option overrides any `search_path` set on the role or the database (`ALTER ROLE ... SET`,
+`ALTER DATABASE ... SET`) for the application's connections. A host calling pgkg's SQL functions
+directly should qualify them (`pgkg.pgkg_retrieve(...)`) or put the schema on its own path.
+
+The extension schemas are written into the function bodies when each migration is applied, so an
+install is pinned to where its extensions were then. `ALTER EXTENSION ... SET SCHEMA` afterwards
+breaks every body that names the old schema; move an extension before installing pgkg, not after.
+
+An existing install in `public` needs nothing: its function bodies predate the qualification and
+keep resolving through `public` on the path, as before.
+
 ### Development mode
 
 The suite runs against a real Postgres — every assertion goes through SQL, because that is where the
@@ -667,7 +709,9 @@ PGKG_OFFLINE_EXTRACT=1 uv run --python 3.12 pytest -q
 ```
 
 `PGKG_OFFLINE_EXTRACT=1` replaces every LLM call with deterministic dummy extraction, so no keys
-are needed. Note that the suite connects as the container's owning superuser, for whom every RLS
+are needed. The suite installs into `PGKG_DB_SCHEMA` exactly as `pgkg migrate` would, so
+`PGKG_DB_SCHEMA=pgkg_host PGKG_EXTENSION_SCHEMA=pgkg_ext` runs it against a vendored install; CI
+does both. Note that the suite connects as the container's owning superuser, for whom every RLS
 policy is inert: an isolation test has to `SET LOCAL ROLE pgkg_app` **inside a transaction** to
 exercise the policy rather than just the SQL predicate.
 
@@ -804,6 +848,7 @@ pgkg/
 ├── pgkg/                       # Python package
 │   ├── config.py               # Settings (pydantic) + the embedder registry readers
 │   ├── db.py                   # asyncpg pool, pgvector codec, iterative scan
+│   ├── migrate.py              # The migration runner and its schema placeholders
 │   ├── embedded.py             # Embedded Postgres via pgserver (no Docker)
 │   ├── chunking.py             # Content-defined chunk boundaries
 │   ├── memory.py               # Scope, chat ingest, recall, forget, believed_at
@@ -825,7 +870,7 @@ pgkg/
 │   └── test_*.py               # One module per subject
 │
 ├── bench/                      # LoCoMo and LongMemEval harnesses
-├── scripts/run_migrations.py   # Apply .sql migrations to the database
+├── scripts/run_migrations.py   # The same runner as `pgkg migrate`, against DATABASE_URL
 ├── Dockerfile                  # Multi-stage build (builder + runtime)
 ├── docker-compose.yml          # Postgres (pgvector) + FastAPI app
 ├── Makefile                    # Common tasks (up, down, test, smoke, psql)

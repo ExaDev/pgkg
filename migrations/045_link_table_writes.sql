@@ -178,9 +178,9 @@ AS $$
     SELECT (p_document_id IS NULL AND NOT p_version_scoped)
         OR EXISTS (
             SELECT 1
-            FROM document_version_chunks dvc
-            JOIN document_versions dv ON dv.id = dvc.document_version_id
-            JOIN documents d ON d.id = dv.document_id
+            FROM @pgkg_schema@.document_version_chunks dvc
+            JOIN @pgkg_schema@.document_versions dv ON dv.id = dvc.document_version_id
+            JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
             WHERE dvc.chunk_id = p_chunk_id
               AND dv.status = 'current'
               AND d.deleted_at IS NULL
@@ -211,20 +211,20 @@ WITH target AS (
            c.retrievable   AS was_retrievable,
            c.version_scoped AS was_scoped,
            c.version_scoped OR EXISTS (
-               SELECT 1 FROM document_version_chunks dvc
+               SELECT 1 FROM @pgkg_schema@.document_version_chunks dvc
                WHERE dvc.chunk_id = c.id
            ) AS scoped
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.id = ANY(p_chunk_ids)
 ),
 decided AS (
     SELECT t.*,
-           pgkg_chunk_retrievable(t.id, t.document_id, t.scoped)
+           @pgkg_schema@.pgkg_chunk_retrievable(t.id, t.document_id, t.scoped)
                AS is_retrievable
     FROM target t
 ),
 marked AS (
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET retrievable    = d.is_retrievable,
         version_scoped = d.scoped
     FROM decided d
@@ -239,7 +239,7 @@ flipped AS (
     WHERE d.is_retrievable IS DISTINCT FROM d.was_retrievable
 ),
 totals AS (
-    INSERT INTO corpus_stats AS cs
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', f.org_id, f.collection_id,
            SUM(f.delta_sign), SUM(f.delta_sign * f.doc_len)
@@ -251,7 +251,7 @@ totals AS (
             updated_at = now()
     RETURNING 1
 )
-INSERT INTO lexeme_df AS ld
+INSERT INTO @pgkg_schema@.lexeme_df AS ld
     (kind, namespace, lexeme, org_id, collection_id, df)
 SELECT 'chunk', '', u.lexeme, f.org_id, f.collection_id, SUM(f.delta_sign)
 FROM flipped f, unnest(f.tsv) AS u(lexeme, positions, weights)
@@ -284,20 +284,20 @@ BEGIN
         RETURN NULL;
     END IF;
 
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET refcount = counted.links
     FROM (
         SELECT c2.id,
                (SELECT count(*)::INT
-                FROM document_version_chunks dvc
+                FROM @pgkg_schema@.document_version_chunks dvc
                 WHERE dvc.chunk_id = c2.id) AS links
-        FROM chunks c2
+        FROM @pgkg_schema@.chunks c2
         WHERE c2.id = ANY(v_ids)
     ) counted
     WHERE c.id = counted.id
       AND c.refcount IS DISTINCT FROM counted.links;
 
-    PERFORM pgkg_chunk_retrievability_sync(v_ids);
+    PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync(v_ids);
 
     RETURN NULL;
 END;
@@ -322,42 +322,42 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET version_scoped = TRUE
     WHERE NOT c.version_scoped
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
       AND EXISTS (
-          SELECT 1 FROM document_version_chunks dvc WHERE dvc.chunk_id = c.id
+          SELECT 1 FROM @pgkg_schema@.document_version_chunks dvc WHERE dvc.chunk_id = c.id
       );
 
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET retrievable =
-            pgkg_chunk_retrievable(c.id, c.document_id, c.version_scoped)
+            @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.document_id, c.version_scoped)
     WHERE (p_collection_id IS NULL OR c.collection_id = p_collection_id)
       AND c.retrievable IS DISTINCT FROM
-          pgkg_chunk_retrievable(c.id, c.document_id, c.version_scoped);
+          @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.document_id, c.version_scoped);
 
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL OR collection_id = p_collection_id);
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL OR collection_id = p_collection_id);
 
-    INSERT INTO corpus_stats
+    INSERT INTO @pgkg_schema@.corpus_stats
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', c.org_id, c.collection_id,
            COUNT(*), COALESCE(SUM(c.doc_len), 0)
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.retrievable
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
     GROUP BY c.org_id, c.collection_id;
 
-    INSERT INTO lexeme_df
+    INSERT INTO @pgkg_schema@.lexeme_df
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'chunk', '', u.lexeme, c.org_id, c.collection_id, COUNT(*)
-    FROM chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
+    FROM @pgkg_schema@.chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
     WHERE c.retrievable
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
     GROUP BY u.lexeme, c.org_id, c.collection_id;

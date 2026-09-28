@@ -15,6 +15,8 @@ from datetime import datetime, timedelta, timezone
 import asyncpg
 import pytest
 
+from pgkg.migrate import render_for
+
 MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
 PRE_REFACTOR_MIGRATION = MIGRATIONS_DIR / "009_query_decomposition.sql"
 
@@ -550,7 +552,8 @@ async def test_apply_profile_clamps_extreme_age(pool: asyncpg.Pool) -> None:
 
 async def _install_pre_refactor_search(conn: asyncpg.Connection) -> None:
     """Instantiate migration 009's monolith as pgkg_search_pre010()."""
-    source = PRE_REFACTOR_MIGRATION.read_text()
+    schema = await conn.fetchval("SELECT current_schema()")
+    source = await render_for(conn, PRE_REFACTOR_MIGRATION.read_text(), schema=schema)
     assert "FUNCTION pgkg_search(" in source
     await conn.execute(source.replace("FUNCTION pgkg_search(", "FUNCTION pgkg_search_pre010("))
 

@@ -6,17 +6,12 @@ to testcontainers (Docker).
 from __future__ import annotations
 
 import os
-import pathlib
 import tempfile
 from contextlib import contextmanager
 from typing import AsyncGenerator
 
 import asyncpg
 import pytest
-from pgvector.asyncpg import register_vector
-
-MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
-
 
 REQUIRED_EXTENSIONS = ("vector", "pg_trgm", "pgcrypto")
 
@@ -125,36 +120,43 @@ def fresh_cluster_dsn():
 
 
 @pytest.fixture(scope="session")
-async def pool(pg_dsn) -> AsyncGenerator[asyncpg.Pool, None]:
-    """Asyncpg pool pointing at the test database with all migrations applied."""
-    # Apply migrations first — the vector extension must exist before
-    # register_vector can be called in the pool's init callback.
+def pgkg_schema() -> str:
+    """The schema the suite installs pgkg into: PGKG_DB_SCHEMA, as in production.
+
+    CI runs the suite twice, once in public and once with PGKG_DB_SCHEMA and
+    PGKG_EXTENSION_SCHEMA pointing elsewhere, which is the install a host
+    application vendoring pgkg makes (issue #30).
+    """
+    from pgkg.config import get_settings
+
+    return get_settings().db_schema
+
+
+@pytest.fixture(scope="session")
+async def pool(pg_dsn, pgkg_schema) -> AsyncGenerator[asyncpg.Pool, None]:
+    """Asyncpg pool pointing at the test database with all migrations applied.
+
+    Migrated by the runner `pgkg migrate` uses and pooled by the function the
+    application pools with, so the suite exercises the install and the
+    connection settings production gets: the search_path that finds pgkg's
+    schema, the vector codec registered against the extension's schema, and
+    the iterative HNSW scan a scoped vector search needs (ADR 0001, D3).
+    """
+    from pgkg.config import get_settings
+    from pgkg.db import make_pool
+    from pgkg.migrate import apply_migrations
+
     migrate_conn = await asyncpg.connect(pg_dsn)
     try:
-        for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
-            await migrate_conn.execute(migration.read_text())
+        await apply_migrations(
+            migrate_conn,
+            schema=pgkg_schema,
+            extension_schema=get_settings().extension_schema,
+        )
     finally:
         await migrate_conn.close()
 
-    # Now create the pool the way production means to create it.  The codec
-    # registration is only half of it: a scoped vector search over an HNSW
-    # index under-returns rather than erroring unless the scan is iterative
-    # (ADR 0001, D3), so a suite whose pool leaves that off is not exercising
-    # the search the product performs.
-    #
-    # Set at connection startup, not from the pool's init callback: asyncpg
-    # runs RESET ALL when a connection goes back to the pool, so a plain SET
-    # survives exactly one acquire.  A startup option becomes the session
-    # default and RESET ALL restores it.
-    from pgkg.db import _ITERATIVE_SCAN
-
-    conn_pool = await asyncpg.create_pool(
-        pg_dsn,
-        min_size=1,
-        max_size=5,
-        init=lambda conn: register_vector(conn),
-        server_settings={"hnsw.iterative_scan": _ITERATIVE_SCAN},
-    )
+    conn_pool = await make_pool(pg_dsn, schema=pgkg_schema, max_size=5)
 
     yield conn_pool
     await conn_pool.close()

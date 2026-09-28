@@ -74,7 +74,7 @@ corpus_stats AS (
     SELECT
         GREATEST(COUNT(*), 1)::FLOAT8              AS n_total,
         GREATEST(AVG(length(p.tsv)), 1.0)::FLOAT8  AS avgdl
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.namespace = p_namespace
       AND p.superseded_by IS NULL
 ),
@@ -84,7 +84,7 @@ doc_freq AS (
         ql.lexeme,
         (
             SELECT COUNT(*)::FLOAT8
-            FROM propositions p
+            FROM @pgkg_schema@.propositions p
             WHERE p.tsv @@ to_tsquery('simple', ql.lexeme)
               AND p.namespace = p_namespace
               AND p.superseded_by IS NULL
@@ -119,7 +119,7 @@ FROM (
             JOIN idf i ON i.lexeme = u.lexeme
             CROSS JOIN corpus_stats cs
         ) AS bm25_score
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN query_or
     WHERE q_text IS NOT NULL
       AND q_text <> ''
@@ -157,9 +157,9 @@ AS $$
 SELECT
     p.id,
     'vec'::TEXT,
-    (ROW_NUMBER() OVER (ORDER BY p.embedding <=> q_embedding))::INT,
-    (1.0 - (p.embedding <=> q_embedding))::REAL
-FROM propositions p
+    (ROW_NUMBER() OVER (ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::INT,
+    (1.0 - (p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::REAL
+FROM @pgkg_schema@.propositions p
 WHERE q_embedding IS NOT NULL
   AND p.embedding IS NOT NULL
   AND p.namespace = p_namespace
@@ -169,7 +169,7 @@ WHERE q_embedding IS NOT NULL
         OR p.session_id = p_session_id
         OR p.session_id IS NULL
       )
-ORDER BY p.embedding <=> q_embedding
+ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
 LIMIT k_initial;
 $$;
 
@@ -211,14 +211,14 @@ seed_entities AS (
         FROM (
             SELECT p.subject_id AS entity_id, s.score
             FROM seeds s
-            JOIN propositions p ON p.id = s.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = s.prop_id
             WHERE p.subject_id IS NOT NULL
 
             UNION ALL
 
             SELECT p.object_id AS entity_id, s.score
             FROM seeds s
-            JOIN propositions p ON p.id = s.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = s.prop_id
             WHERE p.object_id IS NOT NULL
         ) combined
         GROUP BY entity_id
@@ -237,10 +237,10 @@ per_seed AS (
             ORDER BY COALESCE(e.weight, 0.0) DESC, np.id
         ) AS seed_rank
     FROM seed_entities se
-    JOIN edges e
+    JOIN @pgkg_schema@.edges e
       ON e.src_entity = se.entity_id
       OR e.dst_entity = se.entity_id
-    JOIN propositions np ON np.id = e.proposition_id
+    JOIN @pgkg_schema@.propositions np ON np.id = e.proposition_id
     WHERE np.superseded_by IS NULL
       AND np.namespace = p_namespace
       AND NOT EXISTS (SELECT 1 FROM seeds s WHERE s.prop_id = np.id)
@@ -329,7 +329,7 @@ SELECT
         0.0
     ) AS REAL)
 FROM unnest(p_scored) AS c(item_id, kind, cand_rank, raw_score)
-JOIN propositions p ON p.id = c.item_id;
+JOIN @pgkg_schema@.propositions p ON p.id = c.item_id;
 $$;
 
 
@@ -367,13 +367,13 @@ WITH
 retrieved AS (
     SELECT
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(q_text, p_namespace, p_session_id, k_initial) b
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(q_text, p_namespace, p_session_id, k_initial) b
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(q_embedding, p_namespace, p_session_id, k_initial) v
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(q_embedding, p_namespace, p_session_id, k_initial) v
         ) AS candidates
 ),
 
@@ -381,16 +381,16 @@ retrieved AS (
 -- fused scores set both the seed-entity ordering and the neighbour floor.
 seeds AS (
     SELECT ARRAY(
-        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
-        FROM retrieved r, pgkg_fuse(r.candidates, rrf_k) f
+        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
+        FROM retrieved r, @pgkg_schema@.pgkg_fuse(r.candidates, rrf_k) f
     ) AS candidates
 ),
 
 expanded AS (
     SELECT ARRAY(
-        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-        FROM pgkg_graph_candidates(
-            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::pgkg_candidate[] END,
+        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+        FROM @pgkg_schema@.pgkg_graph_candidates(
+            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::@pgkg_schema@.pgkg_candidate[] END,
             p_namespace
         ) g
     ) AS candidates
@@ -399,14 +399,14 @@ expanded AS (
 
 fused AS (
     SELECT f.*
-    FROM retrieved r, expanded x, pgkg_fuse(r.candidates || x.candidates, rrf_k) f
+    FROM retrieved r, expanded x, @pgkg_schema@.pgkg_fuse(r.candidates || x.candidates, rrf_k) f
 ),
 
 profiled AS (
     SELECT ap.*
-    FROM pgkg_apply_profile(
+    FROM @pgkg_schema@.pgkg_apply_profile(
         ARRAY(
-            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
+            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
             FROM fused f
         ),
         recency_half_life_days
@@ -431,7 +431,7 @@ SELECT
     p.object_id,
     p.asserted_at
 FROM fused
-JOIN propositions p ON p.id = fused.item_id
+JOIN @pgkg_schema@.propositions p ON p.id = fused.item_id
 JOIN profiled ON profiled.item_id = fused.item_id
 ORDER BY profiled.adjusted_score DESC
 LIMIT k_retrieve;

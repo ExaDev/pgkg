@@ -156,7 +156,7 @@ async def test_query_embedding_parameter_is_an_unmodified_halfvec(
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE p.proname = $1
-              AND n.nspname = 'public'
+              AND n.nspname = current_schema()
             """,
             function_name,
         )
@@ -347,6 +347,34 @@ async def test_helper_converts_a_column_at_another_width(pool: asyncpg.Pool) -> 
     assert index["amname"] == "hnsw"
     assert index["opcname"] == "halfvec_cosine_ops"
     assert preserved == "[1,0,0,0,0,0,0,0]"
+
+
+async def test_the_helpers_take_a_schema_qualified_table_too(
+    pool: asyncpg.Pool, pgkg_schema: str
+) -> None:
+    """An unqualified name means pgkg's schema, whatever the caller's path;
+    a qualified one means what it says, and is not prefixed a second time."""
+    table = f"pgkg_dimprobe_{uuid.uuid4().hex[:8]}"
+    qualified = f"{pgkg_schema}.{table}"
+    async with pool.acquire() as conn:
+        await conn.execute(f"CREATE TABLE {qualified} (id INT PRIMARY KEY, vec vector(8))")
+        try:
+            await conn.execute(
+                "SELECT pgkg_set_embedding_storage($1, 'vec', $2)",
+                qualified,
+                f"{table}_vec_idx",
+            )
+            dim = await conn.fetchval("SELECT pgkg_embedding_dim($1, 'vec')", qualified)
+            qualified_propositions = await conn.fetchval(
+                "SELECT pgkg_embedding_dim($1, 'embedding')",
+                f"{pgkg_schema}.propositions",
+            )
+            unqualified_propositions = await embedding_dim(conn)
+        finally:
+            await conn.execute(f"DROP TABLE {qualified}")
+
+    assert dim == 8
+    assert qualified_propositions == unqualified_propositions == 1024
 
 
 async def test_helper_requires_a_dimension_when_the_column_declares_none(

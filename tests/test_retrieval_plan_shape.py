@@ -238,7 +238,7 @@ async def test_no_retrieval_function_tests_liveness_by_calling_a_function(
                 """
                 SELECT p.proname
                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                WHERE n.nspname = 'public'
+                WHERE n.nspname = current_schema()
                   AND p.proname = ANY($1::text[])
                   AND p.prosrc ILIKE '%pgkg_chunk_live%'
                 """,

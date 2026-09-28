@@ -789,7 +789,7 @@ async def test_chunks_carries_no_parent_pointer_at_all(
         bodies = await conn.fetch(
             "SELECT p.proname, pg_get_functiondef(p.oid) AS src FROM pg_proc p"
             " JOIN pg_namespace n ON n.oid = p.pronamespace"
-            " WHERE n.nspname = 'public' AND p.proname LIKE 'pgkg%'"
+            " WHERE n.nspname = current_schema() AND p.proname LIKE 'pgkg%'"
         )
 
     chunk_alias = re.compile(

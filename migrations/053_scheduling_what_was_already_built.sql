@@ -130,7 +130,7 @@ BEGIN
     SELECT array_agg(pending.id) INTO v_ids
     FROM (
         SELECT e.id
-        FROM entities e
+        FROM @pgkg_schema@.entities e
         WHERE e.org_id = p_org_id
           AND e.mentions_matched_at IS NULL
         ORDER BY e.created_at, e.id
@@ -143,11 +143,11 @@ BEGIN
         RETURN;
     END IF;
 
-    v_added := pgkg_match_chunk_mentions(
+    v_added := @pgkg_schema@.pgkg_match_chunk_mentions(
         v_ids, p_max_chunks, p_max_words, p_threshold
     );
 
-    UPDATE entities SET mentions_matched_at = now()
+    UPDATE @pgkg_schema@.entities SET mentions_matched_at = now()
     WHERE id = ANY(v_ids)
       AND mentions_matched_at IS NULL;
 
@@ -177,7 +177,7 @@ CREATE FUNCTION pgkg_contradict_superseded(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_org        UUID := COALESCE(p_org_id, pgkg_current_org());
+    v_org        UUID := COALESCE(p_org_id, @pgkg_schema@.pgkg_current_org());
     v_candidate  RECORD;
     v_considered BIGINT := 0;
     v_closed     BIGINT := 0;
@@ -185,8 +185,8 @@ BEGIN
     FOR v_candidate IN
         SELECT stale.id AS id,
                COALESCE(fresh.valid_from, fresh.recorded_at) AS effective
-        FROM propositions stale
-        JOIN propositions fresh ON fresh.id = stale.superseded_by
+        FROM @pgkg_schema@.propositions stale
+        JOIN @pgkg_schema@.propositions fresh ON fresh.id = stale.superseded_by
         WHERE stale.org_id = v_org
           AND fresh.org_id = stale.org_id
           -- 021: `superseded_by = id` was the old retirement idiom, "replaced
@@ -210,7 +210,7 @@ BEGIN
     LOOP
         v_considered := v_considered + 1;
         v_closed := v_closed
-                  + pgkg_contradict(v_candidate.id, v_candidate.effective);
+                  + @pgkg_schema@.pgkg_contradict(v_candidate.id, v_candidate.effective);
     END LOOP;
 
     RETURN QUERY SELECT v_considered, v_closed;
@@ -241,7 +241,7 @@ DECLARE
     affected BIGINT;
 BEGIN
     WITH withdrawn AS (
-        UPDATE propositions p
+        UPDATE @pgkg_schema@.propositions p
         SET invalidated_at = now(),
             invalidation_reason = 'ttl'
         WHERE p.invalidated_at IS NULL
@@ -277,7 +277,7 @@ LANGUAGE SQL
 AS $$
     SELECT pg_try_advisory_lock(
         hashtext('pgkg_maintenance'),
-        hashtext(p_task || ':' || COALESCE(p_org_id, pgkg_current_org())::TEXT)
+        hashtext(p_task || ':' || COALESCE(p_org_id, @pgkg_schema@.pgkg_current_org())::TEXT)
     )
 $$;
 
@@ -288,7 +288,7 @@ LANGUAGE SQL
 AS $$
     SELECT pg_advisory_unlock(
         hashtext('pgkg_maintenance'),
-        hashtext(p_task || ':' || COALESCE(p_org_id, pgkg_current_org())::TEXT)
+        hashtext(p_task || ':' || COALESCE(p_org_id, @pgkg_schema@.pgkg_current_org())::TEXT)
     )
 $$;
 

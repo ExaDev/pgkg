@@ -12,15 +12,15 @@ DECLARE
     iter     INT;
 BEGIN
     -- Count entities in namespace
-    SELECT COUNT(*) INTO n FROM entities WHERE namespace = p_namespace;
+    SELECT COUNT(*) INTO n FROM @pgkg_schema@.entities WHERE namespace = p_namespace;
     IF n = 0 THEN RETURN; END IF;
 
     base := (1.0 - damping) / n;
 
     -- Initialise / reset scores uniformly
-    INSERT INTO entity_pagerank (entity_id, score, computed_at)
+    INSERT INTO @pgkg_schema@.entity_pagerank (entity_id, score, computed_at)
     SELECT id, 1.0 / n, now()
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE namespace = p_namespace
     ON CONFLICT (entity_id) DO UPDATE
         SET score = EXCLUDED.score,
@@ -28,30 +28,30 @@ BEGIN
 
     -- Power iterations
     FOR iter IN 1 .. iterations LOOP
-        UPDATE entity_pagerank ep
+        UPDATE @pgkg_schema@.entity_pagerank ep
         SET score = base + damping * (
             SELECT COALESCE(SUM(ep2.score * e.weight / out_deg.total), 0.0)
-            FROM edges e
-            JOIN entity_pagerank ep2 ON ep2.entity_id = e.src_entity
-            JOIN entities src_ent   ON src_ent.id = e.src_entity
+            FROM @pgkg_schema@.edges e
+            JOIN @pgkg_schema@.entity_pagerank ep2 ON ep2.entity_id = e.src_entity
+            JOIN @pgkg_schema@.entities src_ent   ON src_ent.id = e.src_entity
                                    AND src_ent.namespace = p_namespace
             JOIN (
                 SELECT src_entity, SUM(weight) AS total
-                FROM edges
+                FROM @pgkg_schema@.edges
                 GROUP BY src_entity
             ) out_deg ON out_deg.src_entity = e.src_entity
             WHERE e.dst_entity = ep.entity_id
         )
         WHERE ep.entity_id IN (
-            SELECT id FROM entities WHERE namespace = p_namespace
+            SELECT id FROM @pgkg_schema@.entities WHERE namespace = p_namespace
         );
     END LOOP;
 
     -- Stamp computation time
-    UPDATE entity_pagerank ep
+    UPDATE @pgkg_schema@.entity_pagerank ep
     SET computed_at = now()
     WHERE ep.entity_id IN (
-        SELECT id FROM entities WHERE namespace = p_namespace
+        SELECT id FROM @pgkg_schema@.entities WHERE namespace = p_namespace
     );
 END;
 $$;

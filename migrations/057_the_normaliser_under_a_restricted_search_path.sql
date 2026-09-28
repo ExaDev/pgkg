@@ -22,7 +22,8 @@
 --
 -- WHY QUALIFIED AND NOT `SET search_path`.  A SQL function with a SET clause is
 -- never inlined, and these are the functions the gazetteer's phrase side calls
--- per candidate phrase.  `public.` is the schema every migration assumes today.
+-- per candidate phrase.  The qualifier is the install schema, substituted by
+-- the runner (issue #30).
 --
 -- The bodies are 040's, character for character but for the qualification.
 -- CREATE OR REPLACE keeps the function's OID, so the generated columns that
@@ -37,8 +38,8 @@ CREATE OR REPLACE FUNCTION pgkg_gazetteer_keys(p_texts TEXT[]) RETURNS TEXT[]
 LANGUAGE SQL IMMUTABLE STRICT PARALLEL SAFE
 AS $$
     SELECT ARRAY(
-        SELECT public.pgkg_gazetteer_key(t)
+        SELECT @pgkg_schema@.pgkg_gazetteer_key(t)
         FROM unnest(p_texts) AS t
-        WHERE length(public.pgkg_gazetteer_key(t)) >= 3
+        WHERE length(@pgkg_schema@.pgkg_gazetteer_key(t)) >= 3
     )
 $$;

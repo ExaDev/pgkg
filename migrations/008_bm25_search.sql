@@ -61,7 +61,7 @@ corpus_stats AS (
     SELECT
         GREATEST(COUNT(*), 1)::FLOAT8              AS n_total,
         GREATEST(AVG(length(p.tsv)), 1.0)::FLOAT8  AS avgdl
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.namespace = p_namespace
       AND p.superseded_by IS NULL
 ),
@@ -73,7 +73,7 @@ doc_freq AS (
         ql.lexeme,
         (
             SELECT COUNT(*)::FLOAT8
-            FROM propositions p
+            FROM @pgkg_schema@.propositions p
             WHERE p.tsv @@ to_tsquery('simple', ql.lexeme)
               AND p.namespace = p_namespace
               AND p.superseded_by IS NULL
@@ -112,7 +112,7 @@ kw AS (
                 JOIN idf i ON i.lexeme = u.lexeme
                 CROSS JOIN corpus_stats cs
             ) AS bm25_score
-        FROM propositions p
+        FROM @pgkg_schema@.propositions p
         WHERE q_text IS NOT NULL
           AND q_text <> ''
           AND p.namespace = p_namespace
@@ -134,9 +134,9 @@ vec AS (
     SELECT
         p.id AS prop_id,
         ROW_NUMBER() OVER (
-            ORDER BY p.embedding <=> q_embedding
+            ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
         )    AS rank
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE q_embedding IS NOT NULL
       AND p.embedding IS NOT NULL
       AND p.namespace = p_namespace
@@ -146,7 +146,7 @@ vec AS (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-    ORDER BY p.embedding <=> q_embedding
+    ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
     LIMIT k_initial
 ),
 
@@ -172,14 +172,14 @@ seed_entities AS (
         FROM (
             SELECT p.subject_id AS entity_id, f.rrf_score
             FROM fused f
-            JOIN propositions p ON p.id = f.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = f.prop_id
             WHERE p.subject_id IS NOT NULL
 
             UNION ALL
 
             SELECT p.object_id AS entity_id, f.rrf_score
             FROM fused f
-            JOIN propositions p ON p.id = f.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = f.prop_id
             WHERE p.object_id IS NOT NULL
         ) combined
         GROUP BY entity_id
@@ -197,8 +197,8 @@ neighbor_props AS (
         AS REAL)                                                       AS rrf_score,
         FALSE                                                          AS in_kw,
         FALSE                                                          AS in_vec
-    FROM edges e
-    JOIN propositions np ON np.id = e.proposition_id
+    FROM @pgkg_schema@.edges e
+    JOIN @pgkg_schema@.propositions np ON np.id = e.proposition_id
     WHERE expand_graph = TRUE
       AND (
             e.src_entity IN (SELECT entity_id FROM seed_entities)
@@ -249,7 +249,7 @@ scored AS (
         p.object_id,
         p.asserted_at
     FROM all_candidates ac
-    JOIN propositions p ON p.id = ac.prop_id
+    JOIN @pgkg_schema@.propositions p ON p.id = ac.prop_id
 )
 
 SELECT
