@@ -48,6 +48,12 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   pinned in the function's own `proconfig` so a caller can neither narrow entity dedup by raising it
   nor have their own `%` redefined by calling. Measured on 40,001 names in one org: 78.4 ms and 949
   buffers becomes 0.65 ms and 70.
+- **Migration 051 applies without a superuser** (#29). The `proconfig` pin names a pg_trgm GUC, and
+  until the session has called into pg_trgm that GUC is an unknown placeholder only a superuser may
+  set — so a fresh install on Cloud SQL or RDS stopped at 051 with `permission denied to set
+  parameter "pg_trgm.similarity_threshold"`. 051 now calls `show_limit()` first, which loads the
+  extension and registers the real, user-settable parameter. Edited in place: only a fresh install
+  ever failed here, and the runner tracks migrations by filename.
 - **Retrievability is stated, not inferred from parentage.** Chunk liveness and the content
   address's partial predicate both read `chunks.document_id` to mean "this row is provenance for
   extracted facts, not retrievable content". That is not a fact about parentage, and it is what made

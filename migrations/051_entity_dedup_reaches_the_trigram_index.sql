@@ -81,6 +81,19 @@
 -- SECURITY INVOKER are exactly as 024 left them.  0.6 is not promoted to a
 -- parameter: p_threshold already means the embedding threshold, and a second
 -- one would have to be pinned into proconfig, which a parameter cannot be.
+--
+-- WHY pg_trgm IS LOADED BEFORE THE FUNCTION IS CREATED (issue #29).  pg_trgm
+-- defines its GUCs when its library loads, and nothing loads it until a
+-- session first calls into it; CREATE EXTENSION in 001 loads it at most for
+-- its own session.  In a fresh migration session the proconfig line below
+-- names a placeholder of unknown context, and Postgres lets only a superuser
+-- set one — so on Cloud SQL or RDS, where the migrating role is not a
+-- superuser, this migration failed with "permission denied to set parameter".
+-- Calling any pg_trgm function first registers the real, user-settable
+-- parameter.  show_limit() is the cheapest such call and reads the threshold
+-- without changing it.
+
+SELECT show_limit();
 
 CREATE OR REPLACE FUNCTION pgkg_link_entity(
     p_namespace  TEXT,
