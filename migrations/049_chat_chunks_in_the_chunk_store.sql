@@ -94,21 +94,21 @@ DECLARE
     v_org        UUID;
     v_collection UUID;
     v_provenance UUID;
-    v_hash       BYTEA := digest(p_text, 'sha256');
+    v_hash       BYTEA := @extschema:pgcrypto@.digest(p_text, 'sha256');
     v_chunk      UUID;
     v_is_new     BOOLEAN := FALSE;
 BEGIN
     SELECT d.org_id, d.collection_id, dv.provenance_id
     INTO v_org, v_collection, v_provenance
-    FROM document_versions dv
-    JOIN documents d ON d.id = dv.document_id
+    FROM @pgkg_schema@.document_versions dv
+    JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
     WHERE dv.id = p_version_id;
 
     IF v_org IS NULL THEN
         RAISE EXCEPTION 'no such document version %', p_version_id;
     END IF;
 
-    INSERT INTO chunks (text, org_id, collection_id, acl_group_id,
+    INSERT INTO @pgkg_schema@.chunks (text, org_id, collection_id, acl_group_id,
                         provenance_id, asserted_at, visibility, owner_user_id)
     VALUES (p_text, v_org, v_collection, p_acl_group_id,
             v_provenance, p_asserted_at, p_visibility, p_owner_user_id)
@@ -124,7 +124,7 @@ BEGIN
 
     IF v_chunk IS NULL THEN
         SELECT c.id INTO v_chunk
-        FROM chunks c
+        FROM @pgkg_schema@.chunks c
         WHERE c.org_id = v_org
           AND c.collection_id = v_collection
           AND c.acl_group_id IS NOT DISTINCT FROM p_acl_group_id
@@ -136,7 +136,7 @@ BEGIN
         v_is_new := TRUE;
     END IF;
 
-    INSERT INTO document_version_chunks (document_version_id, chunk_id, ord)
+    INSERT INTO @pgkg_schema@.document_version_chunks (document_version_id, chunk_id, ord)
     VALUES (p_version_id, v_chunk, p_ord)
     ON CONFLICT ON CONSTRAINT document_version_chunks_pkey DO NOTHING;
 

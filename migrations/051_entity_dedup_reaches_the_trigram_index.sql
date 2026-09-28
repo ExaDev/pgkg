@@ -108,11 +108,11 @@ SET pg_trgm.similarity_threshold = 0.6
 AS $$
 DECLARE
     v_id  UUID;
-    v_org UUID := pgkg_current_org();
+    v_org UUID := @pgkg_schema@.pgkg_current_org();
 BEGIN
     -- 1. Exact name + type match within namespace, inside this org
     SELECT id INTO v_id
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE org_id = v_org
       AND namespace = p_namespace
       AND name = p_name
@@ -131,13 +131,13 @@ BEGIN
     -- it is the confirmation that keeps the strict inequality 024 had.
     IF p_embedding IS NOT NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE org_id = v_org
           AND namespace = p_namespace
-          AND name % p_name
-          AND similarity(name, p_name) > 0.6
-          AND (1 - (embedding <=> p_embedding)) > p_threshold
-        ORDER BY (embedding <=> p_embedding)
+          AND name OPERATOR(@extschema:pg_trgm@.%) p_name
+          AND @extschema:pg_trgm@.similarity(name, p_name) > 0.6
+          AND (1 - (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)) > p_threshold
+        ORDER BY (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)
         LIMIT 1;
     END IF;
 
@@ -149,14 +149,14 @@ BEGIN
     -- DO NOTHING blocks on the unique index until the competitor commits or
     -- rolls back; on commit it returns no row and the re-read below — a new
     -- snapshot, because each plpgsql statement takes one — finds the winner.
-    INSERT INTO entities (name, type, embedding, namespace, org_id)
+    INSERT INTO @pgkg_schema@.entities (name, type, embedding, namespace, org_id)
     VALUES (p_name, p_type, p_embedding, p_namespace, v_org)
     ON CONFLICT (org_id, namespace, name, COALESCE(type, '')) DO NOTHING
     RETURNING id INTO v_id;
 
     IF v_id IS NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE org_id = v_org
           AND namespace = p_namespace
           AND name = p_name

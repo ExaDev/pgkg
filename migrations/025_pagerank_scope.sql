@@ -39,11 +39,11 @@ DECLARE
     n     INT;
     base  REAL;
     iter  INT;
-    v_org UUID := COALESCE(p_org_id, pgkg_current_org());
+    v_org UUID := COALESCE(p_org_id, @pgkg_schema@.pgkg_current_org());
 BEGIN
     -- 1. The subgraph: this org's entities in this namespace, and nothing else.
     SELECT COUNT(*) INTO n
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE namespace = p_namespace AND org_id = v_org;
 
     IF n = 0 THEN RETURN; END IF;
@@ -51,9 +51,9 @@ BEGIN
     base := (1.0 - damping) / n;
 
     -- 2. Seed uniformly.
-    INSERT INTO entity_pagerank (entity_id, score, computed_at)
+    INSERT INTO @pgkg_schema@.entity_pagerank (entity_id, score, computed_at)
     SELECT id, 1.0 / n, now()
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE namespace = p_namespace AND org_id = v_org
     ON CONFLICT (entity_id) DO UPDATE
         SET score = EXCLUDED.score,
@@ -64,21 +64,21 @@ BEGIN
     -- subgraph is not a vote inside it, and counting it in out-degree alone
     -- would dilute every real neighbour by an amount set outside the tenant.
     FOR iter IN 1 .. iterations LOOP
-        UPDATE entity_pagerank ep
+        UPDATE @pgkg_schema@.entity_pagerank ep
         SET score = base + damping * (
             SELECT COALESCE(SUM(ep2.score * e.weight / out_deg.total), 0.0)
-            FROM edges e
-            JOIN entity_pagerank ep2 ON ep2.entity_id = e.src_entity
-            JOIN entities src_ent   ON src_ent.id = e.src_entity
+            FROM @pgkg_schema@.edges e
+            JOIN @pgkg_schema@.entity_pagerank ep2 ON ep2.entity_id = e.src_entity
+            JOIN @pgkg_schema@.entities src_ent   ON src_ent.id = e.src_entity
                                    AND src_ent.namespace = p_namespace
                                    AND src_ent.org_id = v_org
             JOIN (
                 SELECT e2.src_entity, SUM(e2.weight) AS total
-                FROM edges e2
-                JOIN entities s ON s.id = e2.src_entity
+                FROM @pgkg_schema@.edges e2
+                JOIN @pgkg_schema@.entities s ON s.id = e2.src_entity
                                AND s.namespace = p_namespace
                                AND s.org_id = v_org
-                JOIN entities d ON d.id = e2.dst_entity
+                JOIN @pgkg_schema@.entities d ON d.id = e2.dst_entity
                                AND d.namespace = p_namespace
                                AND d.org_id = v_org
                 GROUP BY e2.src_entity
@@ -86,16 +86,16 @@ BEGIN
             WHERE e.dst_entity = ep.entity_id
         )
         WHERE ep.entity_id IN (
-            SELECT id FROM entities
+            SELECT id FROM @pgkg_schema@.entities
             WHERE namespace = p_namespace AND org_id = v_org
         );
     END LOOP;
 
     -- 4. Stamp computation time.
-    UPDATE entity_pagerank ep
+    UPDATE @pgkg_schema@.entity_pagerank ep
     SET computed_at = now()
     WHERE ep.entity_id IN (
-        SELECT id FROM entities
+        SELECT id FROM @pgkg_schema@.entities
         WHERE namespace = p_namespace AND org_id = v_org
     );
 END;

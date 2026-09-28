@@ -156,7 +156,7 @@ async def test_query_embedding_parameter_is_an_unmodified_halfvec(
             FROM pg_proc p
             JOIN pg_namespace n ON n.oid = p.pronamespace
             WHERE p.proname = $1
-              AND n.nspname = 'public'
+              AND n.nspname = current_schema()
             """,
             function_name,
         )

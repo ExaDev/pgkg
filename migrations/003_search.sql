@@ -32,7 +32,7 @@ kw AS (
         ROW_NUMBER() OVER (
             ORDER BY ts_rank_cd(p.tsv, plainto_tsquery('english', q_text)) DESC
         )                                                             AS rank
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE q_text IS NOT NULL
       AND q_text <> ''
       AND p.namespace = p_namespace
@@ -52,9 +52,9 @@ vec AS (
     SELECT
         p.id AS prop_id,
         ROW_NUMBER() OVER (
-            ORDER BY p.embedding <=> q_embedding
+            ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
         )    AS rank
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE q_embedding IS NOT NULL
       AND p.embedding IS NOT NULL
       AND p.namespace = p_namespace
@@ -64,7 +64,7 @@ vec AS (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-    ORDER BY p.embedding <=> q_embedding
+    ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
     LIMIT k_initial
 ),
 
@@ -90,14 +90,14 @@ seed_entities AS (
         FROM (
             SELECT p.subject_id AS entity_id, f.rrf_score
             FROM fused f
-            JOIN propositions p ON p.id = f.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = f.prop_id
             WHERE p.subject_id IS NOT NULL
 
             UNION ALL
 
             SELECT p.object_id AS entity_id, f.rrf_score
             FROM fused f
-            JOIN propositions p ON p.id = f.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = f.prop_id
             WHERE p.object_id IS NOT NULL
         ) combined
         GROUP BY entity_id
@@ -115,8 +115,8 @@ neighbor_props AS (
         AS REAL)                                                       AS rrf_score,
         FALSE                                                          AS in_kw,
         FALSE                                                          AS in_vec
-    FROM edges e
-    JOIN propositions np ON np.id = e.proposition_id
+    FROM @pgkg_schema@.edges e
+    JOIN @pgkg_schema@.propositions np ON np.id = e.proposition_id
     WHERE expand_graph = TRUE
       AND (
             e.src_entity IN (SELECT entity_id FROM seed_entities)
@@ -166,7 +166,7 @@ scored AS (
         p.predicate,
         p.object_id
     FROM all_candidates ac
-    JOIN propositions p ON p.id = ac.prop_id
+    JOIN @pgkg_schema@.propositions p ON p.id = ac.prop_id
 )
 
 SELECT
@@ -191,7 +191,7 @@ CREATE OR REPLACE FUNCTION pgkg_bump_access(prop_ids UUID[])
 RETURNS VOID
 LANGUAGE SQL
 AS $$
-    UPDATE propositions
+    UPDATE @pgkg_schema@.propositions
     SET last_accessed_at = now(),
         access_count     = access_count + 1
     WHERE id = ANY(prop_ids);
@@ -214,7 +214,7 @@ DECLARE
 BEGIN
     -- 1. Exact name + type match within namespace
     SELECT id INTO v_id
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE namespace = p_namespace
       AND name = p_name
       AND (type = p_type OR (type IS NULL AND p_type IS NULL))
@@ -227,11 +227,11 @@ BEGIN
     -- 2. Trigram + embedding similarity match
     IF p_embedding IS NOT NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE namespace = p_namespace
-          AND similarity(name, p_name) > 0.6
-          AND (1 - (embedding <=> p_embedding)) > p_threshold
-        ORDER BY (embedding <=> p_embedding)
+          AND @extschema:pg_trgm@.similarity(name, p_name) > 0.6
+          AND (1 - (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)) > p_threshold
+        ORDER BY (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)
         LIMIT 1;
     END IF;
 
@@ -240,7 +240,7 @@ BEGIN
     END IF;
 
     -- 3. Create new entity
-    INSERT INTO entities (name, type, embedding, namespace)
+    INSERT INTO @pgkg_schema@.entities (name, type, embedding, namespace)
     VALUES (p_name, p_type, p_embedding, p_namespace)
     RETURNING id INTO v_id;
 

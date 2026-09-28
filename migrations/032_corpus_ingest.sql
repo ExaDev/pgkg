@@ -144,7 +144,7 @@ AS $$
 DECLARE
     v_job UUID;
 BEGIN
-    INSERT INTO ingest_jobs
+    INSERT INTO @pgkg_schema@.ingest_jobs
         (org_id, collection_id, external_id, content_hash, payload, uri)
     VALUES (p_org_id, p_collection_id, p_external_id, p_content_hash,
             p_payload, p_uri)
@@ -155,7 +155,7 @@ BEGIN
 
     IF v_job IS NULL THEN
         SELECT j.id INTO v_job
-        FROM ingest_jobs j
+        FROM @pgkg_schema@.ingest_jobs j
         WHERE j.org_id = p_org_id
           AND j.collection_id = p_collection_id
           AND j.external_id = p_external_id
@@ -189,7 +189,7 @@ LANGUAGE SQL
 AS $$
     WITH claimable AS (
         SELECT j.id
-        FROM ingest_jobs j
+        FROM @pgkg_schema@.ingest_jobs j
         WHERE (p_org_id IS NULL OR j.org_id = p_org_id)
           AND (j.status = 'pending'
                OR (j.status = 'running'
@@ -198,7 +198,7 @@ AS $$
         FOR UPDATE SKIP LOCKED
         LIMIT 1
     )
-    UPDATE ingest_jobs j
+    UPDATE @pgkg_schema@.ingest_jobs j
     SET status = 'running',
         attempts = j.attempts + 1,
         started_at = COALESCE(j.started_at, now()),
@@ -226,7 +226,7 @@ CREATE FUNCTION pgkg_report_ingest_progress(
 ) RETURNS VOID
 LANGUAGE SQL
 AS $$
-    UPDATE ingest_jobs
+    UPDATE @pgkg_schema@.ingest_jobs
     SET chunks_total = COALESCE(p_chunks_total, chunks_total),
         chunks_embedded = COALESCE(p_chunks_embedded, chunks_embedded),
         heartbeat_at = now()
@@ -249,7 +249,7 @@ CREATE FUNCTION pgkg_finish_ingest_job(
 ) RETURNS VOID
 LANGUAGE SQL
 AS $$
-    UPDATE ingest_jobs
+    UPDATE @pgkg_schema@.ingest_jobs
     SET status = 'done',
         document_id = COALESCE(p_document_id, document_id),
         version_id = COALESCE(p_version_id, version_id),
@@ -270,7 +270,7 @@ AS $$
 DECLARE
     v_status TEXT;
 BEGIN
-    UPDATE ingest_jobs j
+    UPDATE @pgkg_schema@.ingest_jobs j
     SET status = CASE WHEN j.attempts >= p_max_attempts
                       THEN 'failed' ELSE 'pending' END,
         error = p_error,

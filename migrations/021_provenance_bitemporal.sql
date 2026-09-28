@@ -188,9 +188,9 @@ BEGIN
     PERFORM set_config('pgkg.allow_provenance_erasure', 'on', TRUE);
 
     WITH gone AS (
-        DELETE FROM provenance
+        DELETE FROM @pgkg_schema@.provenance
         WHERE id = ANY(p_ids)
-          AND id <> pgkg_unattributed_provenance()
+          AND id <> @pgkg_schema@.pgkg_unattributed_provenance()
         RETURNING 1
     )
     SELECT COUNT(*) INTO erased FROM gone;
@@ -357,12 +357,12 @@ DECLARE
     affected BIGINT;
 BEGIN
     WITH withdrawn AS (
-        UPDATE propositions p
+        UPDATE @pgkg_schema@.propositions p
         SET invalidated_at = now(),
             invalidation_reason = p_reason
         WHERE p.invalidated_at IS NULL
           AND p.provenance_id IN (
-              SELECT pr.id FROM provenance pr WHERE pr.source_id = p_source_id
+              SELECT pr.id FROM @pgkg_schema@.provenance pr WHERE pr.source_id = p_source_id
           )
         RETURNING 1
     )
@@ -380,12 +380,12 @@ DECLARE
     affected BIGINT;
 BEGIN
     WITH withdrawn AS (
-        UPDATE propositions p
+        UPDATE @pgkg_schema@.propositions p
         SET invalidated_at = now(),
             invalidation_reason = 'retracted_run'
         WHERE p.invalidated_at IS NULL
           AND p.provenance_id IN (
-              SELECT pr.id FROM provenance pr
+              SELECT pr.id FROM @pgkg_schema@.provenance pr
               WHERE pr.ingest_run_id = p_ingest_run_id
           )
         RETURNING 1
@@ -411,7 +411,7 @@ DECLARE
     affected BIGINT;
 BEGIN
     WITH closed AS (
-        UPDATE propositions p
+        UPDATE @pgkg_schema@.propositions p
         SET valid_to = p_effective_at
         WHERE p.id = p_proposition_id
           AND (p.valid_to IS NULL OR p.valid_to > p_effective_at)
@@ -434,7 +434,7 @@ DECLARE
     affected BIGINT;
 BEGIN
     WITH withdrawn AS (
-        UPDATE propositions p
+        UPDATE @pgkg_schema@.propositions p
         SET invalidated_at = now(),
             invalidation_reason = 'ttl'
         WHERE p.invalidated_at IS NULL
@@ -484,11 +484,11 @@ SELECT
     p.valid_from,
     p.valid_to,
     p.provenance_id
-FROM propositions p
+FROM @pgkg_schema@.propositions p
 WHERE p.namespace = p_namespace
   AND p.recorded_at <= p_belief_at
   AND (p.invalidated_at IS NULL OR p.invalidated_at > p_belief_at)
-  AND pgkg_visible(
+  AND @pgkg_schema@.pgkg_visible(
         p.org_id, p.collection_id, p.visibility,
         p.owner_user_id, p.acl_group_id,
         p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -551,7 +551,7 @@ stats AS (
         GREATEST(COALESCE(cs.n_total, 1), 1)::FLOAT8 AS n_total,
         COALESCE(cs.avgdl, 1.0)                      AS avgdl
     FROM (VALUES (1)) AS present(x)
-    LEFT JOIN corpus_stats cs
+    LEFT JOIN @pgkg_schema@.corpus_stats cs
         ON cs.namespace = p_namespace
        AND cs.kind = 'proposition'
 ),
@@ -568,7 +568,7 @@ idf AS (
         ) AS idf_val
     FROM query_lexemes ql
     CROSS JOIN stats s
-    LEFT JOIN lexeme_df ld
+    LEFT JOIN @pgkg_schema@.lexeme_df ld
         ON ld.namespace = p_namespace
        AND ld.kind = 'proposition'
        AND ld.lexeme = ql.lexeme
@@ -593,12 +593,12 @@ FROM (
             JOIN idf i ON i.lexeme = u.lexeme
             CROSS JOIN stats s
         ) AS bm25_score
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     CROSS JOIN query_or
     WHERE q_text IS NOT NULL
       AND q_text <> ''
       AND p.namespace = p_namespace
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             p.invalidated_at, p.valid_from, p.valid_to,
             COALESCE(p_valid_at, now())
           )
@@ -609,7 +609,7 @@ FROM (
             OR p.session_id = p_session_id
             OR p.session_id IS NULL
           )
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             p.org_id, p.collection_id, p.visibility,
             p.owner_user_id, p.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -644,13 +644,13 @@ AS $$
 SELECT
     p.id,
     'vec'::TEXT,
-    (ROW_NUMBER() OVER (ORDER BY p.embedding <=> q_embedding))::INT,
-    (1.0 - (p.embedding <=> q_embedding))::REAL
-FROM propositions p
+    (ROW_NUMBER() OVER (ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::INT,
+    (1.0 - (p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::REAL
+FROM @pgkg_schema@.propositions p
 WHERE q_embedding IS NOT NULL
   AND p.embedding IS NOT NULL
   AND p.namespace = p_namespace
-  AND pgkg_temporal_visible(
+  AND @pgkg_schema@.pgkg_temporal_visible(
         p.invalidated_at, p.valid_from, p.valid_to,
         COALESCE(p_valid_at, now())
       )
@@ -659,12 +659,12 @@ WHERE q_embedding IS NOT NULL
         OR p.session_id = p_session_id
         OR p.session_id IS NULL
       )
-  AND pgkg_visible(
+  AND @pgkg_schema@.pgkg_visible(
         p.org_id, p.collection_id, p.visibility,
         p.owner_user_id, p.acl_group_id,
         p_org_ids, p_collection_ids, p_user_id, p_acl_groups
       )
-ORDER BY p.embedding <=> q_embedding
+ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
 LIMIT k_initial;
 $$;
 
@@ -710,14 +710,14 @@ seed_entities AS (
         FROM (
             SELECT p.subject_id AS entity_id, s.score
             FROM seeds s
-            JOIN propositions p ON p.id = s.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = s.prop_id
             WHERE p.subject_id IS NOT NULL
 
             UNION ALL
 
             SELECT p.object_id AS entity_id, s.score
             FROM seeds s
-            JOIN propositions p ON p.id = s.prop_id
+            JOIN @pgkg_schema@.propositions p ON p.id = s.prop_id
             WHERE p.object_id IS NOT NULL
         ) combined
         GROUP BY entity_id
@@ -736,17 +736,17 @@ per_seed AS (
             ORDER BY COALESCE(e.weight, 0.0) DESC, np.id
         ) AS seed_rank
     FROM seed_entities se
-    JOIN edges e
+    JOIN @pgkg_schema@.edges e
       ON e.src_entity = se.entity_id
       OR e.dst_entity = se.entity_id
-    JOIN propositions np ON np.id = e.proposition_id
+    JOIN @pgkg_schema@.propositions np ON np.id = e.proposition_id
     WHERE np.namespace = p_namespace
-      AND pgkg_temporal_visible(
+      AND @pgkg_schema@.pgkg_temporal_visible(
             np.invalidated_at, np.valid_from, np.valid_to,
             COALESCE(p_valid_at, now())
           )
       AND NOT EXISTS (SELECT 1 FROM seeds s WHERE s.prop_id = np.id)
-      AND pgkg_visible(
+      AND @pgkg_schema@.pgkg_visible(
             np.org_id, np.collection_id, np.visibility,
             np.owner_user_id, np.acl_group_id,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups
@@ -814,8 +814,8 @@ WITH
 retrieved AS (
     SELECT
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(
                 q_text, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at
@@ -823,8 +823,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(
                 q_embedding, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at
@@ -836,16 +836,16 @@ retrieved AS (
 -- fused scores set both the seed-entity ordering and the neighbour floor.
 seeds AS (
     SELECT ARRAY(
-        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
-        FROM retrieved r, pgkg_fuse(r.candidates, rrf_k) f
+        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
+        FROM retrieved r, @pgkg_schema@.pgkg_fuse(r.candidates, rrf_k) f
     ) AS candidates
 ),
 
 expanded AS (
     SELECT ARRAY(
-        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-        FROM pgkg_graph_candidates(
-            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::pgkg_candidate[] END,
+        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+        FROM @pgkg_schema@.pgkg_graph_candidates(
+            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::@pgkg_schema@.pgkg_candidate[] END,
             p_namespace, 20, 10, 100,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
             p_valid_at
@@ -856,14 +856,14 @@ expanded AS (
 
 fused AS (
     SELECT f.*
-    FROM retrieved r, expanded x, pgkg_fuse(r.candidates || x.candidates, rrf_k) f
+    FROM retrieved r, expanded x, @pgkg_schema@.pgkg_fuse(r.candidates || x.candidates, rrf_k) f
 ),
 
 profiled AS (
     SELECT ap.*
-    FROM pgkg_apply_profile(
+    FROM @pgkg_schema@.pgkg_apply_profile(
         ARRAY(
-            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
+            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
             FROM fused f
         ),
         recency_half_life_days
@@ -873,7 +873,7 @@ profiled AS (
 SELECT
     fused.item_id,
     p.text,
-    p.embedding::vector,
+    p.embedding::@extschema:vector@.vector,
     fused.fused_score,
     profiled.adjusted_score,
     CASE
@@ -888,7 +888,7 @@ SELECT
     p.object_id,
     p.asserted_at
 FROM fused
-JOIN propositions p ON p.id = fused.item_id
+JOIN @pgkg_schema@.propositions p ON p.id = fused.item_id
 JOIN profiled ON profiled.item_id = fused.item_id
 ORDER BY profiled.adjusted_score DESC
 LIMIT k_retrieve;
@@ -906,24 +906,24 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'proposition'
       AND (p_namespace IS NULL OR namespace = p_namespace);
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'proposition'
       AND (p_namespace IS NULL OR namespace = p_namespace);
 
-    INSERT INTO corpus_stats (namespace, kind, n_total, total_len)
+    INSERT INTO @pgkg_schema@.corpus_stats (namespace, kind, n_total, total_len)
     SELECT p.namespace, 'proposition', COUNT(*), COALESCE(SUM(p.doc_len), 0)
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.invalidated_at IS NULL
       AND (p_namespace IS NULL OR p.namespace = p_namespace)
     GROUP BY p.namespace;
 
-    INSERT INTO lexeme_df (namespace, kind, lexeme, df)
+    INSERT INTO @pgkg_schema@.lexeme_df (namespace, kind, lexeme, df)
     SELECT p.namespace, 'proposition', u.lexeme, COUNT(*)
-    FROM propositions p, unnest(p.tsv) AS u(lexeme, positions, weights)
+    FROM @pgkg_schema@.propositions p, unnest(p.tsv) AS u(lexeme, positions, weights)
     WHERE p.invalidated_at IS NULL
       AND (p_namespace IS NULL OR p.namespace = p_namespace)
     GROUP BY p.namespace, u.lexeme;
@@ -937,7 +937,7 @@ AS $$
 DECLARE
     delta_sign INT := TG_ARGV[0]::INT;
 BEGIN
-    INSERT INTO corpus_stats AS cs (namespace, kind, n_total, total_len)
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs (namespace, kind, n_total, total_len)
     SELECT d.namespace,
            'proposition',
            delta_sign * COUNT(*),
@@ -950,7 +950,7 @@ BEGIN
             total_len  = GREATEST(cs.total_len + EXCLUDED.total_len, 0),
             updated_at = now();
 
-    INSERT INTO lexeme_df AS ld (namespace, kind, lexeme, df)
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld (namespace, kind, lexeme, df)
     SELECT d.namespace, 'proposition', u.lexeme, delta_sign * COUNT(*)
     FROM delta_rows d, unnest(d.tsv) AS u(lexeme, positions, weights)
     WHERE d.invalidated_at IS NULL
@@ -993,7 +993,7 @@ BEGIN
           )
     ),
     corpus AS (
-        INSERT INTO corpus_stats AS cs (namespace, kind, n_total, total_len)
+        INSERT INTO @pgkg_schema@.corpus_stats AS cs (namespace, kind, n_total, total_len)
         SELECT d.namespace,
                'proposition',
                SUM(d.delta_sign),
@@ -1006,7 +1006,7 @@ BEGIN
                 updated_at = now()
         RETURNING 1
     )
-    INSERT INTO lexeme_df AS ld (namespace, kind, lexeme, df)
+    INSERT INTO @pgkg_schema@.lexeme_df AS ld (namespace, kind, lexeme, df)
     SELECT d.namespace, 'proposition', u.lexeme, SUM(d.delta_sign)
     FROM delta d, unnest(d.tsv) AS u(lexeme, positions, weights)
     GROUP BY d.namespace, u.lexeme

@@ -156,8 +156,8 @@ LANGUAGE SQL STABLE
 AS $$
     SELECT g.id, g.name, g.dim, g.storage_type, g.normalize, g.query_prefix,
            oe.role
-    FROM org_embedders oe
-    JOIN embedder_generations g ON g.id = oe.generation_id
+    FROM @pgkg_schema@.org_embedders oe
+    JOIN @pgkg_schema@.embedder_generations g ON g.id = oe.generation_id
     WHERE oe.org_id = p_org_id
       AND g.status IN ('live', 'primary', 'retiring')
     ORDER BY (oe.role = 'primary') DESC, g.name;
@@ -191,28 +191,29 @@ DECLARE
                                WHEN 'prop'  THEN 'propositions'
                                WHEN 'chunk' THEN 'chunks'
                            END;
-    v_table        TEXT := pgkg_generation_table(p_source, p_generation_id);
+    v_table        TEXT := @pgkg_schema@.pgkg_generation_table(p_source, p_generation_id);
 BEGIN
     IF v_source_table IS NULL THEN
         RAISE EXCEPTION 'unknown embedding source %', p_source;
     END IF;
 
     SELECT g.dim INTO v_dim
-    FROM embedder_generations g WHERE g.id = p_generation_id;
+    FROM @pgkg_schema@.embedder_generations g WHERE g.id = p_generation_id;
 
     IF v_dim IS NULL THEN
         RAISE EXCEPTION 'no such embedder generation %', p_generation_id;
     END IF;
 
     EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I ('
-        '  item_id UUID PRIMARY KEY REFERENCES %I(id) ON DELETE CASCADE,'
-        '  vec halfvec(%s) NOT NULL)',
+        'CREATE TABLE IF NOT EXISTS @pgkg_schema@.%I ('
+        '  item_id UUID PRIMARY KEY REFERENCES @pgkg_schema@.%I(id) ON DELETE CASCADE,'
+        '  vec @extschema:vector@.halfvec(%s) NOT NULL)',
         v_table, v_source_table, v_dim
     );
 
     EXECUTE format(
-        'CREATE INDEX IF NOT EXISTS %I ON %I USING hnsw (vec halfvec_cosine_ops)',
+        'CREATE INDEX IF NOT EXISTS %I ON @pgkg_schema@.%I '
+        'USING hnsw (vec @extschema:vector@.halfvec_cosine_ops)',
         v_table || '_vec_idx', v_table
     );
 
@@ -269,42 +270,42 @@ BEGIN
     END IF;
 
     SELECT g.dim, g.status INTO v_dim, v_status
-    FROM embedder_generations g WHERE g.id = p_generation_id;
+    FROM @pgkg_schema@.embedder_generations g WHERE g.id = p_generation_id;
 
     IF v_dim IS NULL OR v_status NOT IN ('live', 'primary', 'retiring') THEN
         RETURN;
     END IF;
 
     IF p_org_ids IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM org_embedders oe
+        SELECT 1 FROM @pgkg_schema@.org_embedders oe
         WHERE oe.generation_id = p_generation_id
           AND oe.org_id = ANY(p_org_ids)
     ) THEN
         RETURN;
     END IF;
 
-    IF vector_dims(q_embedding) <> v_dim THEN
+    IF @extschema:vector@.vector_dims(q_embedding) <> v_dim THEN
         RAISE EXCEPTION
             'query vector has % dimensions but generation % declares %',
-            vector_dims(q_embedding), p_generation_id, v_dim;
+            @extschema:vector@.vector_dims(q_embedding), p_generation_id, v_dim;
     END IF;
 
-    v_table := pgkg_generation_table('prop', p_generation_id);
+    v_table := @pgkg_schema@.pgkg_generation_table('prop', p_generation_id);
 
     -- No side table means this generation is the inline one, and its vectors
     -- are on the rows that name it.
-    IF to_regclass(v_table) IS NULL THEN
+    IF to_regclass('@pgkg_schema@.' || v_table) IS NULL THEN
         RETURN QUERY
         SELECT
             p.id,
             'vec'::TEXT,
-            (ROW_NUMBER() OVER (ORDER BY p.embedding <=> q_embedding))::INT,
-            (1.0 - (p.embedding <=> q_embedding))::REAL
-        FROM propositions p
+            (ROW_NUMBER() OVER (ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::INT,
+            (1.0 - (p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding))::REAL
+        FROM @pgkg_schema@.propositions p
         WHERE p.embedding IS NOT NULL
           AND p.embedder_generation_id = p_generation_id
           AND p.namespace = p_namespace
-          AND pgkg_temporal_visible(
+          AND @pgkg_schema@.pgkg_temporal_visible(
                 p.invalidated_at, p.valid_from, p.valid_to,
                 COALESCE(p_valid_at, now())
               )
@@ -313,12 +314,12 @@ BEGIN
                 OR p.session_id = p_session_id
                 OR p.session_id IS NULL
               )
-          AND pgkg_visible(
+          AND @pgkg_schema@.pgkg_visible(
                 p.org_id, p.collection_id, p.visibility,
                 p.owner_user_id, p.acl_group_id,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups
               )
-        ORDER BY p.embedding <=> q_embedding
+        ORDER BY p.embedding OPERATOR(@extschema:vector@.<=>) q_embedding
         LIMIT k_initial;
         RETURN;
     END IF;
@@ -327,22 +328,22 @@ BEGIN
         SELECT
             s.item_id,
             'vec'::TEXT,
-            (ROW_NUMBER() OVER (ORDER BY s.vec <=> $1))::INT,
-            (1.0 - (s.vec <=> $1))::REAL
-        FROM %I s
-        JOIN propositions p ON p.id = s.item_id
+            (ROW_NUMBER() OVER (ORDER BY s.vec OPERATOR(@extschema:vector@.<=>) $1))::INT,
+            (1.0 - (s.vec OPERATOR(@extschema:vector@.<=>) $1))::REAL
+        FROM @pgkg_schema@.%I s
+        JOIN @pgkg_schema@.propositions p ON p.id = s.item_id
         WHERE p.namespace = $2
-          AND pgkg_temporal_visible(
+          AND @pgkg_schema@.pgkg_temporal_visible(
                 p.invalidated_at, p.valid_from, p.valid_to,
                 COALESCE($9, now())
               )
           AND ($3 IS NULL OR p.session_id = $3 OR p.session_id IS NULL)
-          AND pgkg_visible(
+          AND @pgkg_schema@.pgkg_visible(
                 p.org_id, p.collection_id, p.visibility,
                 p.owner_user_id, p.acl_group_id,
                 $5, $6, $7, $8
               )
-        ORDER BY s.vec <=> $1
+        ORDER BY s.vec OPERATOR(@extschema:vector@.<=>) $1
         LIMIT $4
     $q$, v_table)
     USING q_embedding, p_namespace, p_session_id, k_initial,
@@ -399,8 +400,8 @@ WITH
 retrieved AS (
     SELECT
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(
                 q_text, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at
@@ -408,8 +409,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(
                 q_embedding, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at
@@ -417,10 +418,10 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-            FROM unnest(COALESCE(p_gen_queries, '{}'::pgkg_gen_query[]))
+            SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM unnest(COALESCE(p_gen_queries, '{}'::@pgkg_schema@.pgkg_gen_query[]))
                  AS gq(generation_id, q_embedding),
-                 LATERAL pgkg_generation_candidates(
+                 LATERAL @pgkg_schema@.pgkg_generation_candidates(
                      gq.generation_id, gq.q_embedding,
                      p_namespace, p_session_id, k_initial,
                      p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
@@ -433,16 +434,16 @@ retrieved AS (
 -- fused scores set both the seed-entity ordering and the neighbour floor.
 seeds AS (
     SELECT ARRAY(
-        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
-        FROM retrieved r, pgkg_fuse(r.candidates, rrf_k) f
+        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
+        FROM retrieved r, @pgkg_schema@.pgkg_fuse(r.candidates, rrf_k) f
     ) AS candidates
 ),
 
 expanded AS (
     SELECT ARRAY(
-        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-        FROM pgkg_graph_candidates(
-            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::pgkg_candidate[] END,
+        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+        FROM @pgkg_schema@.pgkg_graph_candidates(
+            CASE WHEN expand_graph THEN s.candidates ELSE '{}'::@pgkg_schema@.pgkg_candidate[] END,
             p_namespace, 20, 10, 100,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
             p_valid_at
@@ -453,14 +454,14 @@ expanded AS (
 
 fused AS (
     SELECT f.*
-    FROM retrieved r, expanded x, pgkg_fuse(r.candidates || x.candidates, rrf_k) f
+    FROM retrieved r, expanded x, @pgkg_schema@.pgkg_fuse(r.candidates || x.candidates, rrf_k) f
 ),
 
 profiled AS (
     SELECT ap.*
-    FROM pgkg_apply_profile(
+    FROM @pgkg_schema@.pgkg_apply_profile(
         ARRAY(
-            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
+            SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
             FROM fused f
         ),
         recency_half_life_days
@@ -470,7 +471,7 @@ profiled AS (
 SELECT
     fused.item_id,
     p.text,
-    p.embedding::vector,
+    p.embedding::@extschema:vector@.vector,
     fused.fused_score,
     profiled.adjusted_score,
     CASE
@@ -485,7 +486,7 @@ SELECT
     p.object_id,
     p.asserted_at
 FROM fused
-JOIN propositions p ON p.id = fused.item_id
+JOIN @pgkg_schema@.propositions p ON p.id = fused.item_id
 JOIN profiled ON profiled.item_id = fused.item_id
 ORDER BY profiled.adjusted_score DESC
 LIMIT k_retrieve;

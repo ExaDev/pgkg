@@ -109,21 +109,21 @@ DECLARE
     v_org        UUID;
     v_collection UUID;
     v_provenance UUID;
-    v_hash       BYTEA := digest(p_text, 'sha256');
+    v_hash       BYTEA := @extschema:pgcrypto@.digest(p_text, 'sha256');
     v_chunk      UUID;
     v_is_new     BOOLEAN := FALSE;
 BEGIN
     SELECT d.org_id, d.collection_id, dv.provenance_id
     INTO v_org, v_collection, v_provenance
-    FROM document_versions dv
-    JOIN documents d ON d.id = dv.document_id
+    FROM @pgkg_schema@.document_versions dv
+    JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
     WHERE dv.id = p_version_id;
 
     IF v_org IS NULL THEN
         RAISE EXCEPTION 'no such document version %', p_version_id;
     END IF;
 
-    INSERT INTO chunks (text, org_id, collection_id, acl_group_id,
+    INSERT INTO @pgkg_schema@.chunks (text, org_id, collection_id, acl_group_id,
                         provenance_id, asserted_at)
     VALUES (p_text, v_org, v_collection, p_acl_group_id,
             v_provenance, p_asserted_at)
@@ -137,7 +137,7 @@ BEGIN
 
     IF v_chunk IS NULL THEN
         SELECT c.id INTO v_chunk
-        FROM chunks c
+        FROM @pgkg_schema@.chunks c
         WHERE c.org_id = v_org
           AND c.collection_id = v_collection
           AND c.acl_group_id IS NOT DISTINCT FROM p_acl_group_id
@@ -147,7 +147,7 @@ BEGIN
         v_is_new := TRUE;
     END IF;
 
-    INSERT INTO document_version_chunks (document_version_id, chunk_id, ord)
+    INSERT INTO @pgkg_schema@.document_version_chunks (document_version_id, chunk_id, ord)
     VALUES (p_version_id, v_chunk, p_ord)
     ON CONFLICT ON CONSTRAINT document_version_chunks_pkey DO NOTHING;
 
@@ -179,7 +179,7 @@ AS $$
 WITH anchor AS (
     SELECT c.id, c.org_id, c.collection_id, c.acl_group_id,
            c.visibility, c.owner_user_id
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.id = ANY(p_chunk_ids)
 ),
 
@@ -189,11 +189,11 @@ WITH anchor AS (
 carrier AS (
     SELECT a.id AS chunk_id, dvc.document_version_id
     FROM anchor a
-    JOIN document_version_chunks dvc ON dvc.chunk_id = a.id
-    JOIN document_versions dv
+    JOIN @pgkg_schema@.document_version_chunks dvc ON dvc.chunk_id = a.id
+    JOIN @pgkg_schema@.document_versions dv
       ON dv.id = dvc.document_version_id
      AND dv.status = 'current'
-    JOIN documents d
+    JOIN @pgkg_schema@.documents d
       ON d.id = dv.document_id
      AND d.deleted_at IS NULL
      AND d.org_id = a.org_id
@@ -222,10 +222,10 @@ span AS (
         neighbour.ord,
         neighbour.chunk_id AS neighbour_id
     FROM sole s
-    JOIN document_version_chunks anchor_link
+    JOIN @pgkg_schema@.document_version_chunks anchor_link
       ON anchor_link.document_version_id = s.document_version_id
      AND anchor_link.chunk_id = s.chunk_id
-    JOIN document_version_chunks neighbour
+    JOIN @pgkg_schema@.document_version_chunks neighbour
       ON neighbour.document_version_id = s.document_version_id
      AND neighbour.ord BETWEEN anchor_link.ord - GREATEST(p_before, 0)
                            AND anchor_link.ord + GREATEST(p_after, 0)
@@ -239,7 +239,7 @@ SELECT
     string_agg(n.text, E'\n\n' ORDER BY span.ord)
 FROM span
 JOIN anchor a ON a.id = span.chunk_id
-JOIN chunks n
+JOIN @pgkg_schema@.chunks n
   ON n.id = span.neighbour_id
  AND n.org_id = a.org_id
  AND n.collection_id = a.collection_id
@@ -275,15 +275,15 @@ BEGIN
     -- statement of its own, so the read below takes a fresh snapshot and sees
     -- the version the crawl we waited for committed.
     SELECT d.id INTO v_document
-    FROM documents d WHERE d.id = p_document_id FOR UPDATE;
+    FROM @pgkg_schema@.documents d WHERE d.id = p_document_id FOR UPDATE;
 
     IF v_document IS NULL THEN
         RAISE EXCEPTION 'no such document %', p_document_id;
     END IF;
 
     SELECT dv.id INTO v_unchanged
-    FROM documents d
-    JOIN document_versions dv ON dv.id = d.current_version_id
+    FROM @pgkg_schema@.documents d
+    JOIN @pgkg_schema@.document_versions dv ON dv.id = d.current_version_id
     WHERE d.id = p_document_id
       AND dv.content_hash = p_content_hash;
 
@@ -292,20 +292,20 @@ BEGIN
         RETURN;
     END IF;
 
-    INSERT INTO document_versions
+    INSERT INTO @pgkg_schema@.document_versions
         (document_id, org_id, version_no, content_hash, status, provenance_id)
     SELECT
         d.id,
         d.org_id,
         COALESCE(
-            (SELECT MAX(dv.version_no) FROM document_versions dv
+            (SELECT MAX(dv.version_no) FROM @pgkg_schema@.document_versions dv
              WHERE dv.document_id = d.id),
             0
         ) + 1,
         p_content_hash,
         'pending',
-        COALESCE(p_provenance_id, pgkg_unattributed_provenance())
-    FROM documents d
+        COALESCE(p_provenance_id, @pgkg_schema@.pgkg_unattributed_provenance())
+    FROM @pgkg_schema@.documents d
     WHERE d.id = p_document_id
     RETURNING document_versions.id INTO v_new;
 
@@ -336,8 +336,8 @@ BEGIN
     -- absent and "absent" is the answer that must not link.
     SELECT l.chunk_id, l.document_version_id INTO v_chunk, v_version
     FROM new_links l
-    LEFT JOIN document_versions dv ON dv.id = l.document_version_id
-    LEFT JOIN chunks c ON c.id = l.chunk_id
+    LEFT JOIN @pgkg_schema@.document_versions dv ON dv.id = l.document_version_id
+    LEFT JOIN @pgkg_schema@.chunks c ON c.id = l.chunk_id
     WHERE dv.org_id IS NULL
        OR c.org_id IS NULL
        OR dv.org_id <> c.org_id

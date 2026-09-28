@@ -33,7 +33,7 @@ DECLARE
 BEGIN
     -- 1. Exact name + type match within namespace
     SELECT id INTO v_id
-    FROM entities
+    FROM @pgkg_schema@.entities
     WHERE namespace = p_namespace
       AND name = p_name
       AND (type = p_type OR (type IS NULL AND p_type IS NULL))
@@ -46,11 +46,11 @@ BEGIN
     -- 2. Trigram + embedding similarity match
     IF p_embedding IS NOT NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE namespace = p_namespace
-          AND similarity(name, p_name) > 0.6
-          AND (1 - (embedding <=> p_embedding)) > p_threshold
-        ORDER BY (embedding <=> p_embedding)
+          AND @extschema:pg_trgm@.similarity(name, p_name) > 0.6
+          AND (1 - (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)) > p_threshold
+        ORDER BY (embedding OPERATOR(@extschema:vector@.<=>) p_embedding)
         LIMIT 1;
     END IF;
 
@@ -62,14 +62,14 @@ BEGIN
     -- DO NOTHING blocks on the unique index until the competitor commits or
     -- rolls back; on commit it returns no row and the re-read below — a new
     -- snapshot, because each plpgsql statement takes one — finds the winner.
-    INSERT INTO entities (name, type, embedding, namespace)
+    INSERT INTO @pgkg_schema@.entities (name, type, embedding, namespace)
     VALUES (p_name, p_type, p_embedding, p_namespace)
     ON CONFLICT (namespace, name, type) DO NOTHING
     RETURNING id INTO v_id;
 
     IF v_id IS NULL THEN
         SELECT id INTO v_id
-        FROM entities
+        FROM @pgkg_schema@.entities
         WHERE namespace = p_namespace
           AND name = p_name
           AND (type = p_type OR (type IS NULL AND p_type IS NULL))

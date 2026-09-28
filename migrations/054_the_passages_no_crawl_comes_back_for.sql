@@ -74,7 +74,7 @@ CREATE FUNCTION pgkg_unvectored_chunks(
 LANGUAGE SQL STABLE
 AS $$
     SELECT c.id, c.text
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.org_id = p_org_id
       AND c.embedding IS NULL
       AND c.refcount > 0

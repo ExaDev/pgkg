@@ -24,10 +24,10 @@ CREATE FUNCTION pgkg_bind_org_to_primary_generation() RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO org_embedders (org_id, generation_id, role)
+    INSERT INTO @pgkg_schema@.org_embedders (org_id, generation_id, role)
     SELECT NEW.id, g.id, 'primary'
-    FROM embedder_generations g
-    WHERE g.id = pgkg_generation_1()
+    FROM @pgkg_schema@.embedder_generations g
+    WHERE g.id = @pgkg_schema@.pgkg_generation_1()
     ON CONFLICT (org_id, generation_id) DO NOTHING;
 
     RETURN NEW;
@@ -59,34 +59,35 @@ DECLARE
                                WHEN 'prop'  THEN 'propositions'
                                WHEN 'chunk' THEN 'chunks'
                            END;
-    v_table        TEXT := pgkg_generation_table(p_source, p_generation_id);
+    v_table        TEXT := @pgkg_schema@.pgkg_generation_table(p_source, p_generation_id);
 BEGIN
     IF v_source_table IS NULL THEN
         RAISE EXCEPTION 'unknown embedding source %', p_source;
     END IF;
 
     SELECT g.dim INTO v_dim
-    FROM embedder_generations g WHERE g.id = p_generation_id;
+    FROM @pgkg_schema@.embedder_generations g WHERE g.id = p_generation_id;
 
     IF v_dim IS NULL THEN
         RAISE EXCEPTION 'no such embedder generation %', p_generation_id;
     END IF;
 
     EXECUTE format(
-        'CREATE TABLE IF NOT EXISTS %I ('
-        '  item_id UUID PRIMARY KEY REFERENCES %I(id) ON DELETE CASCADE,'
-        '  vec halfvec(%s) NOT NULL)',
+        'CREATE TABLE IF NOT EXISTS @pgkg_schema@.%I ('
+        '  item_id UUID PRIMARY KEY REFERENCES @pgkg_schema@.%I(id) ON DELETE CASCADE,'
+        '  vec @extschema:vector@.halfvec(%s) NOT NULL)',
         v_table, v_source_table, v_dim
     );
 
     EXECUTE format(
-        'CREATE INDEX IF NOT EXISTS %I ON %I USING hnsw (vec halfvec_cosine_ops)',
+        'CREATE INDEX IF NOT EXISTS %I ON @pgkg_schema@.%I '
+        'USING hnsw (vec @extschema:vector@.halfvec_cosine_ops)',
         v_table || '_vec_idx', v_table
     );
 
     BEGIN
         EXECUTE format(
-            'GRANT SELECT, INSERT, UPDATE, DELETE ON %I TO pgkg_app', v_table
+            'GRANT SELECT, INSERT, UPDATE, DELETE ON @pgkg_schema@.%I TO pgkg_app', v_table
         );
     EXCEPTION WHEN insufficient_privilege OR undefined_object THEN
         RAISE NOTICE 'pgkg_app not granted on % (%)', v_table, SQLERRM;

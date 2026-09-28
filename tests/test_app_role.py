@@ -25,7 +25,7 @@ async def test_every_table_is_reachable_by_the_application_role(
             SELECT c.relname
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public'
+            WHERE n.nspname = current_schema()
               AND c.relkind = 'r'
               AND c.relname <> 'pgkg_schema_migrations'
               AND NOT has_table_privilege('pgkg_app', c.oid, 'SELECT')
@@ -47,7 +47,7 @@ async def test_the_application_role_can_write_where_it_must(
             SELECT c.relname
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public'
+            WHERE n.nspname = current_schema()
               AND c.relkind = 'r'
               AND c.relname IN ('propositions', 'provenance', 'entities',
                                 'chunks', 'documents', 'edges')

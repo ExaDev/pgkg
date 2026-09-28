@@ -172,7 +172,7 @@ BEGIN
 
     target AS (
         SELECT c.id, c.org_id, lower(c.text) AS lowered
-        FROM chunks c
+        FROM @pgkg_schema@.chunks c
         WHERE c.id = ANY(p_chunk_ids)
     ),
 
@@ -202,7 +202,7 @@ BEGIN
             a.org_id,
             a.w_start AS span_start,
             b.w_end   AS span_end,
-            pgkg_gazetteer_key(
+            @pgkg_schema@.pgkg_gazetteer_key(
                 substr(a.lowered, a.w_start + 1, b.w_end - a.w_start)
             ) AS phrase
         FROM positioned a
@@ -221,7 +221,7 @@ BEGIN
         SELECT u.chunk_id, u.org_id, e.id AS entity_id,
                u.span_start, u.span_end, 'name'::TEXT AS match_kind
         FROM usable u
-        JOIN entities e
+        JOIN @pgkg_schema@.entities e
           ON e.org_id = u.org_id
          AND e.gazetteer_name_key = u.phrase
 
@@ -230,7 +230,7 @@ BEGIN
         SELECT u.chunk_id, u.org_id, e.id,
                u.span_start, u.span_end, 'alias'
         FROM usable u
-        JOIN entities e
+        JOIN @pgkg_schema@.entities e
           ON e.org_id = u.org_id
          AND e.gazetteer_alias_keys @> ARRAY[u.phrase]
 
@@ -239,10 +239,10 @@ BEGIN
         SELECT u.chunk_id, u.org_id, e.id,
                u.span_start, u.span_end, 'fuzzy'
         FROM usable u
-        JOIN entities e
+        JOIN @pgkg_schema@.entities e
           ON e.org_id = u.org_id
-         AND e.name % u.phrase
-         AND similarity(e.gazetteer_name_key, u.phrase) >= p_threshold
+         AND e.name OPERATOR(@extschema:pg_trgm@.%) u.phrase
+         AND @extschema:pg_trgm@.similarity(e.gazetteer_name_key, u.phrase) >= p_threshold
         WHERE e.gazetteer_name_key <> u.phrase
     ),
 
@@ -259,7 +259,7 @@ BEGIN
     ),
 
     inserted AS (
-        INSERT INTO entity_mentions
+        INSERT INTO @pgkg_schema@.entity_mentions
             (entity_id, chunk_id, org_id, span_start, span_end, match_kind)
         SELECT entity_id, chunk_id, org_id, span_start, span_end, match_kind
         FROM best
@@ -269,7 +269,7 @@ BEGIN
 
     SELECT COUNT(*) INTO v_added FROM inserted;
 
-    UPDATE chunks SET mentions_matched_at = now()
+    UPDATE @pgkg_schema@.chunks SET mentions_matched_at = now()
     WHERE id = ANY(p_chunk_ids)
       AND mentions_matched_at IS NULL;
 
@@ -292,12 +292,12 @@ CREATE OR REPLACE FUNCTION pgkg_match_chunk_mentions(
 ) RETURNS BIGINT
 LANGUAGE SQL
 AS $$
-    SELECT pgkg_match_entity_mentions(
+    SELECT @pgkg_schema@.pgkg_match_entity_mentions(
         ARRAY(
             SELECT DISTINCT c.id
             FROM (
                 SELECT e.org_id, k.key
-                FROM entities e
+                FROM @pgkg_schema@.entities e
                 CROSS JOIN LATERAL (
                     SELECT e.gazetteer_name_key AS key
                     UNION
@@ -308,7 +308,7 @@ AS $$
             ) n
             CROSS JOIN LATERAL (
                 SELECT c.id
-                FROM chunks c
+                FROM @pgkg_schema@.chunks c
                 WHERE c.org_id = n.org_id
                   AND c.tsv @@ plainto_tsquery('english', n.key)
                 LIMIT GREATEST(p_max_chunks, 0)

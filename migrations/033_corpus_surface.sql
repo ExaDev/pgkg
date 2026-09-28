@@ -51,15 +51,15 @@ AS $$
     SELECT (
             p_refcount = 0
             AND NOT EXISTS (
-                SELECT 1 FROM chunks c
+                SELECT 1 FROM @pgkg_schema@.chunks c
                 WHERE c.id = p_chunk_id AND c.document_id IS NOT NULL
             )
         )
         OR EXISTS (
             SELECT 1
-            FROM document_version_chunks dvc
-            JOIN document_versions dv ON dv.id = dvc.document_version_id
-            JOIN documents d ON d.id = dv.document_id
+            FROM @pgkg_schema@.document_version_chunks dvc
+            JOIN @pgkg_schema@.document_versions dv ON dv.id = dvc.document_version_id
+            JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
             WHERE dvc.chunk_id = p_chunk_id
               AND dv.status = 'current'
               AND d.deleted_at IS NULL
@@ -187,8 +187,8 @@ WITH
 retrieved AS (
     SELECT
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(
                 q_text, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'propositions'
@@ -197,8 +197,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(
                 q_embedding, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'propositions'
@@ -207,10 +207,10 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-            FROM unnest(COALESCE(p_gen_queries, '{}'::pgkg_gen_query[]))
+            SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM unnest(COALESCE(p_gen_queries, '{}'::@pgkg_schema@.pgkg_gen_query[]))
                  AS gq(generation_id, q_embedding),
-                 LATERAL pgkg_generation_candidates(
+                 LATERAL @pgkg_schema@.pgkg_generation_candidates(
                      gq.generation_id, gq.q_embedding,
                      p_namespace, p_session_id, k_initial,
                      p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
@@ -220,8 +220,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::pgkg_candidate
-            FROM pgkg_bm25_candidates(
+            SELECT (b.item_id, b.kind, b.rank, b.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_bm25_candidates(
                 q_text, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'chunks'
@@ -230,8 +230,8 @@ retrieved AS (
         )
         ||
         ARRAY(
-            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::pgkg_candidate
-            FROM pgkg_vector_candidates(
+            SELECT (v.item_id, v.kind, v.rank, v.raw_score)::@pgkg_schema@.pgkg_candidate
+            FROM @pgkg_schema@.pgkg_vector_candidates(
                 q_embedding, p_namespace, p_session_id, k_initial,
                 p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
                 p_valid_at, 'chunks'
@@ -241,20 +241,20 @@ retrieved AS (
 ),
 seeds AS (
     SELECT ARRAY(
-        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::pgkg_candidate
-        FROM retrieved r, pgkg_fuse(r.candidates, rrf_k) f
+        SELECT (f.item_id, 'fused'::TEXT, 0, f.fused_score)::@pgkg_schema@.pgkg_candidate
+        FROM retrieved r, @pgkg_schema@.pgkg_fuse(r.candidates, rrf_k) f
     ) AS candidates
 ),
 
 expanded AS (
     SELECT ARRAY(
-        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::pgkg_candidate
-        FROM pgkg_graph_candidates(
+        SELECT (g.item_id, g.kind, g.rank, g.raw_score)::@pgkg_schema@.pgkg_candidate
+        FROM @pgkg_schema@.pgkg_graph_candidates(
             CASE
                 WHEN expand_graph
                  AND (p_sources IS NULL OR 'propositions' = ANY(p_sources))
                 THEN s.candidates
-                ELSE '{}'::pgkg_candidate[]
+                ELSE '{}'::@pgkg_schema@.pgkg_candidate[]
             END,
             p_namespace, 20, 10, 100,
             p_org_ids, p_collection_ids, p_user_id, p_acl_groups,
@@ -266,7 +266,7 @@ expanded AS (
 
 fused AS (
     SELECT f.*
-    FROM retrieved r, expanded x, pgkg_fuse(r.candidates || x.candidates, rrf_k) f
+    FROM retrieved r, expanded x, @pgkg_schema@.pgkg_fuse(r.candidates || x.candidates, rrf_k) f
 ),
 
 weighted AS (
@@ -284,15 +284,15 @@ weighted AS (
                ELSE              w_scope_org
            END)::REAL AS weighted_score
     FROM fused f
-    JOIN pgkg_item_scope(ARRAY(SELECT inner_f.item_id FROM fused inner_f)) s
+    JOIN @pgkg_schema@.pgkg_item_scope(ARRAY(SELECT inner_f.item_id FROM fused inner_f)) s
       ON s.item_id = f.item_id
 ),
 
 quota AS (
     SELECT q.*
-    FROM pgkg_apply_quotas(
+    FROM @pgkg_schema@.pgkg_apply_quotas(
         ARRAY(
-            SELECT (w.item_id, 'fused'::TEXT, 0, w.weighted_score)::pgkg_candidate
+            SELECT (w.item_id, 'fused'::TEXT, 0, w.weighted_score)::@pgkg_schema@.pgkg_candidate
             FROM weighted w
         ),
         k_rerank, corpus_fraction, memory_floor
@@ -301,9 +301,9 @@ quota AS (
 
 profiled AS (
     SELECT ap.*
-    FROM pgkg_apply_profile(
+    FROM @pgkg_schema@.pgkg_apply_profile(
         ARRAY(
-            SELECT (q.item_id, 'fused'::TEXT, 0, q.quota_score)::pgkg_candidate
+            SELECT (q.item_id, 'fused'::TEXT, 0, q.quota_score)::@pgkg_schema@.pgkg_candidate
             FROM quota q
         ),
         recency_half_life_days, perishable_half_life_days
@@ -312,13 +312,13 @@ profiled AS (
 
 payload AS (
     SELECT p.id AS item_id, p.text, p.asserted_at
-    FROM propositions p
+    FROM @pgkg_schema@.propositions p
     WHERE p.id IN (SELECT q.item_id FROM quota q)
 
     UNION ALL
 
     SELECT c.id, c.text, c.asserted_at
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.id IN (SELECT q.item_id FROM quota q)
 ),
 
@@ -327,7 +327,7 @@ payload AS (
 -- context: the lowest version id is an arbitrary choice, but a stable one.
 windows AS (
     SELECT DISTINCT ON (cw.chunk_id) cw.chunk_id, cw.context_text
-    FROM pgkg_chunk_window(
+    FROM @pgkg_schema@.pgkg_chunk_window(
         ARRAY(SELECT q.item_id FROM quota q), window_before, window_after
     ) cw
     ORDER BY cw.chunk_id, cw.document_version_id

@@ -179,9 +179,9 @@ AS $$
     SELECT (NOT p_provenance_only AND NOT p_version_scoped)
         OR EXISTS (
             SELECT 1
-            FROM document_version_chunks dvc
-            JOIN document_versions dv ON dv.id = dvc.document_version_id
-            JOIN documents d ON d.id = dv.document_id
+            FROM @pgkg_schema@.document_version_chunks dvc
+            JOIN @pgkg_schema@.document_versions dv ON dv.id = dvc.document_version_id
+            JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
             WHERE dvc.chunk_id = p_chunk_id
               AND dv.status = 'current'
               AND d.deleted_at IS NULL
@@ -210,20 +210,20 @@ WITH target AS (
            c.retrievable    AS was_retrievable,
            c.version_scoped AS was_scoped,
            c.version_scoped OR EXISTS (
-               SELECT 1 FROM document_version_chunks dvc
+               SELECT 1 FROM @pgkg_schema@.document_version_chunks dvc
                WHERE dvc.chunk_id = c.id
            ) AS scoped
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.id = ANY(p_chunk_ids)
 ),
 decided AS (
     SELECT t.*,
-           pgkg_chunk_retrievable(t.id, t.provenance_only, t.scoped)
+           @pgkg_schema@.pgkg_chunk_retrievable(t.id, t.provenance_only, t.scoped)
                AS is_retrievable
     FROM target t
 ),
 marked AS (
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET retrievable    = d.is_retrievable,
         version_scoped = d.scoped
     FROM decided d
@@ -238,7 +238,7 @@ flipped AS (
     WHERE d.is_retrievable IS DISTINCT FROM d.was_retrievable
 ),
 totals AS (
-    INSERT INTO corpus_stats AS cs
+    INSERT INTO @pgkg_schema@.corpus_stats AS cs
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', f.org_id, f.collection_id,
            SUM(f.delta_sign), SUM(f.delta_sign * f.doc_len)
@@ -250,7 +250,7 @@ totals AS (
             updated_at = now()
     RETURNING 1
 )
-INSERT INTO lexeme_df AS ld
+INSERT INTO @pgkg_schema@.lexeme_df AS ld
     (kind, namespace, lexeme, org_id, collection_id, df)
 SELECT 'chunk', '', u.lexeme, f.org_id, f.collection_id, SUM(f.delta_sign)
 FROM flipped f, unnest(f.tsv) AS u(lexeme, positions, weights)
@@ -281,7 +281,7 @@ BEGIN
     WHERE n.provenance_only IS DISTINCT FROM o.provenance_only;
 
     IF v_ids IS NOT NULL THEN
-        PERFORM pgkg_chunk_retrievability_sync(v_ids);
+        PERFORM @pgkg_schema@.pgkg_chunk_retrievability_sync(v_ids);
     END IF;
 
     RETURN NULL;
@@ -295,42 +295,42 @@ RETURNS VOID
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET version_scoped = TRUE
     WHERE NOT c.version_scoped
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
       AND EXISTS (
-          SELECT 1 FROM document_version_chunks dvc WHERE dvc.chunk_id = c.id
+          SELECT 1 FROM @pgkg_schema@.document_version_chunks dvc WHERE dvc.chunk_id = c.id
       );
 
-    UPDATE chunks c
+    UPDATE @pgkg_schema@.chunks c
     SET retrievable =
-            pgkg_chunk_retrievable(c.id, c.provenance_only, c.version_scoped)
+            @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.provenance_only, c.version_scoped)
     WHERE (p_collection_id IS NULL OR c.collection_id = p_collection_id)
       AND c.retrievable IS DISTINCT FROM
-          pgkg_chunk_retrievable(c.id, c.provenance_only, c.version_scoped);
+          @pgkg_schema@.pgkg_chunk_retrievable(c.id, c.provenance_only, c.version_scoped);
 
-    DELETE FROM corpus_stats
+    DELETE FROM @pgkg_schema@.corpus_stats
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL OR collection_id = p_collection_id);
 
-    DELETE FROM lexeme_df
+    DELETE FROM @pgkg_schema@.lexeme_df
     WHERE kind = 'chunk'
       AND (p_collection_id IS NULL OR collection_id = p_collection_id);
 
-    INSERT INTO corpus_stats
+    INSERT INTO @pgkg_schema@.corpus_stats
         (kind, namespace, org_id, collection_id, n_total, total_len)
     SELECT 'chunk', '', c.org_id, c.collection_id,
            COUNT(*), COALESCE(SUM(c.doc_len), 0)
-    FROM chunks c
+    FROM @pgkg_schema@.chunks c
     WHERE c.retrievable
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
     GROUP BY c.org_id, c.collection_id;
 
-    INSERT INTO lexeme_df
+    INSERT INTO @pgkg_schema@.lexeme_df
         (kind, namespace, lexeme, org_id, collection_id, df)
     SELECT 'chunk', '', u.lexeme, c.org_id, c.collection_id, COUNT(*)
-    FROM chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
+    FROM @pgkg_schema@.chunks c, unnest(c.tsv) AS u(lexeme, positions, weights)
     WHERE c.retrievable
       AND (p_collection_id IS NULL OR c.collection_id = p_collection_id)
     GROUP BY u.lexeme, c.org_id, c.collection_id;
@@ -390,21 +390,21 @@ DECLARE
     v_org        UUID;
     v_collection UUID;
     v_provenance UUID;
-    v_hash       BYTEA := digest(p_text, 'sha256');
+    v_hash       BYTEA := @extschema:pgcrypto@.digest(p_text, 'sha256');
     v_chunk      UUID;
     v_is_new     BOOLEAN := FALSE;
 BEGIN
     SELECT d.org_id, d.collection_id, dv.provenance_id
     INTO v_org, v_collection, v_provenance
-    FROM document_versions dv
-    JOIN documents d ON d.id = dv.document_id
+    FROM @pgkg_schema@.document_versions dv
+    JOIN @pgkg_schema@.documents d ON d.id = dv.document_id
     WHERE dv.id = p_version_id;
 
     IF v_org IS NULL THEN
         RAISE EXCEPTION 'no such document version %', p_version_id;
     END IF;
 
-    INSERT INTO chunks (text, org_id, collection_id, acl_group_id,
+    INSERT INTO @pgkg_schema@.chunks (text, org_id, collection_id, acl_group_id,
                         provenance_id, asserted_at, visibility, owner_user_id)
     VALUES (p_text, v_org, v_collection, p_acl_group_id,
             v_provenance, p_asserted_at, p_visibility, p_owner_user_id)
@@ -420,7 +420,7 @@ BEGIN
 
     IF v_chunk IS NULL THEN
         SELECT c.id INTO v_chunk
-        FROM chunks c
+        FROM @pgkg_schema@.chunks c
         WHERE c.org_id = v_org
           AND c.collection_id = v_collection
           AND c.acl_group_id IS NOT DISTINCT FROM p_acl_group_id
@@ -432,7 +432,7 @@ BEGIN
         v_is_new := TRUE;
     END IF;
 
-    INSERT INTO document_version_chunks (document_version_id, chunk_id, ord)
+    INSERT INTO @pgkg_schema@.document_version_chunks (document_version_id, chunk_id, ord)
     VALUES (p_version_id, v_chunk, p_ord)
     ON CONFLICT ON CONSTRAINT document_version_chunks_pkey DO NOTHING;
 
