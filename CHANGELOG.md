@@ -36,7 +36,9 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   (statistics included), pins `search_path` and can be executed only by `pgkg_app`. Tests show it
   returns exactly the rows and scores the policy path returns, across other-org, other-collection,
   private and ACL-denied cases, and that it uses the GIN index where the policy path cannot. It is
-  off by default, and it does not help on tables set to `FORCE ROW LEVEL SECURITY`. See the README,
+  off by default, and it does not help on tables set to `FORCE ROW LEVEL SECURITY`. The function is
+  installed and granted to `pgkg_app` everywhere, and the setting only selects it. A role without
+  the grant keeps the policy path and is refused only if it selects `owner`. See the README,
   "Known limitations: managed Postgres".
 - **A passage no crawl comes back for is now vectored on a timer.** The repair a corpus ingest
   performs for its own stranded rows runs after the transaction that promoted the version, so an

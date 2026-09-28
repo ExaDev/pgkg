@@ -229,8 +229,11 @@ async def row_security_warnings(
     statement a superuser runs to mark it — except the keyword operators when
     the owner arm is selected and actually escapes the policy, because that is
     the remedy already taken.  And one when the owner arm is selected but its
-    owner is under the policy after all, where it buys nothing.
+    owner is under the policy after all, where it buys nothing.  A schema that
+    predates 059 has none of the functions this reads, and is told so.
     """
+    if not await conn.fetchval(_HAS_059_SQL):
+        return (_NOT_MIGRATED,)
     owner_effective = await owner_arm_bypasses_policy(conn)
     owner_remedies_keyword = keyword_arm == "owner" and owner_effective
     unmarked = tuple(
@@ -246,6 +249,16 @@ async def row_security_warnings(
     )
     return unmarked + ineffective
 
+
+_HAS_059_SQL = """
+SELECT to_regprocedure('pgkg_leakproof_state()') IS NOT NULL
+   AND to_regprocedure('pgkg_owner_arm_bypasses_policy()') IS NOT NULL
+"""
+
+_NOT_MIGRATED = (
+    "this schema predates migration 059, so the LEAKPROOF state of the keyword "
+    "and gazetteer operators cannot be read; run `pgkg migrate` first."
+)
 
 _OWNER_ARM_UNDER_POLICY = (
     "PGKG_KEYWORD_ARM=owner is selected, but pgkg_bm25_candidates_as_owner() "

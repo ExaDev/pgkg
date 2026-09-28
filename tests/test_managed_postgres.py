@@ -649,15 +649,21 @@ async def test_the_pool_carries_the_arm_across_every_acquire(
     pg_dsn: str, arm: str
 ) -> None:
     """A startup option, for the reason hnsw.iterative_scan is one: asyncpg
-    issues RESET ALL on release, and a SET would survive one acquire."""
+    issues RESET ALL on release, and a SET would survive one acquire.
+
+    The policy arm sends no parameter at all: it is what an unset GUC already
+    means, and a pooler such as PgBouncer refuses a startup parameter it does
+    not know, so a deployment that never opted in must not be made to send
+    one."""
     from pgkg.db import make_pool
 
+    expected = arm if arm == "owner" else None
     pool = await make_pool(pg_dsn, keyword_arm=arm)
     try:
         for _ in range(3):
             async with pool.acquire() as conn:
                 seen = await conn.fetchval("SELECT current_setting($1, true)", ARM_GUC)
-                assert seen == arm
+                assert seen == expected
     finally:
         await pool.close()
 
@@ -708,7 +714,181 @@ async def test_the_keyword_arm_dispatches_on_the_setting(
 
     (owner_scan,) = [
         line for line in plan.splitlines()
-        if "Function Scan on pgkg_bm25_candidates_as_owner" in line
+        if "Function Scan on pgkg_bm25_candidates_owner_gate" in line
     ]
     assert ("never executed" not in owner_scan) is owner_runs, plan
     assert rows, "nothing matched, so either branch would look the same"
+    assert "Function Scan on pgkg_bm25_candidates_under_policy" not in plan, (
+        "the policy path no longer inlines into the dispatcher, so its plan is "
+        f"no longer 041's:\n{plan}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A role that is not pgkg_app.
+# ---------------------------------------------------------------------------
+#
+# 020 says the policies bite for any non-exempt role the operator creates by
+# hand, and 059 grants the owner arm to pgkg_app alone.  Postgres checks
+# EXECUTE on a function in a FROM list when the plan is initialised, not when
+# the node first runs.  So an owner branch gated only by a One-Time Filter
+# denied every keyword call for such a role, on the default path with the GUC
+# unset.
+
+@asynccontextmanager
+async def as_other_role(
+    conn: asyncpg.Connection, org: uuid.UUID
+) -> AsyncIterator[str]:
+    """A hand-made application role: table and schema access, not pgkg_app."""
+    async with conn.transaction():
+        role = unique("other_app")
+        await conn.execute(f"CREATE ROLE {role} NOLOGIN")
+        await conn.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
+        await conn.execute(f"GRANT SELECT ON ALL TABLES IN SCHEMA public TO {role}")
+        await conn.execute(f"SET LOCAL ROLE {role}")
+        await conn.execute("SELECT set_config($1, $2, true)", ORG_GUC, str(org))
+        yield role
+
+
+async def test_a_role_that_is_not_pgkg_app_keeps_the_policy_path(
+    pool: asyncpg.Pool, tenancy
+) -> None:
+    _, args = _scope_args(tenancy, "own org", "chunks")
+    async with pool.acquire() as conn, as_other_role(conn, tenancy["mine"]):
+        rows = await conn.fetch(KEYWORD_ARM, *args)
+        retrieved = await conn.fetch(
+            "SELECT item_id FROM pgkg_retrieve($1, NULL, 10, 200, $2)",
+            args[0],
+            tenancy["namespace"],
+        )
+
+    assert tenancy["ids"][("chunks", "home")] in {r["item_id"] for r in rows}
+    assert retrieved, "pgkg_retrieve() returned nothing on the default path"
+
+
+async def test_a_role_that_is_not_pgkg_app_is_refused_the_owner_arm(
+    pool: asyncpg.Pool, tenancy
+) -> None:
+    """Selecting the owner arm without the grant fails closed, by name."""
+    _, args = _scope_args(tenancy, "own org", "chunks")
+    async with pool.acquire() as conn, as_other_role(conn, tenancy["mine"]):
+        await conn.execute("SELECT set_config($1, 'owner', true)", ARM_GUC)
+        with pytest.raises(
+            asyncpg.InsufficientPrivilegeError,
+            match="pgkg_bm25_candidates_as_owner",
+        ):
+            await conn.fetch(KEYWORD_ARM, *args)
+
+
+async def test_the_owner_arm_itself_refuses_an_ungranted_role(
+    pool: asyncpg.Pool, tenancy
+) -> None:
+    _, args = _scope_args(tenancy, "own org", "chunks")
+    async with pool.acquire() as conn, as_other_role(conn, tenancy["mine"]):
+        with pytest.raises(asyncpg.InsufficientPrivilegeError):
+            await conn.fetch(
+                "SELECT * FROM pgkg_bm25_candidates_as_owner("
+                "$1, $2, NULL, 200, $3::uuid[], $4::uuid[], $5::uuid,"
+                " $6::uuid[], NULL, $7)",
+                *args,
+            )
+
+
+DISPATCHER = OWNER_ARM.replace("_as_owner", "")
+
+
+@pytest.mark.parametrize("arm", ["policy", "owner"])
+async def test_the_keyword_arm_returns_its_rows_in_rank_order(
+    pool: asyncpg.Pool, tenancy, arm: str
+) -> None:
+    """A UNION ALL guarantees no order, and callers read the arm without an
+    ORDER BY of their own, as they did when it was one SELECT with one."""
+    _, args = _scope_args(tenancy, "names everyone", "chunks")
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await as_app(conn, tenancy["mine"])
+            await conn.execute("SELECT set_config($1, $2, true)", ARM_GUC, arm)
+            rows = await conn.fetch(
+                "SELECT rank FROM pgkg_bm25_candidates("
+                "$1, $2, NULL, 200, $3::uuid[], $4::uuid[], $5::uuid,"
+                " $6::uuid[], NULL, $7)",
+                *args,
+            )
+        source = await conn.fetchval(
+            "SELECT prosrc FROM pg_proc WHERE oid = $1::regprocedure", DISPATCHER
+        )
+
+    ranks = [r["rank"] for r in rows]
+    assert len(ranks) > 1
+    assert ranks == sorted(ranks)
+    assert "ORDER BY" in source.rsplit("UNION ALL", 1)[1], (
+        "the order is what the planner happened to produce, not what the "
+        "dispatcher asks for"
+    )
+
+
+# The org rule the owner arm restates, in the words it restates it from.  If
+# pgkg_current_org() or pgkg_default_org() is redefined, the owner arm's copy
+# in 059 has to be re-read against the new text before this is updated.
+CURRENT_ORG_RULE = (
+    "COALESCE(NULLIF(current_setting('pgkg.org_id', TRUE), '')::UUID,"
+    " pgkg_default_org())"
+)
+DEFAULT_ORG_RULE = "SELECT '00000000-0000-0000-0000-000000000001'::UUID"
+
+
+def _normalised(sql: str) -> str:
+    """Whitespace, schema qualification and parenthesis padding removed, so
+    the #30 qualification of these bodies does not read as a redefinition."""
+    text = " ".join(sql.replace("public.", "").replace("pg_catalog.", "").split())
+    return text.replace("( ", "(").replace(" )", ")")
+
+
+async def test_the_owner_arm_restates_the_org_rule_the_policies_call(
+    pool: asyncpg.Pool,
+) -> None:
+    async with pool.acquire() as conn:
+        sources = {
+            row["proname"]: row["prosrc"]
+            for row in await conn.fetch(
+                "SELECT proname, prosrc FROM pg_proc p"
+                " JOIN pg_namespace n ON n.oid = p.pronamespace"
+                " WHERE n.nspname = 'public' AND proname = ANY($1::text[])",
+                ["pgkg_current_org", "pgkg_default_org",
+                 "pgkg_bm25_candidates_as_owner"],
+            )
+        }
+
+    message = (
+        "pgkg_current_org() or pgkg_default_org() no longer reads the way "
+        "pgkg_bm25_candidates_as_owner() restates it; update the owner arm's "
+        "readable_orgs before this pin"
+    )
+    assert _normalised(sources["pgkg_current_org"]) == _normalised(
+        f"SELECT {CURRENT_ORG_RULE}"
+    ), message
+    assert _normalised(sources["pgkg_default_org"]) == _normalised(
+        DEFAULT_ORG_RULE
+    ), message
+    assert _normalised(CURRENT_ORG_RULE) in _normalised(
+        sources["pgkg_bm25_candidates_as_owner"]
+    ), message
+
+
+async def test_a_schema_without_059_is_told_to_migrate(pool: asyncpg.Pool) -> None:
+    """`pgkg check` against a schema that predates 059 says what to do rather
+    than printing an UndefinedFunctionError traceback."""
+    from pgkg.config import row_security_warnings
+
+    async with pool.acquire() as conn:
+        transaction = conn.transaction()
+        await transaction.start()
+        try:
+            await conn.execute("DROP FUNCTION pgkg_owner_arm_bypasses_policy()")
+            await conn.execute("DROP FUNCTION pgkg_leakproof_state() CASCADE")
+            warnings = await row_security_warnings(conn, keyword_arm="policy")
+        finally:
+            await transaction.rollback()
+
+    assert len(warnings) == 1, warnings
+    assert "059" in warnings[0] and "pgkg migrate" in warnings[0]

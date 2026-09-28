@@ -589,6 +589,10 @@ the same way on `entities`. Neither the vector (HNSW) arm nor `pgkg_visible()` i
   of every operator. `keyword_index` also carries `arm` and `owner_arm_bypasses_policy`.
 - In SQL, `SELECT * FROM pgkg_leakproof_state()`.
 
+`pgkg migrate` and `pgkg check` read `PGKG_KEYWORD_ARM` from the environment they run in, while
+`/health` reports the `pgkg.keyword_arm` GUC on its own connection. Run the CLI with the same
+environment as the application, or it will judge the keyword warnings against the wrong arm.
+
 **The fix, if you can get a superuser.** Run the statements in the `fix` column of
 `pgkg_leakproof_state()` as the functions' owner. Nothing else changes, and none of it needs a
 restart. `similarity_op` lives in whichever schema holds `pg_trgm`, which is usually `public`:
@@ -608,6 +612,14 @@ own tables' policies, so inside the function `@@` is an ordinary qual and the GI
 the value `owner` selects the new path; anything else, including leaving it unset, keeps the policy
 path. It covers the keyword arm only, so the gazetteer stays degraded until a superuser marks its
 operators.
+
+The setting chooses a plan; it is not a security boundary. Migration 059 installs
+`pgkg_bm25_candidates_as_owner()` on every deployment and grants it to `pgkg_app`, and `pgkg_app`
+can set the GUC itself or call the function directly. That is acceptable only because the function
+returns the same rows as the policy path, and the tests that pin that are what the grant rests on.
+It shares the GIN timing channel that 043 accepted, described below. A role without the grant, such
+as an application role you created by hand or a read-only role, keeps working on the policy path
+and is refused only if it selects `owner`.
 
 Why this is safe, and what it depends on:
 

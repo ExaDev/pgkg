@@ -105,7 +105,15 @@
 -- pgkg/db.py gives for hnsw.iterative_scan.  The policy-path body is renamed,
 -- not restated, so it is still 041's text and the plan-shape tests still see
 -- the same plan: the dispatcher is a single SELECT and inlines, and so does
--- the body beneath it.
+-- the body beneath it.  The owner branch goes through a PL/pgSQL gate (section
+-- 5) so that a role without EXECUTE on the owner arm is refused only when it
+-- selects that arm, never on the default path.
+--
+-- The opt-in is a choice of plan, not a security boundary.  The owner arm is
+-- installed and granted to pgkg_app on every deployment, and pgkg_app may set
+-- the GUC or call the function directly.  That is acceptable only because the
+-- arm returns what the policy path returns; the tests that pin that equality
+-- are what the grant rests on.
 --
 -- FORCE ROW LEVEL SECURITY.  If a deployment forces row security on these
 -- tables, the owner is under the policy inside the function as well.  The arm
@@ -385,16 +393,62 @@ BEGIN
         ) TO pgkg_app;
     ELSE
         RAISE WARNING
-            'pgkg_app does not exist, so nothing may call '
-            'pgkg_bm25_candidates_as_owner(); PGKG_KEYWORD_ARM=owner will fail '
-            'until it is granted EXECUTE to the application role';
+            'pgkg_app does not exist, so no application role may call '
+            'pgkg_bm25_candidates_as_owner(): the policy path is unaffected, and '
+            'PGKG_KEYWORD_ARM=owner is refused until the role that selects it '
+            'is granted EXECUTE on the function';
     END IF;
 END;
 $$;
 
 
--- 5. The name every keyword caller uses, dispatching on the setting.  Unset,
--- or anything but 'owner', is the policy path.
+-- 5. The gate the dispatcher reaches the owner arm through.
+--
+-- Postgres checks EXECUTE on every function in a FROM list when it
+-- initialises the plan, including one under a One-Time Filter that will never
+-- let it run.  Named directly in the dispatcher, the owner arm would therefore
+-- deny every keyword call — on the default path, GUC unset — to any role
+-- without the grant: an application role an operator made by hand, which 020
+-- supports, a read-only role, or every role of a deployment where pgkg_app did
+-- not exist when this ran.  A PL/pgSQL body is planned only when it runs, so
+-- behind this gate the owner arm's EXECUTE check happens if and only if the
+-- owner branch is taken, and an ungranted role that selects it is refused by
+-- name.  The gate is SECURITY INVOKER and PUBLIC may execute it: it confers
+-- nothing, since what it calls still checks the caller.
+CREATE FUNCTION pgkg_bm25_candidates_owner_gate(
+    q_text           TEXT,
+    p_namespace      TEXT,
+    p_session_id     TEXT,
+    k_initial        INT,
+    p_org_ids        UUID[],
+    p_collection_ids UUID[],
+    p_user_id        UUID,
+    p_acl_groups     UUID[],
+    p_valid_at       TIMESTAMPTZ,
+    p_source         TEXT
+) RETURNS TABLE (
+    item_id   UUID,
+    kind      TEXT,
+    rank      INT,
+    raw_score REAL
+)
+LANGUAGE plpgsql STABLE
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT o.item_id, o.kind, o.rank, o.raw_score
+    FROM public.pgkg_bm25_candidates_as_owner(
+        q_text, p_namespace, p_session_id, k_initial, p_org_ids,
+        p_collection_ids, p_user_id, p_acl_groups, p_valid_at, p_source
+    ) o;
+END;
+$$;
+
+
+-- 6. The name every keyword caller uses, dispatching on the setting.  Unset,
+-- or anything but 'owner', is the policy path.  Ordered at the top, because a
+-- UNION ALL promises no order and callers read the arm as the single ordered
+-- SELECT it was; ordering by rank is the arm's own order, and it still inlines.
 CREATE FUNCTION pgkg_bm25_candidates(
     q_text           TEXT,
     p_namespace      TEXT   DEFAULT 'default',
@@ -424,11 +478,13 @@ WHERE pg_catalog.current_setting('pgkg.keyword_arm', TRUE) IS DISTINCT FROM 'own
 UNION ALL
 
 SELECT o.item_id, o.kind, o.rank, o.raw_score
-FROM public.pgkg_bm25_candidates_as_owner(
+FROM public.pgkg_bm25_candidates_owner_gate(
     q_text, p_namespace, p_session_id, k_initial, p_org_ids, p_collection_ids,
     p_user_id, p_acl_groups, p_valid_at, p_source
 ) o
-WHERE pg_catalog.current_setting('pgkg.keyword_arm', TRUE) = 'owner';
+WHERE pg_catalog.current_setting('pgkg.keyword_arm', TRUE) = 'owner'
+
+ORDER BY 3;
 $$;
 
 COMMENT ON FUNCTION pgkg_bm25_candidates(
@@ -439,7 +495,7 @@ COMMENT ON FUNCTION pgkg_bm25_candidates(
     'Postgres that cannot mark the @@ functions LEAKPROOF (migration 059).';
 
 
--- 6. Whether the owner-rights path actually escapes the policy, which is the
+-- 7. Whether the owner-rights path actually escapes the policy, which is the
 -- only thing it is for.
 CREATE FUNCTION pgkg_owner_arm_bypasses_policy()
 RETURNS BOOLEAN

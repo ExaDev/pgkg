@@ -38,17 +38,20 @@ async def make_pool(
     #
     # The keyword arm travels the same way and for the same reason: 059's
     # dispatcher reads it on every call, and a SET would select the owner arm
-    # for one acquire and the policy path for every one after.
+    # for one acquire and the policy path for every one after.  Sent only when
+    # it selects the owner arm: unset already means the policy path, and a
+    # pooler such as PgBouncer refuses a startup parameter it does not know, so
+    # a deployment that never opted in must not be made to send one.
     arm = keyword_arm or get_settings().keyword_arm
+    server_settings = {"hnsw.iterative_scan": _ITERATIVE_SCAN} | (
+        {KEYWORD_ARM_GUC: arm} if arm == "owner" else {}
+    )
     pool = await asyncpg.create_pool(
         dsn,
         min_size=1,
         max_size=10,
         init=_init_connection,
-        server_settings={
-            "hnsw.iterative_scan": _ITERATIVE_SCAN,
-            KEYWORD_ARM_GUC: arm,
-        },
+        server_settings=server_settings,
     )
     return pool  # type: ignore[return-value]
 
