@@ -19,10 +19,10 @@ index condition into a per-row call.  The plan assertions are what hold that.
 """
 from __future__ import annotations
 
-import argparse
 import re
 import uuid
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from urllib.parse import urlsplit, urlunsplit
 
 import asyncpg
@@ -31,7 +31,7 @@ from pgvector import HalfVector
 from pgvector.asyncpg import register_vector
 
 from pgkg.db import make_pool
-from pgkg.migrate import MIGRATIONS_DIR, apply_migrations
+from pgkg.migrate import MIGRATIONS_DIR, UntrackedInstallError, apply_migrations
 
 SCHEMA = "pgkg_host"
 EXTENSION_SCHEMA = "pgkg_ext"
@@ -55,29 +55,42 @@ def _with_database(dsn: str, database: str) -> str:
     return urlunsplit(parts._replace(path=f"/{database}"))
 
 
-@pytest.fixture(scope="module")
-async def vendored_dsn(pg_dsn: str) -> AsyncIterator[str]:
-    database = unique("pgkg_vendored")
+@asynccontextmanager
+async def _scratch_database(pg_dsn: str, prefix: str) -> AsyncIterator[str]:
+    """A database of its own, dropped afterwards, so an install in it cannot
+    meet the suite's."""
+    database = unique(prefix)
     admin = await asyncpg.connect(pg_dsn)
     try:
         await admin.execute(f"CREATE DATABASE {database}")
     finally:
         await admin.close()
-
-    dsn = _with_database(pg_dsn, database)
-    conn = await asyncpg.connect(dsn)
     try:
-        await apply_migrations(conn, schema=SCHEMA, extension_schema=EXTENSION_SCHEMA)
+        yield _with_database(pg_dsn, database)
     finally:
-        await conn.close()
+        admin = await asyncpg.connect(pg_dsn)
+        try:
+            await admin.execute(f"DROP DATABASE {database} WITH (FORCE)")
+        finally:
+            await admin.close()
 
-    yield dsn
 
-    admin = await asyncpg.connect(pg_dsn)
-    try:
-        await admin.execute(f"DROP DATABASE {database} WITH (FORCE)")
-    finally:
-        await admin.close()
+@pytest.fixture(scope="module")
+async def vendored_dsn(pg_dsn: str) -> AsyncIterator[str]:
+    """pgkg in pgkg_host, with its extensions in a schema the operator made
+    beforehand and granted nothing on, which is what `CREATE SCHEMA` leaves:
+    the runner has to give the application role what it needs there."""
+    async with _scratch_database(pg_dsn, "pgkg_vendored") as dsn:
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute(f"CREATE SCHEMA {EXTENSION_SCHEMA}")
+            await apply_migrations(
+                conn, schema=SCHEMA, extension_schema=EXTENSION_SCHEMA
+            )
+        finally:
+            await conn.close()
+
+        yield dsn
 
 
 async def _connect_without_a_path(dsn: str) -> asyncpg.Connection:
@@ -186,20 +199,13 @@ async def test_pgkg_migrate_installs_into_the_configured_schema(
     from pgkg import cli
     from pgkg.config import Settings
 
-    database = unique("pgkg_cli")
-    admin = await asyncpg.connect(pg_dsn)
-    await admin.execute(f"CREATE DATABASE {database}")
-    try:
-        dsn = _with_database(pg_dsn, database)
+    async with _scratch_database(pg_dsn, "pgkg_cli") as dsn:
         settings = Settings(
-            _env_file=None,
-            database_url=dsn,
-            db_schema="pgkg_cli_host",
-            extension_schema="pgkg_cli_ext",
+            _env_file=None, db_schema="pgkg_cli_host", extension_schema="pgkg_cli_ext"
         )
         monkeypatch.setattr("pgkg.config.get_settings", lambda: settings)
 
-        await cli.run_migrate(argparse.Namespace())
+        await cli.run_migrate(dsn)
 
         conn = await asyncpg.connect(dsn)
         try:
@@ -208,12 +214,56 @@ async def test_pgkg_migrate_installs_into_the_configured_schema(
             )
         finally:
             await conn.close()
-    finally:
-        await admin.execute(f"DROP DATABASE {database} WITH (FORCE)")
-        await admin.close()
 
     assert recorded == len(list(MIGRATIONS_DIR.glob("*.sql")))
     assert "Applying 001_extensions.sql..." in capsys.readouterr().out
+
+
+async def test_an_untracked_install_is_refused_rather_than_reapplied(
+    pg_dsn: str,
+) -> None:
+    """pgkg objects in the schema and no tracking table there means the
+    tracking table was lost or the schema was installed another way.  Running
+    from 001 would fail part-way at best; the runner says what to do instead."""
+    async with _scratch_database(pg_dsn, "pgkg_untracked") as dsn:
+        conn = await asyncpg.connect(dsn)
+        try:
+            await conn.execute("CREATE SCHEMA pgkg_old")
+            await conn.execute("CREATE TABLE pgkg_old.orgs (id UUID PRIMARY KEY)")
+
+            with pytest.raises(UntrackedInstallError, match="baseline"):
+                await apply_migrations(
+                    conn, schema="pgkg_old", extension_schema="pgkg_old"
+                )
+            tracked = await conn.fetchval(
+                "SELECT to_regclass('pgkg_old.pgkg_schema_migrations') IS NOT NULL"
+            )
+        finally:
+            await conn.close()
+
+    assert not tracked
+
+
+async def test_an_extension_schema_nothing_is_created_in_is_not_created(
+    pg_dsn: str,
+) -> None:
+    """Every extension already installed elsewhere leaves the configured
+    extension schema with nothing to hold, so the runner does not make it."""
+    async with _scratch_database(pg_dsn, "pgkg_ext_elsewhere") as dsn:
+        conn = await asyncpg.connect(dsn)
+        try:
+            for extension in ("vector", "pg_trgm", "pgcrypto"):
+                await conn.execute(f"CREATE EXTENSION {extension} SCHEMA public")
+            await apply_migrations(
+                conn, schema="pgkg_elsewhere", extension_schema="pgkg_unused"
+            )
+            created = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'pgkg_unused')"
+            )
+        finally:
+            await conn.close()
+
+    assert not created
 
 
 async def test_the_application_pool_finds_pgkg_in_its_schema(vendored_dsn: str) -> None:
@@ -259,6 +309,35 @@ async def test_a_row_security_policy_resolves_and_inlines_without_a_path(
     assert "pgkg_current_org" not in plan, (
         f"the policy's function was not inlined:\n{plan}"
     )
+
+
+async def test_the_application_role_retrieves_through_an_operator_made_extension_schema(
+    caller: asyncpg.Connection,
+) -> None:
+    """pgkg_app reaches halfvec, `<=>` and similarity() through the extension
+    schema, so it needs USAGE there.  A schema the operator created has none
+    for it, and the runner grants exactly that: to pgkg_app, not to PUBLIC."""
+    async with caller.transaction():
+        await caller.execute("SET LOCAL ROLE pgkg_app")
+        await caller.execute(
+            "SELECT pg_catalog.set_config('pgkg.org_id', $1, true)", str(DEFAULT_ORG)
+        )
+        rows = await caller.fetch(
+            f"""
+            SELECT item_id FROM {SCHEMA}.pgkg_retrieve(
+                'helios', $1::{EXTENSION_SCHEMA}.halfvec,
+                p_namespace => 'nowhere', p_org_ids => $2::uuid[]
+            )
+            """,
+            vec(3), [DEFAULT_ORG],
+        )
+    public_usage = await caller.fetchval(
+        "SELECT pg_catalog.has_schema_privilege('public', $1, 'USAGE')",
+        EXTENSION_SCHEMA,
+    )
+
+    assert rows == []
+    assert not public_usage
 
 
 async def test_a_statistics_trigger_fires_without_a_path(

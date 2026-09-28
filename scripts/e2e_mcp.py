@@ -24,12 +24,12 @@ import asyncio, contextlib, json, os, socket, subprocess, textwrap
 from pathlib import Path
 from uuid import UUID
 
-import asyncpg
 import httpx
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 from pgkg.config import DEFAULT_COLLECTION_ID, DEFAULT_ORG_ID
+from pgkg.db import make_pool
 
 REPO = Path(__file__).resolve().parent.parent
 UV = ["uv", "run", "--python", "3.12"]
@@ -243,7 +243,10 @@ async def main():
         "so sections 6 and 7 cannot mean anything. Run with "
         "PGKG_OFFLINE_EXTRACT=0 and a real provider."
     )
-    conn = await asyncpg.connect(db_url)
+    # Through the application's pool, so the unqualified queries below find
+    # pgkg in PGKG_DB_SCHEMA the way the server they are checking does.
+    pool = await make_pool(db_url, max_size=1)
+    conn = await pool.acquire()
     params = server_params()
     async with stdio_client(params) as (r, w):
         async with ClientSession(r, w) as s:
@@ -435,7 +438,8 @@ async def main():
         f"arm can ever find it: {[(str(r['collection_id']), r['has_vector']) for r in rows]}"
     )
 
-    await conn.close()
+    await pool.release(conn)
+    await pool.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
