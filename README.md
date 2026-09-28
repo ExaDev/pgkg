@@ -510,6 +510,56 @@ refuses content that names none: pass `acl_group_id` on `POST /documents` or to
 Drive group tree is not built — so today it is the connector's to supply, and an ACL-bounded
 collection fails closed rather than publishing untagged content.
 
+### The application role
+
+Postgres exempts a table's owner from row-level security, so every policy is inert for the role
+that ran the migrations. The policies are written for `pgkg_app`, a `NOLOGIN` role that is neither
+owner nor `SUPERUSER` or `BYPASSRLS`. Without it the policies protect nothing, so `pgkg migrate`
+will not run without it, and refuses a `pgkg_app` that is either.
+
+Connect the deployment as a dedicated login that is a member of `pgkg_app` and owns nothing:
+
+```sql
+CREATE ROLE pgkg_service LOGIN PASSWORD '...' IN ROLE pgkg_app;
+```
+
+Connecting as the migrator and running `SET ROLE pgkg_app` also works, but it is weaker: any
+statement that can issue `RESET ROLE` is back to the table owner, for whom no policy applies.
+
+The migrations also withhold one table from `pgkg_app`: `pgkg_schema_migrations`, the ledger
+`pgkg migrate` keeps. It carries no policy, and a row deleted from it is a migration the next run
+applies again.
+
+- **Created by the migrations.** When the migrating role is a superuser or has `CREATEROLE`,
+  migration 020 creates `pgkg_app` and grants it to the session that migrated, so that login can
+  `SET ROLE pgkg_app`. On PG16 and later that grant is what makes the role usable at all: a
+  `CREATEROLE` user holds only `ADMIN` on a role it creates.
+
+  Roles are cluster-wide, so a second database on the same cluster finds `pgkg_app` already there
+  and only grants to it. A migrator for that database that is not already a member cannot assume
+  it until whoever holds `ADMIN` on `pgkg_app` — its original creator, or a superuser — runs
+  `GRANT pgkg_app TO <login>`.
+- **Provisioned externally.** On a managed Postgres the migrating user often cannot create roles —
+  a Cloud SQL IAM user, for one. An administrator creates the role first, and the migrations then
+  only grant to it:
+
+  ```sql
+  CREATE ROLE pgkg_app NOLOGIN;
+  GRANT pgkg_app TO my_service_login;   -- the login the deployment connects as
+  ```
+
+  The administrator also enables `vector`, which is not a trusted extension, in the target
+  database; `pg_trgm` and `pgcrypto` are trusted and the database owner can create them.
+
+Before applying anything, `pgkg migrate` checks that `pgkg_app` exists or that the migrating role
+can create it and that it is not exempt from row security, and otherwise exits with the statement
+that fixes it instead of migrating a schema whose
+policies have no one to apply to. Migration 020 raises the same error for a runner that is not
+`pgkg migrate`. There is no opt-out: a deployment that connects as the owner loses nothing by the
+role existing. An install that ran 020 before it stopped silently degrading gets the repair from
+058, which creates the role if it can, grants it to the migrating login where that login could not
+assume it, and re-grants every table.
+
 ### Development mode
 
 The suite runs against a real Postgres — every assertion goes through SQL, because that is where the

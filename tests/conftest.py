@@ -77,9 +77,9 @@ def _docker_dsn():
         )
 
 
-@pytest.fixture(scope="session")
-def pg_dsn():
-    """Return a Postgres DSN for the integration suite.
+@contextmanager
+def cluster_dsn():
+    """Start a Postgres cluster of its own and yield a superuser DSN for it.
 
     Backend selection via PGKG_TEST_BACKEND:
       auto (default) — try embedded pgserver, fall back to Docker if the
@@ -102,6 +102,25 @@ def pg_dsn():
                 return
 
     with _docker_dsn() as dsn:
+        yield dsn
+
+
+@pytest.fixture(scope="session")
+def pg_dsn():
+    """Return a Postgres DSN for the integration suite."""
+    with cluster_dsn() as dsn:
+        yield dsn
+
+
+@pytest.fixture(scope="module")
+def fresh_cluster_dsn():
+    """A superuser DSN on a cluster no other module has migrated.
+
+    Roles are cluster-wide, so a test about whether the migrations can create
+    pgkg_app cannot share the suite's cluster, where the session pool has
+    already created it.
+    """
+    with cluster_dsn() as dsn:
         yield dsn
 
 

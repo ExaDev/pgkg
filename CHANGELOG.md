@@ -7,6 +7,19 @@ integrated together, plus the parent pointer's removal. Migrations 051-056 (050 
 fix that needed no DDL; the gap is deliberate). Full reasoning in
 [`docs/adrs/0001-implementation-notes.md`](docs/adrs/0001-implementation-notes.md) §1.
 
+- **Migrating without the application role now fails instead of noticing.** 020 created
+  `pgkg_app` best-effort and degraded to a `NOTICE` without `CREATEROLE`, as did every later grant
+  to it, so a migrating role that could not create roles left a schema whose every RLS policy was
+  written for a role that did not exist: protection for nobody, and nothing in the run said so. 020
+  now raises, with the `CREATE ROLE pgkg_app NOLOGIN` an administrator runs to provision it out of
+  band, and `pgkg migrate` checks the same thing before it applies anything. A role that already
+  exists is only granted to — the externally provisioned mode a managed Postgres needs, documented
+  in the README. On PG16 a `CREATEROLE` migrator holds only `ADMIN` on the role it creates and could
+  not `SET ROLE pgkg_app`; 020 now grants the role to the migrating session. Migration 058 repairs an
+  install that ran the old 020: it creates the role if it can, grants it to a migrating login that
+  could not assume it, and re-grants every table. All three also refuse a `pgkg_app` that is
+  `SUPERUSER` or `BYPASSRLS`, and take back the DML `ON ALL TABLES` had handed the role on
+  `pgkg_schema_migrations`, where a deleted row was a migration the next run would apply again.
 - **A passage no crawl comes back for is now vectored on a timer.** The repair a corpus ingest
   performs for its own stranded rows runs after the transaction that promoted the version, so an
   embedder that refuses, a dropped connection or a killed process leaves the row committed with

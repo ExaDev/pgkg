@@ -644,20 +644,65 @@ CREATE POLICY tenant_shards_org_isolation ON tenant_shards
 -- 8. The role the policies are for.  Postgres exempts table owners and
 -- BYPASSRLS roles, so RLS is inert for a deployment that connects as the
 -- schema owner — which is what makes provisioning this role part of the
--- security decision rather than an operational footnote.  Best-effort: a
--- migration run without CREATEROLE still applies everything above, and the
--- policies bite for any non-exempt role the operator creates by hand.
+-- security decision rather than an operational footnote.  So it is not
+-- best-effort: a schema whose policies were written for a role that does not
+-- exist protects nothing for the caller that was meant to assume it, and a
+-- NOTICE is not something a migration runner shows anyone.  A migrating role
+-- without CREATEROLE — a Cloud SQL IAM user, say — stops here, and the
+-- administrator creates the role out of band; the migrations then only grant
+-- to it.
+--
+-- The creator grants the role to its own session.  From PG16 CREATEROLE
+-- confers ADMIN on a created role and nothing else — no SET, no INHERIT — and
+-- before PG16 it conferred no membership at all, so either way the login that
+-- ran the migrations could not SET ROLE pgkg_app until it had.  session_user,
+-- not current_user: SET ROLE is checked against the login, which is the
+-- member that has to hold it if the runner switched role first.  A superuser
+-- needs no membership to SET ROLE, and gets none.
+--
+-- A role provisioned out of band is checked, not trusted: a pgkg_app that is
+-- SUPERUSER or BYPASSRLS takes every grant below and is subject to no policy,
+-- which is the failure that looks exactly like security.
+--
+-- The runner's ledger is taken back.  `pgkg migrate` creates
+-- pgkg_schema_migrations in public before anything runs, so ON ALL TABLES
+-- reaches it; it carries no policy, and a row an application session deleted
+-- would be a migration the next run applies again.  Guarded, because a runner
+-- that keeps no ledger there has nothing to revoke.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app') THEN
-        CREATE ROLE pgkg_app NOLOGIN;
+        BEGIN
+            CREATE ROLE pgkg_app NOLOGIN;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION
+                'pgkg_app does not exist and % cannot create it (%)',
+                current_user, SQLERRM
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'An administrator must run CREATE ROLE pgkg_app NOLOGIN, '
+                         'then re-run the migrations; they grant to the role '
+                         'and do not need to create it.';
+        END;
+
+        IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user) THEN
+            GRANT pgkg_app TO SESSION_USER;
+        END IF;
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app'
+                                        AND (rolsuper OR rolbypassrls)) THEN
+        RAISE EXCEPTION
+            'pgkg_app is exempt from row-level security (SUPERUSER or BYPASSRLS)'
+        USING ERRCODE = 'invalid_role_specification',
+              HINT = 'An administrator must run ALTER ROLE pgkg_app NOSUPERUSER '
+                     'NOBYPASSRLS, then re-run the migrations.';
     END IF;
 
     EXECUTE 'GRANT USAGE ON SCHEMA public TO pgkg_app';
     EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgkg_app';
-EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE
-        'pgkg_app not provisioned (%); RLS policies still apply to any role '
-        'that is neither the table owner nor BYPASSRLS', SQLERRM;
+
+    IF to_regclass('pgkg_schema_migrations') IS NOT NULL THEN
+        REVOKE ALL ON pgkg_schema_migrations FROM pgkg_app;
+    END IF;
 END;
 $$;

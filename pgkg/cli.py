@@ -3,50 +3,102 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import pathlib
 import sys
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import asyncpg
+
+
+MIGRATIONS_DIR = pathlib.Path(__file__).resolve().parent.parent / "migrations"
+
+
+class AppRoleUnavailable(RuntimeError):
+    """pgkg_app is missing and the migrating role cannot create it.
+
+    Every RLS policy is written for pgkg_app and is inert for the table owner,
+    so a schema migrated without it protects nothing for the caller that was
+    meant to assume it.  Raised before any migration is applied.
+    """
+
+
+async def check_app_role(conn: asyncpg.Connection) -> None:
+    row = await conn.fetchrow(
+        "SELECT current_user AS migrator,"
+        "       app.rolsuper AS app_super,"
+        "       app.rolbypassrls AS app_bypassrls,"
+        "       (SELECT rolsuper OR rolcreaterole FROM pg_roles"
+        "         WHERE rolname = current_user) AS can_create"
+        "  FROM (SELECT 1) AS one"
+        "  LEFT JOIN pg_roles app ON app.rolname = 'pgkg_app'"
+    )
+    if row["app_super"] or row["app_bypassrls"]:
+        raise AppRoleUnavailable(
+            "role pgkg_app is exempt from row-level security (SUPERUSER or "
+            "BYPASSRLS), so every policy written for it would be inert.  Have an "
+            "administrator run\n\n"
+            "    ALTER ROLE pgkg_app NOSUPERUSER NOBYPASSRLS;\n\n"
+            "and re-run pgkg migrate."
+        )
+    if row["app_super"] is not None or row["can_create"]:
+        return
+    raise AppRoleUnavailable(
+        f"role pgkg_app does not exist and {row['migrator']} lacks CREATEROLE, "
+        "so the migrations cannot provision the role every row-level security "
+        "policy is written for.  Have an administrator run\n\n"
+        "    CREATE ROLE pgkg_app NOLOGIN;\n\n"
+        "and re-run pgkg migrate: the migrations only grant to an existing role."
+    )
+
+
+async def apply_migrations(conn: asyncpg.Connection) -> None:
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS pgkg_schema_migrations ("
+        "  filename TEXT PRIMARY KEY,"
+        "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
+        ")"
+    )
+    applied = {
+        r["filename"]
+        for r in await conn.fetch("SELECT filename FROM pgkg_schema_migrations")
+    }
+    for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+        if migration.name in applied:
+            print(f"Skipping {migration.name} (already applied).")
+            continue
+        print(f"Applying {migration.name}...")
+        async with conn.transaction():
+            await conn.execute(migration.read_text())
+            await conn.execute(
+                "INSERT INTO pgkg_schema_migrations (filename) VALUES ($1)",
+                migration.name,
+            )
+    print("All migrations applied.")
+
+
+async def run_migrate(dsn: str) -> None:
+    import asyncpg
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        await check_app_role(conn)
+        await apply_migrations(conn)
+    finally:
+        await conn.close()
 
 
 def cmd_migrate(args: argparse.Namespace) -> None:
-    import pathlib
-
-    import asyncpg
-
     from pgkg.config import get_settings
 
-    async def _run() -> None:
-        dsn = get_settings().database_url
-        if dsn is None:
-            from pgkg.embedded import get_dsn
-            dsn = get_dsn()
-        migrations_dir = pathlib.Path(__file__).resolve().parent.parent / "migrations"
-        conn = await asyncpg.connect(dsn)
-        try:
-            await conn.execute(
-                "CREATE TABLE IF NOT EXISTS pgkg_schema_migrations ("
-                "  filename TEXT PRIMARY KEY,"
-                "  applied_at TIMESTAMPTZ NOT NULL DEFAULT now()"
-                ")"
-            )
-            applied = {
-                r["filename"]
-                for r in await conn.fetch("SELECT filename FROM pgkg_schema_migrations")
-            }
-            for migration in sorted(migrations_dir.glob("*.sql")):
-                if migration.name in applied:
-                    print(f"Skipping {migration.name} (already applied).")
-                    continue
-                print(f"Applying {migration.name}...")
-                async with conn.transaction():
-                    await conn.execute(migration.read_text())
-                    await conn.execute(
-                        "INSERT INTO pgkg_schema_migrations (filename) VALUES ($1)",
-                        migration.name,
-                    )
-            print("All migrations applied.")
-        finally:
-            await conn.close()
-
-    asyncio.run(_run())
+    dsn = get_settings().database_url
+    if dsn is None:
+        from pgkg.embedded import get_dsn
+        dsn = get_dsn()
+    try:
+        asyncio.run(run_migrate(dsn))
+    except AppRoleUnavailable as exc:
+        raise SystemExit(f"pgkg migrate: {exc}") from exc
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
