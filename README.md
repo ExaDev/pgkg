@@ -665,9 +665,13 @@ anyone's `search_path`:
 PGKG_DATABASE_URL=postgresql://... PGKG_DB_SCHEMA=pgkg PGKG_EXTENSION_SCHEMA=extensions pgkg migrate
 ```
 
-The runner creates the schema if it is missing (and the extension schema, granting `USAGE` to
-`PUBLIC` only when it created it), keeps `pgkg_schema_migrations` there, and grants `pgkg_app`
-usage of it. Schema names must be plain lower-case identifiers.
+The runner creates the schema if it is missing, and the extension schema only if an extension
+still has to be created in it. It keeps `pgkg_schema_migrations` in the install schema, grants
+`pgkg_app` usage of it, and grants `pgkg_app` — not `PUBLIC` — `USAGE` on every schema an extension
+lives in, since a schema an operator creates grants nothing. Schema names must be plain lower-case
+identifiers that are not reserved words and do not start with `pg_`. A schema that already holds
+pgkg's tables but no `pgkg_schema_migrations` is refused rather than migrated from 001: record the
+migrations it has had in that table first.
 
 Every reference inside a function, trigger or policy body is schema-qualified, so those bodies work
 whatever the caller's `search_path` holds — an RLS policy inlines `pgkg.pgkg_current_org()` and a
@@ -680,9 +684,14 @@ become a per-row call. Migration files spell the schemas `@pgkg_schema@` and
 substitutes them; run the files through it rather than through `psql`.
 
 The application's own queries are unqualified: its pool sets `search_path` to `PGKG_DB_SCHEMA`
-followed by the extensions' schemas, as a startup option so it survives asyncpg's `RESET ALL`. A
-host calling pgkg's SQL functions directly should qualify them (`pgkg.pgkg_retrieve(...)`) or put
-the schema on its own path.
+followed by the extensions' schemas, as a startup option so it survives asyncpg's `RESET ALL`. That
+startup option overrides any `search_path` set on the role or the database (`ALTER ROLE ... SET`,
+`ALTER DATABASE ... SET`) for the application's connections. A host calling pgkg's SQL functions
+directly should qualify them (`pgkg.pgkg_retrieve(...)`) or put the schema on its own path.
+
+The extension schemas are written into the function bodies when each migration is applied, so an
+install is pinned to where its extensions were then. `ALTER EXTENSION ... SET SCHEMA` afterwards
+breaks every body that names the old schema; move an extension before installing pgkg, not after.
 
 An existing install in `public` needs nothing: its function bodies predate the qualification and
 keep resolving through `public` on the path, as before.

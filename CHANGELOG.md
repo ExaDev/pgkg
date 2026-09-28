@@ -162,7 +162,14 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   gazetteer from a caller whose path is `''`, re-creates every SQL function under that path (an
   exact name-resolution check), reads every plpgsql body for an unqualified name, and pins that the
   visibility predicate and both arms still inline onto their indexes. A second CI job runs the whole
-  suite installed in `pgkg_host`.
+  suite installed in `pgkg_host`. The runner grants `pgkg_app` `USAGE` on each extension's schema
+  (a schema an operator made grants it nothing, and retrieval as `pgkg_app` failed with `permission
+  denied for schema`), creates the extension schema only when an extension goes into it, refuses
+  reserved words and `pg_` names, and refuses a schema holding pgkg tables without a migration
+  record rather than re-applying from 001. `pgkg_embedding_dim()` and
+  `pgkg_set_embedding_storage()` take a schema-qualified table as written. Requires `pgvector`
+  (Python) 0.3.4, the first with `register_vector(schema=)`. The function bodies are pinned to the
+  extensions' schemas at install: `ALTER EXTENSION ... SET SCHEMA` afterwards breaks them.
 
 ## 0.6.0
 
