@@ -510,6 +510,38 @@ refuses content that names none: pass `acl_group_id` on `POST /documents` or to
 Drive group tree is not built — so today it is the connector's to supply, and an ACL-bounded
 collection fails closed rather than publishing untagged content.
 
+### The application role
+
+Postgres exempts a table's owner from row-level security, so every policy is inert for the role
+that ran the migrations. The policies are written for `pgkg_app`, a `NOLOGIN` role that is neither
+owner nor `BYPASSRLS`; a deployment connects as a login role that is a member of it, or as the
+migrator followed by `SET ROLE pgkg_app`. Without it the policies protect nothing, so `pgkg migrate`
+will not run without it.
+
+- **Created by the migrations.** When the migrating role is a superuser or has `CREATEROLE`,
+  migration 020 creates `pgkg_app` and grants it to the session that migrated, so that login can
+  `SET ROLE pgkg_app`. On PG16 and later that grant is what makes the role usable at all: a
+  `CREATEROLE` user holds only `ADMIN` on a role it creates.
+- **Provisioned externally.** On a managed Postgres the migrating user often cannot create roles —
+  a Cloud SQL IAM user, for one. An administrator creates the role first, and the migrations then
+  only grant to it:
+
+  ```sql
+  CREATE ROLE pgkg_app NOLOGIN;
+  GRANT pgkg_app TO my_service_login;   -- the login the deployment connects as
+  ```
+
+  The administrator also enables `vector`, which is not a trusted extension, in the target
+  database; `pg_trgm` and `pgcrypto` are trusted and the database owner can create them.
+
+Before applying anything, `pgkg migrate` checks that `pgkg_app` exists or that the migrating role
+can create it, and otherwise exits with the statement above instead of migrating a schema whose
+policies have no one to apply to. Migration 020 raises the same error for a runner that is not
+`pgkg migrate`. There is no opt-out: a deployment that connects as the owner loses nothing by the
+role existing. An install that ran 020 before it stopped silently degrading gets the repair from
+058, which creates the role if it can, grants it to the migrating login where that login could not
+assume it, and re-grants every table.
+
 ### Development mode
 
 The suite runs against a real Postgres — every assertion goes through SQL, because that is where the

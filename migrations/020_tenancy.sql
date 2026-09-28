@@ -644,20 +644,42 @@ CREATE POLICY tenant_shards_org_isolation ON tenant_shards
 -- 8. The role the policies are for.  Postgres exempts table owners and
 -- BYPASSRLS roles, so RLS is inert for a deployment that connects as the
 -- schema owner — which is what makes provisioning this role part of the
--- security decision rather than an operational footnote.  Best-effort: a
--- migration run without CREATEROLE still applies everything above, and the
--- policies bite for any non-exempt role the operator creates by hand.
+-- security decision rather than an operational footnote.  So it is not
+-- best-effort: a schema whose policies were written for a role that does not
+-- exist protects nothing for the caller that was meant to assume it, and a
+-- NOTICE is not something a migration runner shows anyone.  A migrating role
+-- without CREATEROLE — a Cloud SQL IAM user, say — stops here, and the
+-- administrator creates the role out of band; the migrations then only grant
+-- to it.
+--
+-- The creator grants the role to its own session.  From PG16 CREATEROLE
+-- confers ADMIN on a created role and nothing else — no SET, no INHERIT — and
+-- before PG16 it conferred no membership at all, so either way the login that
+-- ran the migrations could not SET ROLE pgkg_app until it had.  session_user,
+-- not current_user: SET ROLE is checked against the login, which is the
+-- member that has to hold it if the runner switched role first.  A superuser
+-- needs no membership to SET ROLE, and gets none.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app') THEN
-        CREATE ROLE pgkg_app NOLOGIN;
+        BEGIN
+            CREATE ROLE pgkg_app NOLOGIN;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION
+                'pgkg_app does not exist and % cannot create it (%)',
+                current_user, SQLERRM
+            USING ERRCODE = 'insufficient_privilege',
+                  HINT = 'An administrator must run CREATE ROLE pgkg_app NOLOGIN, '
+                         'then re-run the migrations; they grant to the role '
+                         'and do not need to create it.';
+        END;
+
+        IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = session_user) THEN
+            GRANT pgkg_app TO SESSION_USER;
+        END IF;
     END IF;
 
     EXECUTE 'GRANT USAGE ON SCHEMA public TO pgkg_app';
     EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgkg_app';
-EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE
-        'pgkg_app not provisioned (%); RLS policies still apply to any role '
-        'that is neither the table owner nor BYPASSRLS', SQLERRM;
 END;
 $$;
