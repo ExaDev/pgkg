@@ -59,13 +59,19 @@ def _embedded_dsn():
     yield get_dsn(pgdata=tmpdir, database="pgkg_test", cleanup_mode="delete")
 
 
+# The server the Docker backend runs, overridable so the suite can be pointed at
+# every major version it claims to support.  16 is the default because it is
+# what docker-compose.yml runs; 17 and 18 build indexes under a restricted
+# search_path (issue #28), which only a run against them can catch.
+DEFAULT_TEST_PG_IMAGE = "pgvector/pgvector:pg16"
+
+
 @contextmanager
 def _docker_dsn():
     from testcontainers.postgres import PostgresContainer
 
-    with PostgresContainer(
-        image="pgvector/pgvector:pg16", driver="asyncpg",
-    ) as container:
+    image = os.environ.get("PGKG_TEST_PG_IMAGE", DEFAULT_TEST_PG_IMAGE)
+    with PostgresContainer(image=image, driver="asyncpg") as container:
         yield container.get_connection_url().replace(
             "postgresql+asyncpg://", "postgresql://"
         )
@@ -79,7 +85,8 @@ def pg_dsn():
       auto (default) — try embedded pgserver, fall back to Docker if the
                        bundled server is missing a required extension
       embedded       — pgserver only
-      docker         — testcontainers only
+      docker         — testcontainers only, running PGKG_TEST_PG_IMAGE
+                       (default pgvector/pgvector:pg16)
     """
     backend = os.environ.get("PGKG_TEST_BACKEND", "auto").lower()
 

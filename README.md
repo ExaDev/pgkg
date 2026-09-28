@@ -515,7 +515,8 @@ collection fails closed rather than publishing untagged content.
 The suite runs against a real Postgres — every assertion goes through SQL, because that is where the
 behaviour lives. It picks a backend itself: an embedded `pgserver` if the bundled build has
 `pg_trgm` and `pgcrypto`, otherwise a `pgvector/pgvector:pg16` testcontainer. Force one with
-`PGKG_TEST_BACKEND=embedded|docker`.
+`PGKG_TEST_BACKEND=embedded|docker`, and point the container at another server with
+`PGKG_TEST_PG_IMAGE` — CI runs `pgvector/pgvector:pg16`, `pg17` and `pg18`.
 
 ```bash
 PGKG_OFFLINE_EXTRACT=1 uv run --python 3.12 pytest -q

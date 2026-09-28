@@ -717,6 +717,18 @@ async def _plan(conn: asyncpg.Connection, sql: str, *args: object) -> str:
     return "\n".join(row[0] for row in rows)
 
 
+def _reads_every_entity(plan: str) -> bool:
+    """Whether the arm's qual was left as a filter over the org's entities.
+
+    Up to 17 that is a sequential scan.  18 can search entities_org_idx with
+    the policy's `org_id = ANY(...)` and apply the arm's qual as a filter on
+    what comes back, which reads every entity of the org just the same — so
+    the filter, and not the scan node's name, is what says the arm lost its
+    index.
+    """
+    return "Seq Scan on entities" in plan or "Rows Removed by Filter" in plan
+
+
 async def _plan_as_app(
     conn: asyncpg.Connection, org: uuid.UUID, sql: str, *args: object
 ) -> str:
@@ -792,7 +804,7 @@ async def test_unmarking_the_operator_returns_the_arm_to_a_sequential_scan(
         f"the {arm} arm reached {index} with {function} not leakproof, so the "
         f"marking is not what the other test is measuring:\n{unmarked}"
     )
-    assert "Seq Scan on entities" in unmarked, (
+    assert _reads_every_entity(unmarked), (
         f"unmarking {function} did not put the {arm} arm back on a sequential "
         f"scan:\n{unmarked}"
     )
@@ -842,7 +854,7 @@ async def test_the_gazetteer_key_is_a_stored_column_and_not_a_leakproof_claim(
         "cannot be honoured — the body is inlined before the qual is judged — "
         "and it would outlive any review of what the body does."
     )
-    assert "Seq Scan on entities" in expression_plan, (
+    assert _reads_every_entity(expression_plan), (
         "the expression form of the name arm no longer needs the stored "
         f"column, so this test has stopped explaining anything:\n"
         f"{expression_plan}"

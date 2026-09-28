@@ -856,7 +856,11 @@ async def test_a_referenced_chunk_cannot_be_deleted(pool: asyncpg.Pool) -> None:
         )
         _, _, chunks = await ingest_version(conn, document, ["referenced"])
 
-        with pytest.raises(asyncpg.ForeignKeyViolationError):
+        # 18 reports an ON DELETE RESTRICT refusal as restrict_violation
+        # (23001); 16 and 17 report it as foreign_key_violation (23503).
+        with pytest.raises(
+            (asyncpg.ForeignKeyViolationError, asyncpg.RestrictViolationError)
+        ):
             async with conn.transaction():
                 await conn.execute(
                     "DELETE FROM chunks WHERE id = $1", chunks[0][0]
