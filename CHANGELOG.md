@@ -20,6 +20,26 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   could not assume it, and re-grants every table. All three also refuse a `pgkg_app` that is
   `SUPERUSER` or `BYPASSRLS`, and take back the DML `ON ALL TABLES` had handed the role on
   `pgkg_schema_migrations`, where a deleted row was a migration the next run would apply again.
+
+- **Managed Postgres: the lost keyword index is now reported, and there is an opt-in way to get it
+  back (#32).** Migrations 043, 046 and 047 mark four built-in operator functions `LEAKPROOF`. That
+  needs a real superuser, and Cloud SQL and RDS do not provide one, so each `ALTER` failed with a
+  `NOTICE` that nobody saw. Under `pgkg_app` the keyword arm then read every row of the tenant
+  instead of using its GIN index: about 80× slower on a 40k-row tenant (0.13 ms against 11 ms). The
+  gazetteer's probes degraded the same way. Migration 059 adds `pgkg_leakproof_state()`, which gives
+  the state of all four functions and, for each one, the statement a superuser runs to fix it. The
+  migration raises a `WARNING` for each unmarked function. `pgkg migrate` repeats the warnings, and
+  the new `pgkg check` prints them and exits 1. `GET /health` now reports `gazetteer_index` next to
+  `keyword_index`, which also gains `arm` and `owner_arm_bypasses_policy`. Where no superuser is
+  available, `PGKG_KEYWORD_ARM=owner` sends the keyword arm to `pgkg_bm25_candidates_as_owner()`, a
+  `SECURITY DEFINER` function. It reads the org from the GUC, applies the four read policies itself
+  (statistics included), pins `search_path` and can be executed only by `pgkg_app`. Tests show it
+  returns exactly the rows and scores the policy path returns, across other-org, other-collection,
+  private and ACL-denied cases, and that it uses the GIN index where the policy path cannot. It is
+  off by default, and it does not help on tables set to `FORCE ROW LEVEL SECURITY`. The function is
+  installed and granted to `pgkg_app` everywhere, and the setting only selects it. A role without
+  the grant keeps the policy path and is refused only if it selects `owner`. See the README,
+  "Known limitations: managed Postgres".
 - **A passage no crawl comes back for is now vectored on a timer.** The repair a corpus ingest
   performs for its own stranded rows runs after the transaction that promoted the version, so an
   embedder that refuses, a dropped connection or a killed process leaves the row committed with

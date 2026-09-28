@@ -84,6 +84,9 @@ async def run_migrate(dsn: str) -> None:
     try:
         await check_app_role(conn)
         await apply_migrations(conn)
+        # A superuser-only ALTER that fell into its exception handler said so
+        # at NOTICE, which nothing shows; say it again where it is seen.
+        _print_warnings(await _row_security_warnings(conn))
     finally:
         await conn.close()
 
@@ -99,6 +102,51 @@ def cmd_migrate(args: argparse.Namespace) -> None:
         asyncio.run(run_migrate(dsn))
     except AppRoleUnavailable as exc:
         raise SystemExit(f"pgkg migrate: {exc}") from exc
+
+
+async def _row_security_warnings(conn: asyncpg.Connection) -> tuple[str, ...]:
+    from pgkg.config import get_settings, row_security_warnings
+
+    return await row_security_warnings(
+        conn, keyword_arm=get_settings().keyword_arm
+    )
+
+
+def _print_warnings(warnings: tuple[str, ...]) -> None:
+    for warning in warnings:
+        print(f"WARNING: {warning}", file=sys.stderr)
+
+
+async def run_check() -> None:
+    """Report what row security is costing the indexes, and fail if anything.
+
+    043, 046 and 047 cannot mark their operators LEAKPROOF without a real
+    superuser, and on managed Postgres the only trace was a NOTICE during the
+    migration.  This is the check a deployment runs after migrating and a
+    monitor runs on a timer: silent and zero when every index is reachable
+    under the application role, one WARNING per defect and exit 1 otherwise.
+    """
+    import asyncpg
+
+    from pgkg.config import get_settings
+
+    dsn = get_settings().database_url
+    if dsn is None:
+        from pgkg.embedded import get_dsn
+        dsn = get_dsn()
+    conn = await asyncpg.connect(dsn)
+    try:
+        warnings = await _row_security_warnings(conn)
+    finally:
+        await conn.close()
+    _print_warnings(warnings)
+    if warnings:
+        raise SystemExit(1)
+    print("Every index condition is reachable under row security.")
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    asyncio.run(run_check())
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -294,6 +342,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("migrate", help="Apply database migrations")
+    subparsers.add_parser(
+        "check",
+        help="Report indexes that row security cannot reach (exit 1 if any)",
+        description=(
+            "On a Postgres without a real superuser (Cloud SQL, RDS) the "
+            "migrations cannot mark the keyword and gazetteer operators "
+            "LEAKPROOF, and those arms scan the whole tenant under the "
+            "application role.  Prints a WARNING per unmarked operator with "
+            "the statement that fixes it."
+        ),
+    )
 
     serve_parser = subparsers.add_parser("serve", help="Start the API server")
     serve_parser.add_argument("--host", default="0.0.0.0")
@@ -419,6 +478,8 @@ def main() -> None:
 
     if args.command == "migrate":
         cmd_migrate(args)
+    elif args.command == "check":
+        cmd_check(args)
     elif args.command == "serve":
         cmd_serve(args)
     elif args.command == "mcp":
