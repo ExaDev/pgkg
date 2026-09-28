@@ -55,6 +55,9 @@
 
 -- 1. The declared width of an embedding column.  pgvector stores the dimension
 -- directly in atttypmod; an unconstrained column has -1 and reads as NULL.
+--
+-- An unqualified table name means pgkg's own schema, whatever the caller's
+-- search_path holds (issue #30); a qualified one is taken as written.
 CREATE FUNCTION pgkg_embedding_dim(p_table TEXT, p_column TEXT)
 RETURNS INT
 LANGUAGE SQL
@@ -62,7 +65,11 @@ STABLE
 AS $$
     SELECT NULLIF(a.atttypmod, -1)
     FROM pg_attribute a
-    WHERE a.attrelid = ('@pgkg_schema@.' || p_table)::regclass
+    WHERE a.attrelid = (
+            CASE WHEN strpos(p_table, '.') > 0 THEN p_table
+                 ELSE '@pgkg_schema@.' || p_table
+            END
+          )::regclass
       AND a.attname = p_column
       AND NOT a.attisdropped;
 $$;
@@ -84,7 +91,17 @@ CREATE FUNCTION pgkg_set_embedding_storage(
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    v_dim INT := COALESCE(p_dim, @pgkg_schema@.pgkg_embedding_dim(p_table, p_column));
+    v_dim    INT := COALESCE(p_dim, @pgkg_schema@.pgkg_embedding_dim(p_table, p_column));
+    v_table  REGCLASS := (
+        CASE WHEN strpos(p_table, '.') > 0 THEN p_table
+             ELSE '@pgkg_schema@.' || p_table
+        END
+    )::regclass;
+    v_schema NAME := (
+        SELECT n.nspname FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = v_table
+    );
 BEGIN
     IF v_dim IS NULL THEN
         RAISE EXCEPTION
@@ -93,19 +110,19 @@ BEGIN
     END IF;
 
     IF p_index IS NOT NULL THEN
-        EXECUTE format('DROP INDEX IF EXISTS @pgkg_schema@.%I', p_index);
+        EXECUTE format('DROP INDEX IF EXISTS %I.%I', v_schema, p_index);
     END IF;
 
     EXECUTE format(
         'ALTER TABLE %s ALTER COLUMN %I TYPE @extschema:vector@.halfvec(%s) '
         'USING %I::@extschema:vector@.halfvec(%s)',
-        ('@pgkg_schema@.' || p_table)::regclass, p_column, v_dim, p_column, v_dim
+        v_table, p_column, v_dim, p_column, v_dim
     );
 
     IF p_index IS NOT NULL THEN
         EXECUTE format(
             'CREATE INDEX %I ON %s USING hnsw (%I @extschema:vector@.halfvec_cosine_ops)',
-            p_index, ('@pgkg_schema@.' || p_table)::regclass, p_column
+            p_index, v_table, p_column
         );
     END IF;
 END;
