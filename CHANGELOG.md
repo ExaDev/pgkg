@@ -50,10 +50,12 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   buffers becomes 0.65 ms and 70.
 - **Migration 051 applies without a superuser** (#29). The `proconfig` pin names a pg_trgm GUC, and
   until the session has called into pg_trgm that GUC is an unknown placeholder only a superuser may
-  set — so a fresh install on Cloud SQL or RDS stopped at 051 with `permission denied to set
-  parameter "pg_trgm.similarity_threshold"`. 051 now calls `show_limit()` first, which loads the
-  extension and registers the real, user-settable parameter. Edited in place: only a fresh install
-  ever failed here, and the runner tracks migrations by filename.
+  set — so on Cloud SQL or RDS, wherever 051 ran in a session that had not itself created pg_trgm
+  (an extension an administrator pre-created, or an upgrade from 050 or below), it stopped with
+  `permission denied to set parameter "pg_trgm.similarity_threshold"`. 051 now calls
+  `similarity('', '')` first, which loads the library and registers the real, user-settable
+  parameter. Edited in place: a failed 051 rolls back and is never recorded, so every deployment
+  that hit this picks up the fixed file, and any that applied it had the library loaded already.
 - **Retrievability is stated, not inferred from parentage.** Chunk liveness and the content
   address's partial predicate both read `chunks.document_id` to mean "this row is provenance for
   extracted facts, not retrievable content". That is not a fact about parentage, and it is what made

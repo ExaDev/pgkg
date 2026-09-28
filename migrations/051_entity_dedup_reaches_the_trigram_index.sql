@@ -90,10 +90,10 @@
 -- set one — so on Cloud SQL or RDS, where the migrating role is not a
 -- superuser, this migration failed with "permission denied to set parameter".
 -- Calling any pg_trgm function first registers the real, user-settable
--- parameter.  show_limit() is the cheapest such call and reads the threshold
--- without changing it.
+-- parameter.  similarity() is already a dependency of the body below (unlike
+-- the deprecated show_limit()), and calling it on empty text changes nothing.
 
-SELECT show_limit();
+SELECT similarity('', '');
 
 CREATE OR REPLACE FUNCTION pgkg_link_entity(
     p_namespace  TEXT,
