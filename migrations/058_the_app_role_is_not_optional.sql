@@ -21,13 +21,24 @@
 --     with createrole_self_grant empty by default — so an install 020 migrated
 --     as a CREATEROLE non-superuser has a role its own login cannot become.
 --     Before PG16 a CREATEROLE creator had no membership at all, but could
---     grant any non-superuser role, which is what the version branch reads.  A
---     role an administrator provisioned, and grants membership in themselves,
---     is left alone: the migrator holds no ADMIN on it and needs none.
+--     grant any non-superuser role, which is what the version branch reads.
+--     From PG16 a role an administrator provisioned is left alone: the
+--     migrator holds no ADMIN on it, and membership is the administrator's to
+--     grant.  Before PG16 a CREATEROLE migrator can grant any non-superuser
+--     role, so it grants this one to itself too, whoever created it.  PG<16 is
+--     best-effort: the suite runs on PG16 only, and the branch is untested.
+--   * Refuses a role that is SUPERUSER or BYPASSRLS, as 020 now does.  Every
+--     grant lands on such a role and no policy applies to it, which is the
+--     failure that looks exactly like security.
 --   * Re-grants on every table.  A role created late missed every grant from
 --     020 onwards, and a GRANT ... ON ALL TABLES that finds them all granted
 --     changes nothing, so the repair and the no-op are one statement.
 --     tests/test_app_role.py pins the invariant it restores.
+--   * Takes the runner's ledger back.  `pgkg migrate` creates
+--     pgkg_schema_migrations in public before 020 runs, so 020's ON ALL TABLES
+--     gave the role DML on a table with no policy, where a deleted row is a
+--     migration the next run applies again.  Guarded, because a runner that
+--     keeps no ledger there has nothing to revoke.
 --
 -- Not an opt-out.  A deployment that means to connect as the owner, for whom
 -- every policy is inert anyway, can still have the role created for it; there
@@ -51,6 +62,15 @@ BEGIN
         END;
     END IF;
 
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app'
+                                        AND (rolsuper OR rolbypassrls)) THEN
+        RAISE EXCEPTION
+            'pgkg_app is exempt from row-level security (SUPERUSER or BYPASSRLS)'
+        USING ERRCODE = 'invalid_role_specification',
+              HINT = 'An administrator must run ALTER ROLE pgkg_app NOSUPERUSER '
+                     'NOBYPASSRLS, then re-run the migrations.';
+    END IF;
+
     IF current_setting('server_version_num')::INT >= 160000 THEN
         v_session_can_set := pg_has_role(session_user, 'pgkg_app', 'SET');
         v_migrator_can_grant :=
@@ -68,5 +88,9 @@ BEGIN
 
     GRANT USAGE ON SCHEMA public TO pgkg_app;
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgkg_app;
+
+    IF to_regclass('pgkg_schema_migrations') IS NOT NULL THEN
+        REVOKE ALL ON pgkg_schema_migrations FROM pgkg_app;
+    END IF;
 END;
 $$;

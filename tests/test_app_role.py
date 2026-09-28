@@ -6,6 +6,10 @@ GRANT ... ON ALL TABLES, which is a snapshot of the tables that existed at that
 moment, not a standing rule: every migration that creates a table after it has
 to grant again.  Forgetting is silent until a deployment connects as the role
 the policies are for and finds a table it cannot read at all.
+
+The one table deliberately out of its reach is pgkg_schema_migrations, the
+runner's ledger: it carries no policy, and a row deleted from it is a migration
+the next run applies again.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ async def test_every_table_is_reachable_by_the_application_role(
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = 'public'
               AND c.relkind = 'r'
+              AND c.relname <> 'pgkg_schema_migrations'
               AND NOT has_table_privilege('pgkg_app', c.oid, 'SELECT')
             ORDER BY c.relname
             """

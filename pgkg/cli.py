@@ -26,11 +26,22 @@ class AppRoleUnavailable(RuntimeError):
 async def check_app_role(conn: asyncpg.Connection) -> None:
     row = await conn.fetchrow(
         "SELECT current_user AS migrator,"
-        "       EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app') AS exists,"
+        "       app.rolsuper AS app_super,"
+        "       app.rolbypassrls AS app_bypassrls,"
         "       (SELECT rolsuper OR rolcreaterole FROM pg_roles"
         "         WHERE rolname = current_user) AS can_create"
+        "  FROM (SELECT 1) AS one"
+        "  LEFT JOIN pg_roles app ON app.rolname = 'pgkg_app'"
     )
-    if row["exists"] or row["can_create"]:
+    if row["app_super"] or row["app_bypassrls"]:
+        raise AppRoleUnavailable(
+            "role pgkg_app is exempt from row-level security (SUPERUSER or "
+            "BYPASSRLS), so every policy written for it would be inert.  Have an "
+            "administrator run\n\n"
+            "    ALTER ROLE pgkg_app NOSUPERUSER NOBYPASSRLS;\n\n"
+            "and re-run pgkg migrate."
+        )
+    if row["app_super"] is not None or row["can_create"]:
         return
     raise AppRoleUnavailable(
         f"role pgkg_app does not exist and {row['migrator']} lacks CREATEROLE, "

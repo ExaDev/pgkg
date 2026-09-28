@@ -659,6 +659,16 @@ CREATE POLICY tenant_shards_org_isolation ON tenant_shards
 -- not current_user: SET ROLE is checked against the login, which is the
 -- member that has to hold it if the runner switched role first.  A superuser
 -- needs no membership to SET ROLE, and gets none.
+--
+-- A role provisioned out of band is checked, not trusted: a pgkg_app that is
+-- SUPERUSER or BYPASSRLS takes every grant below and is subject to no policy,
+-- which is the failure that looks exactly like security.
+--
+-- The runner's ledger is taken back.  `pgkg migrate` creates
+-- pgkg_schema_migrations in public before anything runs, so ON ALL TABLES
+-- reaches it; it carries no policy, and a row an application session deleted
+-- would be a migration the next run applies again.  Guarded, because a runner
+-- that keeps no ledger there has nothing to revoke.
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app') THEN
@@ -679,7 +689,20 @@ BEGIN
         END IF;
     END IF;
 
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'pgkg_app'
+                                        AND (rolsuper OR rolbypassrls)) THEN
+        RAISE EXCEPTION
+            'pgkg_app is exempt from row-level security (SUPERUSER or BYPASSRLS)'
+        USING ERRCODE = 'invalid_role_specification',
+              HINT = 'An administrator must run ALTER ROLE pgkg_app NOSUPERUSER '
+                     'NOBYPASSRLS, then re-run the migrations.';
+    END IF;
+
     EXECUTE 'GRANT USAGE ON SCHEMA public TO pgkg_app';
     EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgkg_app';
+
+    IF to_regclass('pgkg_schema_migrations') IS NOT NULL THEN
+        REVOKE ALL ON pgkg_schema_migrations FROM pgkg_app;
+    END IF;
 END;
 $$;

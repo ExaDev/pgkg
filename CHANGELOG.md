@@ -17,7 +17,9 @@ fix that needed no DDL; the gap is deliberate). Full reasoning in
   in the README. On PG16 a `CREATEROLE` migrator holds only `ADMIN` on the role it creates and could
   not `SET ROLE pgkg_app`; 020 now grants the role to the migrating session. Migration 058 repairs an
   install that ran the old 020: it creates the role if it can, grants it to a migrating login that
-  could not assume it, and re-grants every table.
+  could not assume it, and re-grants every table. All three also refuse a `pgkg_app` that is
+  `SUPERUSER` or `BYPASSRLS`, and take back the DML `ON ALL TABLES` had handed the role on
+  `pgkg_schema_migrations`, where a deleted row was a migration the next run would apply again.
 - **A passage no crawl comes back for is now vectored on a timer.** The repair a corpus ingest
   performs for its own stranded rows runs after the transaction that promoted the version, so an
   embedder that refuses, a dropped connection or a killed process leaves the row committed with

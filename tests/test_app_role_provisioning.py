@@ -9,8 +9,8 @@ actually hands out — no CREATEROLE, CREATEROLE without superuser, and a role a
 administrator provisioned out of band — none of which the rest of the suite,
 migrating as superuser, can see.
 
-Each test gets a fresh database, migrator and (absent) pgkg_app on a cluster of
-its own, because roles are cluster-wide.
+Each test gets a fresh database and migrator, and starts without a pgkg_app,
+on a cluster shared only within this module, because roles are cluster-wide.
 """
 from __future__ import annotations
 
@@ -61,7 +61,11 @@ async def _admin(dsn: str, database: str | None = None) -> asyncpg.Connection:
 
 
 async def provision(
-    admin_dsn: str, *, createrole: bool, pre_provisioned: bool = False,
+    admin_dsn: str,
+    *,
+    createrole: bool,
+    pre_provisioned: bool = False,
+    app_role_attrs: str = "",
 ) -> Deployment:
     suffix = uuid.uuid4().hex[:8]
     migrator = f"migrator_{suffix}"
@@ -75,7 +79,7 @@ async def provision(
         )
         await admin.execute(f"CREATE DATABASE {database} OWNER {migrator}")
         if pre_provisioned:
-            await admin.execute("CREATE ROLE pgkg_app NOLOGIN")
+            await admin.execute(f"CREATE ROLE pgkg_app NOLOGIN {app_role_attrs}")
     finally:
         await admin.close()
 
@@ -112,12 +116,18 @@ async def deployments(
 ) -> AsyncGenerator[list[Deployment], None]:
     made: list[Deployment] = []
     yield made
+    failures: list[BaseException] = []
     for deployment in made:
-        await teardown(deployment)
+        try:
+            await teardown(deployment)
+        except Exception as exc:
+            failures.append(exc)
+    if failures:
+        raise ExceptionGroup("teardown failed", failures)
 
 
 async def deploy(
-    deployments: list[Deployment], dsn: str, **kwargs: bool,
+    deployments: list[Deployment], dsn: str, **kwargs: bool | str,
 ) -> Deployment:
     deployment = await provision(dsn, **kwargs)
     deployments.append(deployment)
@@ -154,6 +164,7 @@ async def tables_unreachable_by_the_app_role(deployment: Deployment) -> list[str
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname = 'public'
               AND c.relkind = 'r'
+              AND c.relname <> 'pgkg_schema_migrations'
               AND NOT has_table_privilege('pgkg_app', c.oid, 'SELECT')
             ORDER BY c.relname
             """
@@ -321,4 +332,120 @@ async def test_the_preflight_refuses_an_install_left_without_a_role(
     with pytest.raises(AppRoleUnavailable):
         await run_migrate(deployment.migrator_dsn)
 
+    assert repair_migration() not in await applied(deployment)
+
+
+async def app_role_privileges_on_the_ledger(deployment: Deployment) -> list[str]:
+    conn = await asyncpg.connect(deployment.migrator_dsn)
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT p.privilege
+            FROM unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE'])
+                 AS p(privilege)
+            WHERE has_table_privilege('pgkg_app', 'pgkg_schema_migrations', p.privilege)
+            ORDER BY p.privilege
+            """
+        )
+    finally:
+        await conn.close()
+    return [r["privilege"] for r in rows]
+
+
+async def test_the_app_role_cannot_touch_the_migration_ledger(
+    fresh_cluster_dsn: str, deployments: list[Deployment],
+) -> None:
+    """The ledger sits in public before 020 runs, so ON ALL TABLES reached it.
+    It carries no policy: a session as pgkg_app could delete a row and have
+    the next run re-apply that migration."""
+    deployment = await deploy(deployments, fresh_cluster_dsn, createrole=True)
+
+    await run_migrate(deployment.migrator_dsn)
+
+    assert await app_role_privileges_on_the_ledger(deployment) == []
+
+
+async def test_058_takes_the_ledger_back_from_the_app_role(
+    fresh_cluster_dsn: str, deployments: list[Deployment],
+) -> None:
+    deployment = await deploy(deployments, fresh_cluster_dsn, createrole=True)
+    await run_migrate(deployment.migrator_dsn)
+    conn = await asyncpg.connect(deployment.migrator_dsn)
+    try:
+        await conn.execute(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON pgkg_schema_migrations TO pgkg_app"
+        )
+    finally:
+        await conn.close()
+    await forget_applied(deployment, repair_migration())
+
+    await run_migrate(deployment.migrator_dsn)
+
+    assert await app_role_privileges_on_the_ledger(deployment) == []
+
+
+EXEMPT_ROLE_ATTRS = pytest.mark.parametrize("attrs", ["BYPASSRLS", "SUPERUSER"])
+
+
+@EXEMPT_ROLE_ATTRS
+async def test_the_preflight_refuses_an_app_role_exempt_from_its_policies(
+    fresh_cluster_dsn: str, deployments: list[Deployment], attrs: str,
+) -> None:
+    """A pgkg_app that bypasses row security is the failure that looks
+    exactly like security: every grant lands and no policy applies."""
+    deployment = await deploy(
+        deployments, fresh_cluster_dsn,
+        createrole=False, pre_provisioned=True, app_role_attrs=attrs,
+    )
+
+    with pytest.raises(AppRoleUnavailable) as excinfo:
+        await run_migrate(deployment.migrator_dsn)
+
+    assert f"NO{attrs}" in str(excinfo.value)
+    assert await applied(deployment) == []
+
+
+@EXEMPT_ROLE_ATTRS
+async def test_020_refuses_an_app_role_exempt_from_its_policies(
+    fresh_cluster_dsn: str, deployments: list[Deployment], attrs: str,
+) -> None:
+    deployment = await deploy(
+        deployments, fresh_cluster_dsn,
+        createrole=False, pre_provisioned=True, app_role_attrs=attrs,
+    )
+
+    conn = await asyncpg.connect(deployment.migrator_dsn)
+    try:
+        with pytest.raises(asyncpg.PostgresError) as excinfo:
+            await apply_migrations(conn)
+    finally:
+        await conn.close()
+
+    assert f"NO{attrs}" in (excinfo.value.hint or "")
+    assert "020_tenancy.sql" not in await applied(deployment)
+
+
+@EXEMPT_ROLE_ATTRS
+async def test_058_refuses_an_app_role_made_exempt_after_020(
+    fresh_cluster_dsn: str, deployments: list[Deployment], attrs: str,
+) -> None:
+    deployment = await deploy(
+        deployments, fresh_cluster_dsn, createrole=False, pre_provisioned=True,
+    )
+    await run_migrate(deployment.migrator_dsn)
+    admin = await _admin(deployment.admin_dsn)
+    try:
+        await admin.execute(f"ALTER ROLE pgkg_app {attrs}")
+    finally:
+        await admin.close()
+    await forget_applied(deployment, repair_migration())
+
+    conn = await asyncpg.connect(deployment.migrator_dsn)
+    try:
+        with pytest.raises(asyncpg.PostgresError) as excinfo:
+            await apply_migrations(conn)
+    finally:
+        await conn.close()
+
+    assert f"NO{attrs}" in (excinfo.value.hint or "")
     assert repair_migration() not in await applied(deployment)
