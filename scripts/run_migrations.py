@@ -12,7 +12,7 @@ import sys
 import asyncpg
 
 from pgkg.config import get_settings
-from pgkg.migrate import apply_migrations
+from pgkg.migrate import install
 
 
 async def main() -> None:
@@ -24,7 +24,7 @@ async def main() -> None:
     settings = get_settings()
     conn = await asyncpg.connect(dsn)
     try:
-        await apply_migrations(
+        await install(
             conn,
             schema=settings.db_schema,
             extension_schema=settings.extension_schema,

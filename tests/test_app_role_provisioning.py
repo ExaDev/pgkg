@@ -23,7 +23,14 @@ from urllib.parse import urlsplit, urlunsplit
 import asyncpg
 import pytest
 
-from pgkg.cli import AppRoleUnavailable, apply_migrations, run_migrate
+from pgkg.cli import AppRoleUnavailable, run_migrate
+from pgkg.config import get_settings
+from pgkg.migrate import apply_migrations as _apply_migrations
+
+# Where `pgkg migrate` installs, which is where these tests look: the suite
+# runs once in public and once vendored into another schema (issue #30).
+SCHEMA = get_settings().db_schema
+LEDGER = f"{SCHEMA}.pgkg_schema_migrations"
 
 MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
 
@@ -162,12 +169,13 @@ async def tables_unreachable_by_the_app_role(deployment: Deployment) -> list[str
             SELECT c.relname
             FROM pg_class c
             JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE n.nspname = 'public'
+            WHERE n.nspname = $1
               AND c.relkind = 'r'
               AND c.relname <> 'pgkg_schema_migrations'
               AND NOT has_table_privilege('pgkg_app', c.oid, 'SELECT')
             ORDER BY c.relname
-            """
+            """,
+            SCHEMA,
         )
     finally:
         await conn.close()
@@ -177,10 +185,10 @@ async def tables_unreachable_by_the_app_role(deployment: Deployment) -> list[str
 async def applied(deployment: Deployment) -> list[str]:
     conn = await asyncpg.connect(deployment.migrator_dsn)
     try:
-        if await conn.fetchval("SELECT to_regclass('pgkg_schema_migrations')") is None:
+        if await conn.fetchval("SELECT to_regclass($1)", LEDGER) is None:
             return []
         rows = await conn.fetch(
-            "SELECT filename FROM pgkg_schema_migrations ORDER BY filename"
+            f"SELECT filename FROM {LEDGER} ORDER BY filename"
         )
     finally:
         await conn.close()
@@ -191,10 +199,18 @@ async def forget_applied(deployment: Deployment, filename: str) -> None:
     conn = await asyncpg.connect(deployment.migrator_dsn)
     try:
         await conn.execute(
-            "DELETE FROM pgkg_schema_migrations WHERE filename = $1", filename
+            f"DELETE FROM {LEDGER} WHERE filename = $1", filename
         )
     finally:
         await conn.close()
+
+
+async def apply_migrations(conn: asyncpg.Connection) -> None:
+    """The shared runner without `pgkg migrate`'s preflight, so what refuses
+    is the SQL itself."""
+    await _apply_migrations(
+        conn, schema=SCHEMA, extension_schema=get_settings().extension_schema
+    )
 
 
 def last_migration() -> str:
@@ -343,9 +359,10 @@ async def app_role_privileges_on_the_ledger(deployment: Deployment) -> list[str]
             SELECT p.privilege
             FROM unnest(ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE'])
                  AS p(privilege)
-            WHERE has_table_privilege('pgkg_app', 'pgkg_schema_migrations', p.privilege)
+            WHERE has_table_privilege('pgkg_app', $1, p.privilege)
             ORDER BY p.privilege
-            """
+            """,
+            LEDGER,
         )
     finally:
         await conn.close()
@@ -373,7 +390,7 @@ async def test_058_takes_the_ledger_back_from_the_app_role(
     conn = await asyncpg.connect(deployment.migrator_dsn)
     try:
         await conn.execute(
-            "GRANT SELECT, INSERT, UPDATE, DELETE ON pgkg_schema_migrations TO pgkg_app"
+            f"GRANT SELECT, INSERT, UPDATE, DELETE ON {LEDGER} TO pgkg_app"
         )
     finally:
         await conn.close()

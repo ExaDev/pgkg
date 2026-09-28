@@ -86,11 +86,11 @@ BEGIN
         GRANT pgkg_app TO SESSION_USER;
     END IF;
 
-    GRANT USAGE ON SCHEMA public TO pgkg_app;
-    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pgkg_app;
+    GRANT USAGE ON SCHEMA @pgkg_schema@ TO pgkg_app;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA @pgkg_schema@ TO pgkg_app;
 
-    IF to_regclass('pgkg_schema_migrations') IS NOT NULL THEN
-        REVOKE ALL ON pgkg_schema_migrations FROM pgkg_app;
+    IF to_regclass('@pgkg_schema@.pgkg_schema_migrations') IS NOT NULL THEN
+        REVOKE ALL ON @pgkg_schema@.pgkg_schema_migrations FROM pgkg_app;
     END IF;
 END;
 $$;

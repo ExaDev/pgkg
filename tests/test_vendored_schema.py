@@ -470,9 +470,12 @@ async def test_the_keyword_arm_still_inlines_into_an_index_scan(
         await caller.execute("SET LOCAL enable_seqscan = off")
         plan = await _plan(caller, sql, [DEFAULT_ORG])
 
-    assert "pgkg_bm25_candidates" not in plan, (
-        f"the keyword arm was not inlined:\n{plan}"
-    )
+    # 059 made pgkg_bm25_candidates a dispatcher over the policy path and a
+    # gated owner arm; the gate stays a Function Scan behind a one-time filter,
+    # and the dispatcher and the policy path must both inline.
+    assert not re.search(
+        r"Function Scan on pgkg_bm25_candidates(_under_policy)?\b", plan
+    ), f"the keyword arm was not inlined:\n{plan}"
     assert re.search(r"Index Scan using \w+ on propositions p", plan), plan
     assert "Index Cond: (namespace = 'ns'::text)" in plan, plan
 

@@ -16,13 +16,19 @@ import uuid
 
 import asyncpg
 
+from pgkg.migrate import extension_schemas, render_migration, search_path_for
+
 MIGRATIONS_DIR = pathlib.Path(__file__).parent.parent / "migrations"
 
 
 async def test_pinning_the_trigram_threshold_needs_no_superuser(
     pg_dsn: str, pool: asyncpg.Pool,
 ) -> None:
-    """`pool` is requested for its migrations: pg_trgm must exist in public."""
+    """`pool` is requested for its migrations: pg_trgm must already exist.
+
+    051 is rendered for the scratch schema the way the runner would render it,
+    and the extensions are used from wherever the suite's install put them.
+    """
     suffix = uuid.uuid4().hex[:8]
     role = f"pgkg_migrator_{suffix}"
     schema = f"pgkg_scratch_{suffix}"
@@ -35,11 +41,14 @@ async def test_pinning_the_trigram_threshold_needs_no_superuser(
     try:
         async with pool.acquire() as admin:
             await admin.execute(f"CREATE SCHEMA {schema} AUTHORIZATION {role}")
+            extensions = await extension_schemas(admin, default="public")
+            for extension_schema in set(extensions.values()) - {"pg_catalog"}:
+                await admin.execute(f"GRANT USAGE ON SCHEMA {extension_schema} TO {role}")
         migrator = await asyncpg.connect(
             pg_dsn,
             user=role,
             password=password,
-            server_settings={"search_path": f"{schema}, public"},
+            server_settings={"search_path": search_path_for(schema, extensions)},
         )
         try:
             trgm_already_loaded = await migrator.fetchval(
@@ -47,8 +56,12 @@ async def test_pinning_the_trigram_threshold_needs_no_superuser(
                 " WHERE name = 'pg_trgm.similarity_threshold'"
             )
             await migrator.execute(
-                (MIGRATIONS_DIR / "051_entity_dedup_reaches_the_trigram_index.sql")
-                .read_text()
+                render_migration(
+                    (MIGRATIONS_DIR / "051_entity_dedup_reaches_the_trigram_index.sql")
+                    .read_text(),
+                    schema=schema,
+                    extension_schemas=extensions,
+                )
             )
             proconfig = await migrator.fetchval(
                 "SELECT p.proconfig FROM pg_proc p"
@@ -61,6 +74,7 @@ async def test_pinning_the_trigram_threshold_needs_no_superuser(
     finally:
         async with pool.acquire() as admin:
             await admin.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            await admin.execute(f"DROP OWNED BY {role}")
             await admin.execute(f"DROP ROLE {role}")
 
     assert not trgm_already_loaded, "pg_trgm preloaded: the placeholder path is untested"
