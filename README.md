@@ -494,6 +494,7 @@ Every variable takes the `PGKG_` prefix — `PGKG_EMBED_MODEL`, not `EMBED_MODEL
 | `PGKG_EXTRACT_PROPOSITIONS` | `true` | Set to `0` to skip LLM extraction on the chat path. Zero LLM cost at ingest. See [Two stores](#two-stores-and-the-two-ways-in). Corpus extraction is a per-collection property, not this flag. |
 | `PGKG_DEFAULT_NAMESPACE` | `default` | Default namespace for memories |
 | `PGKG_PROMPT_VERSION` | `v1` | Informational; logged into the benchmark report. The source of truth is `PROMPT_VERSION` in `ml.py`. |
+| `PGKG_KEYWORD_ARM` | `policy` | `owner` switches the keyword arm to a `SECURITY DEFINER` path that reaches the GIN index without a superuser. Opt-in. See [Known limitations: managed Postgres](#known-limitations-managed-postgres). |
 
 The embedding width is deliberately **not** configurable: it is a property of the schema, read with
 `pgkg_embedding_dim('propositions', 'embedding')` and owned by the embedder registry. A settings
@@ -559,6 +560,87 @@ policies have no one to apply to. Migration 020 raises the same error for a runn
 role existing. An install that ran 020 before it stopped silently degrading gets the repair from
 058, which creates the role if it can, grants it to the migrating login where that login could not
 assume it, and re-grants every table.
+
+### Known limitations: managed Postgres
+
+**The problem.** Row-level security only restricts `pgkg_app`, the role you are told to connect as.
+Under a policy, Postgres will not use a qual as an index condition unless its function is
+`LEAKPROOF`, because otherwise the qual could be asked about rows the policy hides. Migrations 043,
+046 and 047 mark the four functions the keyword and gazetteer arms need: `ts_match_vq` and
+`ts_match_qv` (`@@`), `similarity_op` (`%`) and `arraycontains` (`@>`). Only the functions' owner can
+do that, which in practice means a real superuser. Cloud SQL's `cloudsqlsuperuser` and RDS's
+`rds_superuser` are not one, so on those platforms each `ALTER` hits its exception handler and the
+migration carries on.
+
+**What it costs.** The arms still return the right rows, but they cannot use their indexes. Under
+`pgkg_app`, `tsv @@ query` becomes a Filter over every row the tenant holds. Measured on PG18 with a
+40k-row tenant, the keyword arm took 0.13–0.15 ms as the owner and 10.7–11.3 ms under the policy,
+about 80× slower, and the gap grows with the tenant. The gazetteer's fuzzy and alias probes degrade
+the same way on `entities`. Neither the vector (HNSW) arm nor `pgkg_visible()` is affected.
+
+**How to tell.** Any of these reports it:
+
+- `pgkg check` prints a `WARNING` for each unmarked operator, with the statement that fixes it, and
+  exits 1. It prints nothing and exits 0 when every index is reachable. Run it after migrating, or
+  from a monitor.
+- `pgkg migrate` prints the same warnings when it finishes. Migration 059 also raises them as SQL
+  `WARNING`s rather than `NOTICE`s.
+- `GET /health` reports `keyword_index` and `gazetteer_index`, each with `leakproof` and the state
+  of every operator. `keyword_index` also carries `arm` and `owner_arm_bypasses_policy`.
+- In SQL, `SELECT * FROM pgkg_leakproof_state()`.
+
+**The fix, if you can get a superuser.** Run the statements in the `fix` column of
+`pgkg_leakproof_state()` as the functions' owner. Nothing else changes, and none of it needs a
+restart. `similarity_op` lives in whichever schema holds `pg_trgm`, which is usually `public`:
+
+```sql
+ALTER FUNCTION pg_catalog.ts_match_vq(tsvector, tsquery) LEAKPROOF;
+ALTER FUNCTION pg_catalog.ts_match_qv(tsquery, tsvector) LEAKPROOF;
+ALTER FUNCTION public.similarity_op(text, text) LEAKPROOF;
+ALTER FUNCTION pg_catalog.arraycontains(anyarray, anyarray) LEAKPROOF;
+```
+
+**The opt-in, if you cannot.** `PGKG_KEYWORD_ARM=owner` sends every keyword arm
+(`pgkg_retrieve()`, `pgkg_search()`) to `pgkg_bm25_candidates_as_owner()`. That function is
+`SECURITY DEFINER` and owned by the role that ran the migrations. A table owner is exempt from its
+own tables' policies, so inside the function `@@` is an ordinary qual and the GIN index works again
+(0.72 ms on the same 40k tenant). The application sets this as a connection startup option. Only
+the value `owner` selects the new path; anything else, including leaving it unset, keeps the policy
+path. It covers the keyword arm only, so the gazetteer stays degraded until a superuser marks its
+operators.
+
+Why this is safe, and what it depends on:
+
+- **It restates the policies.** Rows the function reads are never seen by a policy, so the function
+  applies the policies' predicates itself. On the four tables the arm reads (`propositions`,
+  `chunks`, `corpus_stats` and `lexeme_df`), row security enforces exactly one thing: `org_id` is
+  the session's org or the system org. The function applies that to every read, including the BM25
+  statistics, since document frequencies from another org would leak that org's vocabulary. A test
+  checks the live policy list against this restatement, so a new or changed policy on those tables
+  fails it.
+- **Scope checks are unchanged.** Collection scope, private rows, ACL groups and bitemporal validity
+  were never policies. They are checked by `pgkg_visible()` and `pgkg_temporal_visible()`, carried
+  over verbatim, on the same arguments the policy path trusts.
+- **The org comes from `pgkg.org_id`.** The function reads the org from that GUC, never from an
+  argument, and resolves it exactly as `pgkg_current_org()` does. `p_org_ids` can only narrow the
+  result: asking for an org the session cannot read returns nothing.
+- **It is hardened as a `SECURITY DEFINER`.** It runs with `search_path = pg_catalog, pg_temp`, and
+  every pgkg object in it is schema-qualified. `EXECUTE` is revoked from `PUBLIC` and granted only
+  to `pgkg_app`.
+- **Timing is the same as with the fix.** A GIN scan touches other tenants' index entries before
+  the org predicate removes them, so how long a query takes can depend on how common a term is
+  elsewhere. Marking `@@` `LEAKPROOF` has the same effect, and 043 accepted it.
+
+**The FORCE caveat.** The function helps only while its owner is exempt from row security on those
+four tables. That means the function's owner must own the tables (or be a superuser or `BYPASSRLS`),
+and none of the tables may be `ALTER TABLE ... FORCE ROW LEVEL SECURITY`. pgkg never sets `FORCE`.
+If you do, the owner is subject to the policy too: the function still returns the right rows (the
+policy and its restatement both apply), but it cannot use the index. `pgkg check` warns when the
+owner arm is selected but is still under the policy, and
+`SELECT pgkg_owner_arm_bypasses_policy()` gives the answer directly.
+
+Prefer the superuser fix wherever it is available. The opt-in is a second copy of the policies, and
+any future change to them has to be made in both places.
 
 ### Development mode
 

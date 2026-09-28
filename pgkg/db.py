@@ -6,7 +6,7 @@ from typing import AsyncGenerator
 import asyncpg
 from pgvector.asyncpg import register_vector
 
-from pgkg.config import get_settings
+from pgkg.config import KEYWORD_ARM_GUC, KeywordArm, get_settings
 
 
 _ITERATIVE_SCAN = "strict_order"
@@ -16,7 +16,9 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
     await register_vector(conn)
 
 
-async def make_pool(dsn: str | None = None) -> asyncpg.Pool:
+async def make_pool(
+    dsn: str | None = None, *, keyword_arm: KeywordArm | None = None
+) -> asyncpg.Pool:
     if dsn is None:
         from pgkg.embedded import get_dsn
         dsn = get_dsn()
@@ -33,12 +35,20 @@ async def make_pool(dsn: str | None = None) -> asyncpg.Pool:
     # after exactly one acquire and leaves every later caller on the
     # unmitigated scan.  RESET ALL restores startup options to what they were,
     # so this is the form that survives.
+    #
+    # The keyword arm travels the same way and for the same reason: 059's
+    # dispatcher reads it on every call, and a SET would select the owner arm
+    # for one acquire and the policy path for every one after.
+    arm = keyword_arm or get_settings().keyword_arm
     pool = await asyncpg.create_pool(
         dsn,
         min_size=1,
         max_size=10,
         init=_init_connection,
-        server_settings={"hnsw.iterative_scan": _ITERATIVE_SCAN},
+        server_settings={
+            "hnsw.iterative_scan": _ITERATIVE_SCAN,
+            KEYWORD_ARM_GUC: arm,
+        },
     )
     return pool  # type: ignore[return-value]
 

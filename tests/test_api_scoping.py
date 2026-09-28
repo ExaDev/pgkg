@@ -1394,6 +1394,27 @@ async def test_http_health_reports_the_keyword_operators_it_found_marked(
     assert body["keyword_index"]["leakproof"] is True
 
 
+async def test_http_health_reports_the_gazetteer_operators_and_the_arm(
+    pool: asyncpg.Pool, monkeypatch
+) -> None:
+    """047 marks the gazetteer's operators under the same constraint 043 and
+    046 do, and until 059 nothing reported them.  The arm is reported beside
+    the keyword operators because it decides whether their state matters."""
+    monkeypatch.delenv("PGKG_KEYWORD_ARM", raising=False)
+    async with _api(pool, _ns("health_gz"), monkeypatch) as client:
+        body = (await client.get("/health")).json()
+
+    assert body["gazetteer_index"] == {
+        "leakproof": True,
+        "operators": {
+            "arraycontains(anyarray,anyarray)": True,
+            "similarity_op(text,text)": True,
+        },
+    }
+    assert body["keyword_index"]["arm"] == "policy"
+    assert body["keyword_index"]["owner_arm_bypasses_policy"] is True
+
+
 async def test_http_health_says_so_when_an_operator_was_never_marked(
     pool: asyncpg.Pool, monkeypatch
 ) -> None:

@@ -208,6 +208,9 @@ async def test_idf_reads_only_the_query_terms(pool: asyncpg.Pool, corpus) -> Non
 
 RETRIEVAL_FUNCTIONS = (
     "pgkg_bm25_candidates",
+    # 059 made pgkg_bm25_candidates() a dispatcher; the bodies are these two.
+    "pgkg_bm25_candidates_under_policy",
+    "pgkg_bm25_candidates_as_owner",
     "pgkg_vector_candidates",
     "pgkg_graph_candidates",
     "pgkg_chunk_window",

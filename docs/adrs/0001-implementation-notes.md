@@ -345,6 +345,26 @@ function this schema owns also outlives the review of its body. So that arm gets
 remedy: the two keys are stored generated columns, and the quals become an equality on text
 (`texteq`, already leakproof) and containment on a plain `text[]`. The name arm becomes an Index
 Only Scan, which the expression index could not offer either.
+
+### Where no superuser can set the mark: an owner-rights keyword arm, opt-in (059, #32)
+
+On Cloud SQL and RDS every one of the four `ALTER`s above falls into its handler, which leaves the
+keyword arm about 80× slower on a 40k-row tenant. A `BYPASSRLS` owner is not an option there,
+because only a `BYPASSRLS` role can create one. 059 therefore does two things. First, it makes the
+state explicit: `pgkg_leakproof_state()` lists all four functions, what each serves and the
+statement that fixes it, and the migration, `pgkg migrate`, `pgkg check` and `GET /health` all
+report it. Second, `PGKG_KEYWORD_ARM=owner` provides `pgkg_bm25_candidates_as_owner()`, a
+`SECURITY DEFINER` copy of 041's arm. It is safe only because it restates the read policies of the
+four tables it reads, and those policies say one thing: the row's org is the session's org or the
+system org. Collection scope, private rows, ACL groups and validity were never policies. They are
+checked by `pgkg_visible()` and `pgkg_temporal_visible()` on the caller's arguments, which both
+paths trust equally. `pgkg_bm25_candidates()` becomes a dispatcher on the `pgkg.keyword_arm` GUC,
+and the policy-path body is renamed rather than restated, so its plan is unchanged. The restatement
+is a second copy of the policies, so it is off by default and pinned by a test that compares the
+live policy list against it. It stops helping under `FORCE ROW LEVEL SECURITY`: its rows stay
+correct, but it loses the index. The README section "Known limitations: managed Postgres" is the
+operator-facing version.
+
 ### The extraction cache is keyed per org, not gated on `public_source`
 
 D4 restricts `embedding_cache` to operator-licensed material because "for a confidential document a

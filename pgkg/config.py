@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Literal, Protocol
@@ -34,6 +35,12 @@ PROVIDER_DEFAULT_MODELS = {
     "claude_code": "claude-haiku-4-5-20251001",
     "ollama": "llama3.1",
 }
+
+
+# The two values of the `pgkg.keyword_arm` GUC that 059's dispatcher tells
+# apart.  Anything else reaches the database as the policy path.
+KeywordArm = Literal["policy", "owner"]
+KEYWORD_ARM_GUC = "pgkg.keyword_arm"
 
 
 class Settings(BaseSettings):
@@ -74,6 +81,13 @@ class Settings(BaseSettings):
     # Informational: the prompt version used for extraction (source of truth is
     # the PROMPT_VERSION constant in ml.py; this field is logged into BenchReport).
     prompt_version: str = "v2"
+    # Which keyword arm pgkg_bm25_candidates() runs (migration 059).  "policy"
+    # reads under row security, and reaches the GIN index only where the `@@`
+    # functions are marked LEAKPROOF — which a managed Postgres will not let
+    # pgkg do.  "owner" runs a SECURITY DEFINER arm that restates the read
+    # policies and reaches the index without the mark.  Opt-in: it is a second
+    # statement of the policies, and a deployment that can set the mark should.
+    keyword_arm: KeywordArm = "policy"
 
 
     @property
@@ -172,6 +186,88 @@ async def keyword_match_leakproof(conn: _Queryable) -> dict[str, bool | None]:
     """
     rows = await conn.fetch(_KEYWORD_LEAKPROOF_SQL)
     return {row["signature"]: row["leakproof"] for row in rows}
+
+
+_LEAKPROOF_STATE_SQL = """
+SELECT signature, serves, leakproof, fix FROM pgkg_leakproof_state()
+"""
+
+_OWNER_ARM_BYPASSES_SQL = "SELECT pgkg_owner_arm_bypasses_policy()"
+
+# What 059's dispatcher will do on this connection, which is the GUC and not the
+# setting: a pool built by something other than make_pool() carries no option.
+_ARM_IN_FORCE_SQL = f"""
+SELECT CASE WHEN current_setting('{KEYWORD_ARM_GUC}', TRUE) = 'owner'
+            THEN 'owner' ELSE 'policy' END
+"""
+
+
+async def gazetteer_match_leakproof(conn: _Queryable) -> dict[str, bool | None]:
+    """The gazetteer half of pgkg_leakproof_state(): 047's `%` and `@>`."""
+    rows = await conn.fetch(_LEAKPROOF_STATE_SQL)
+    return {
+        row["signature"]: row["leakproof"]
+        for row in rows
+        if row["serves"] == "gazetteer"
+    }
+
+
+async def keyword_arm_in_force(conn: _Queryable) -> KeywordArm:
+    return await conn.fetchval(_ARM_IN_FORCE_SQL)
+
+
+async def owner_arm_bypasses_policy(conn: _Queryable) -> bool:
+    return bool(await conn.fetchval(_OWNER_ARM_BYPASSES_SQL))
+
+
+async def row_security_warnings(
+    conn: _Queryable, *, keyword_arm: KeywordArm
+) -> tuple[str, ...]:
+    """What row security is costing this deployment's indexes, in words.
+
+    One warning per operator 043, 046 or 047 could not mark, carrying the
+    statement a superuser runs to mark it — except the keyword operators when
+    the owner arm is selected and actually escapes the policy, because that is
+    the remedy already taken.  And one when the owner arm is selected but its
+    owner is under the policy after all, where it buys nothing.
+    """
+    owner_effective = await owner_arm_bypasses_policy(conn)
+    owner_remedies_keyword = keyword_arm == "owner" and owner_effective
+    unmarked = tuple(
+        _unmarked_warning(row)
+        for row in await conn.fetch(_LEAKPROOF_STATE_SQL)
+        if row["leakproof"] is not True
+        and not (row["serves"] == "keyword" and owner_remedies_keyword)
+    )
+    ineffective = (
+        (_OWNER_ARM_UNDER_POLICY,)
+        if keyword_arm == "owner" and not owner_effective
+        else ()
+    )
+    return unmarked + ineffective
+
+
+_OWNER_ARM_UNDER_POLICY = (
+    "PGKG_KEYWORD_ARM=owner is selected, but pgkg_bm25_candidates_as_owner() "
+    "runs under row security: its owner does not own every table it reads, or "
+    "one of them is FORCE ROW LEVEL SECURITY. It stays correct and cannot "
+    "reach the GIN index; make the table owner its owner, or drop FORCE."
+)
+
+
+def _unmarked_warning(row: Mapping[str, object]) -> str:
+    fix = row["fix"] or "install the function first"
+    remedy = (
+        " Without one, PGKG_KEYWORD_ARM=owner restores the index (README, "
+        "Known limitations)."
+        if row["serves"] == "keyword"
+        else ""
+    )
+    return (
+        f"{row['signature']} is not LEAKPROOF, so the {row['serves']} arm "
+        "cannot use its index under row security and scans the whole tenant. "
+        f"As a superuser: {fix}.{remedy}"
+    )
 
 
 async def embed_dim(conn: _Queryable, org_id: UUID = DEFAULT_ORG_ID) -> int:

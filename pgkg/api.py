@@ -13,9 +13,12 @@ from pgkg.config import (
     DEFAULT_ORG_ID,
     ORG_GUC,
     embed_dim,
+    gazetteer_match_leakproof,
     get_settings,
+    keyword_arm_in_force,
     keyword_match_leakproof,
     live_generations,
+    owner_arm_bypasses_policy,
 )
 from pgkg.corpus import CorpusIngest, document_hash, dump_provenance
 from pgkg.db import make_pool, close_pool
@@ -493,7 +496,17 @@ async def health() -> dict:
     # and the cost is a sequential scan per arm that only shows at scale and
     # only under a role with row security.  It cannot be enforced, so it is
     # reported: a deployment that missed it is a fact something can watch.
-    keyword_index: dict = {"leakproof": None, "operators": {}}
+    # The arm is reported beside it because the owner arm (059) is the remedy
+    # where the mark cannot be set, and it only is one if its owner escapes the
+    # policy.  The gazetteer's operators (047) are under the same constraint
+    # and have no owner arm, so they are reported on their own.
+    keyword_index: dict = {
+        "leakproof": None,
+        "operators": {},
+        "arm": None,
+        "owner_arm_bypasses_policy": None,
+    }
+    gazetteer_index: dict = {"leakproof": None, "operators": {}}
     if _pool:
         try:
             async with _pool.acquire() as conn:
@@ -509,6 +522,13 @@ async def health() -> dict:
                 keyword_index = {
                     "leakproof": bool(operators) and all(operators.values()),
                     "operators": operators,
+                    "arm": await keyword_arm_in_force(conn),
+                    "owner_arm_bypasses_policy": await owner_arm_bypasses_policy(conn),
+                }
+                gazetteer = await gazetteer_match_leakproof(conn)
+                gazetteer_index = {
+                    "leakproof": bool(gazetteer) and all(gazetteer.values()),
+                    "operators": gazetteer,
                 }
             db_ok = True
         except Exception:
@@ -519,6 +539,7 @@ async def health() -> dict:
         "db": db_ok,
         "embedding": embedding,
         "keyword_index": keyword_index,
+        "gazetteer_index": gazetteer_index,
         "models_loaded": {
             "embed": ml.is_embed_loaded(),
             "rerank": ml.is_rerank_loaded(),
