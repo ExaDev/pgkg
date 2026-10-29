@@ -1,5 +1,7 @@
 # pgkg — Postgres-native knowledge graph engine for agentic memory
 
+[![GitHub](https://img.shields.io/badge/GitHub-181717?logo=github&logoColor=white)](https://github.com/ExaDev/pgkg) [![CI](https://img.shields.io/github/actions/workflow/status/ExaDev/pgkg/test.yml?branch=main)](https://github.com/ExaDev/pgkg/actions)
+
 **The thesis:** Vanilla Postgres with `pgvector` and `tsvector` can match the retrieval quality of complex agent-memory stacks (Mem0, Zep, MemGPT) and knowledge graph systems that bolt on Kafka, Pinecone, Neo4j, etc. The only non-SQL components are embedding, reranking, and LLM-based proposition extraction.
 
 **Two containers, one CTE:** Postgres does the work. Everything else is glue — and the ratio shows it. The retrieval pipeline, the tenancy boundary, the document lifecycle and the graph walk are all SQL; the Python is an HTTP surface, a model client and an ingest loop.
